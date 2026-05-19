@@ -1996,7 +1996,7 @@ export function useChatMessages(
     // refs to point at the new reconnect bubble so the tool_call_result history-resolver
     // writes resolution status to where the proposal actually lives now.
     const stripList = unresolvedHistoryInterruptRef.current;
-    if (stripList && stripList.length > 0) {
+    if (stripList.length > 0) {
       const stripsByMsgId = new Map<string, HistoryInterruptInfo[]>();
       for (const info of stripList) {
         const arr = stripsByMsgId.get(info.assistantMessageId) || [];
