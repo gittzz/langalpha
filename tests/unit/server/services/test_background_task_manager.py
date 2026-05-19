@@ -6,10 +6,12 @@ Covers:
 - cancel_stale_workflow cancels RUNNING and SOFT_INTERRUPTED tasks
 - cancel_stale_workflow handles timeout when task won't exit
 - _run_workflow uses closure-captured events (not re-acquired from lock)
+- Outer-task .cancel() propagates into inner consume_workflow (post-shield-removal)
 """
 
 import asyncio
 import logging
+from contextlib import suppress
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -345,3 +347,81 @@ class TestConsumeWorkflowUsesClosureEvents:
         # or _mark_completed was not called with all events consumed
         # The key assertion: the inner task was registered on the task_info
         assert task_info.inner_task is not None
+
+
+# ---------------------------------------------------------------------------
+# Force-cancel propagates from outer task into inner consume_workflow
+# ---------------------------------------------------------------------------
+
+class TestOuterTaskCancelPropagatesToInner:
+
+    @pytest.mark.asyncio
+    async def test_outer_task_cancel_propagates_to_inner(self):
+        """Cancelling the outer task that wraps _run_workflow now cancels the
+        inner consume_workflow task and runs _mark_cancelled.
+
+        Pinpoints the behavior change from removing ``asyncio.shield(inner_task)``:
+        shutdown's force-cancel path (background_task_manager.py:367) and
+        _cleanup_abandoned_tasks (line 432) both call ``info.task.cancel()``.
+        Pre-shield-removal: inner_task kept running orphaned; post-removal:
+        cancellation propagates through ``await inner_task`` and the workflow
+        generator is closed cleanly.
+        """
+        btm = _make_btm()
+
+        generator_closed = asyncio.Event()
+
+        async def fake_workflow():
+            try:
+                for i in range(1000):
+                    await asyncio.sleep(0.01)
+                    yield f"event-{i}"
+            finally:
+                generator_closed.set()
+
+        cancel_event = asyncio.Event()
+        soft_interrupt_event = asyncio.Event()
+
+        task_info = _make_task_info(
+            thread_id="thread-outer", run_id="run-outer", status=TaskStatus.RUNNING
+        )
+        btm.tasks[("thread-outer", "run-outer")] = task_info
+
+        with patch.object(btm, "_mark_completed", new_callable=AsyncMock), \
+             patch.object(btm, "_mark_cancelled", new_callable=AsyncMock) as mock_mark_cancelled, \
+             patch.object(btm, "_mark_failed", new_callable=AsyncMock), \
+             patch.object(btm, "_mark_soft_interrupted", new_callable=AsyncMock), \
+             patch.object(btm, "_flush_checkpoint", new_callable=AsyncMock):
+
+            outer_task = asyncio.create_task(
+                btm._run_workflow(
+                    thread_id="thread-outer",
+                    run_id="run-outer",
+                    workflow_generator=fake_workflow(),
+                    cancel_event=cancel_event,
+                    soft_interrupt_event=soft_interrupt_event,
+                )
+            )
+
+            # Let the inner task spin up and register itself.
+            await asyncio.sleep(0.05)
+            assert task_info.inner_task is not None
+            inner_task = task_info.inner_task
+
+            # Simulate shutdown / abandoned-cleanup directly cancelling
+            # the outer task — the path that previously hit the shield.
+            outer_task.cancel()
+
+            with suppress(asyncio.CancelledError):
+                await outer_task
+
+        # The cooperative cancel_event was never set — proves the cancellation
+        # arrived via the outer task, not the cooperative path.
+        assert not cancel_event.is_set()
+        # Inner task is now done (shield removal lets the cancel propagate).
+        assert inner_task.done()
+        assert inner_task.cancelled()
+        # _mark_cancelled ran inside the except handler.
+        mock_mark_cancelled.assert_awaited_once_with("thread-outer", "run-outer")
+        # The workflow generator's finally block ran — no orphaned generator.
+        assert generator_closed.is_set()
