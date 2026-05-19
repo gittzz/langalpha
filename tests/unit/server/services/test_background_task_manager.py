@@ -5,7 +5,7 @@ Covers:
 - cancel_stale_workflow no-ops for missing or completed tasks
 - cancel_stale_workflow cancels RUNNING and SOFT_INTERRUPTED tasks
 - cancel_stale_workflow handles timeout when task won't exit
-- _run_workflow_shielded uses closure-captured events (not re-acquired from lock)
+- _run_workflow uses closure-captured events (not re-acquired from lock)
 """
 
 import asyncio
@@ -286,10 +286,10 @@ class TestConsumeWorkflowUsesClosureEvents:
 
     @pytest.mark.asyncio
     async def test_consume_workflow_uses_closure_events(self):
-        """_run_workflow_shielded checks the cancel_event passed as a parameter.
+        """_run_workflow checks the cancel_event passed as a parameter.
 
-        The cancel_event passed to _run_workflow_shielded is captured by the
-        inner consume_workflow closure.  When that event is set, the workflow
+        The cancel_event passed to _run_workflow is captured by the inner
+        consume_workflow closure. When that event is set, the workflow
         should stop — proving the closure uses the parameter, not a fresh
         lookup from self.tasks.
         """
@@ -304,7 +304,7 @@ class TestConsumeWorkflowUsesClosureEvents:
         cancel_event = asyncio.Event()
         soft_interrupt_event = asyncio.Event()
 
-        # Pre-register a RUNNING task so _run_workflow_shielded can find it
+        # Pre-register a RUNNING task so _run_workflow can find it
         task_info = _make_task_info(thread_id="thread-closure", status=TaskStatus.RUNNING)
         btm.tasks[("thread-closure", "run-1")] = task_info
 
@@ -323,10 +323,10 @@ class TestConsumeWorkflowUsesClosureEvents:
 
             cancel_task = asyncio.create_task(set_cancel_after_delay())
 
-            # Run the shielded workflow — it should exit early via CancelledError
+            # Run the workflow — it should exit early via CancelledError
             # because cancel_event gets set after ~5 events
             try:
-                await btm._run_workflow_shielded(
+                await btm._run_workflow(
                     thread_id="thread-closure",
                     run_id="run-1",
                     workflow_generator=fake_workflow(),
