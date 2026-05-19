@@ -440,6 +440,41 @@ class BackgroundTaskManager:
                 f"[BackgroundTaskManager] Cleaned up {len(to_remove)} tasks: {to_remove}"
             )
 
+    async def _reset_event_buffer_state(self, thread_id: str) -> None:
+        """Drop stale Redis Stream state from a prior workflow execution.
+
+        Called before each fresh workflow turn. Without this, a new SSE
+        consumer attaches with ``cursor=0`` and replays the previous
+        turn's events because the producer-side dirty-resume guard in
+        ``pipelined_event_buffer`` only fires after the first new event
+        lands — by then the consumer has already pulled the stale data
+        and advanced its cursor past where the new entries land.
+        """
+        if self.event_storage_backend != "redis":
+            return
+        try:
+            cache = get_cache_client()
+        except Exception as e:
+            logger.warning(
+                f"[BackgroundTaskManager] Cache unavailable while resetting "
+                f"event buffer for {thread_id}: {e}"
+            )
+            return
+        if not cache.enabled or not cache.client:
+            return
+        try:
+            stream_key = f"workflow:stream:{thread_id}"
+            meta_key = f"workflow:events:meta:{thread_id}"
+            pipe = cache.client.pipeline(transaction=False)
+            pipe.delete(stream_key)
+            pipe.delete(meta_key)
+            await pipe.execute()
+        except Exception as e:
+            logger.warning(
+                f"[BackgroundTaskManager] Failed to reset event buffer for "
+                f"{thread_id}: {e}"
+            )
+
     async def pre_register(self, thread_id: str) -> None:
         """Pre-register a thread as QUEUED before the workflow generator starts.
 
@@ -448,6 +483,10 @@ class BackgroundTaskManager:
         Reconnecting clients see a QUEUED TaskInfo and attach to
         ``workflow:stream:{thread_id}`` (initially empty) instead of a 404.
         """
+        # Wipe any stale stream/meta from a prior turn before any consumer
+        # can attach to the placeholder.
+        await self._reset_event_buffer_state(thread_id)
+
         async with self.task_lock:
             if thread_id in self.tasks:
                 existing = self.tasks[thread_id]
@@ -491,6 +530,12 @@ class BackgroundTaskManager:
             ValueError: If max concurrent workflows exceeded
             RuntimeError: If workflow already exists for thread_id
         """
+        # Wipe stale stream/meta from a prior turn before the new asyncio
+        # task starts writing — the upgrade path is redundant here because
+        # pre_register already cleared, but the fresh-start path absolutely
+        # needs this to avoid replay of the previous turn's events.
+        await self._reset_event_buffer_state(thread_id)
+
         async with self.task_lock:
             # Check if already exists
             if thread_id in self.tasks:

@@ -167,7 +167,14 @@ class ConversationPersistenceService:
             )
 
     async def _finalize_pair(self):
-        """Increment turn index and run post-persist hook (clear event buffer, etc.)."""
+        """Increment turn index, run post-persist hook, then release the singleton.
+
+        The class is documented as "one service instance per workflow execution"
+        but cleanup was historically never reached, so the singleton accumulated
+        ``_persisted_queries`` / ``_turn_index_cache`` across turns and silently
+        skipped new query persists when the cached state diverged from the DB.
+        Releasing here makes the next workflow turn build a fresh instance.
+        """
         self.increment_turn_index()
         if self._on_pair_persisted:
             try:
@@ -177,6 +184,7 @@ class ConversationPersistenceService:
                     f"[ConversationPersistence] _on_pair_persisted callback failed "
                     f"for thread_id={self.thread_id}: {e}"
                 )
+        await self.cleanup()
 
     async def _get_latest_checkpoint_id(self) -> str | None:
         """Best-effort: get latest checkpoint_id from the checkpointer.
@@ -230,17 +238,16 @@ class ConversationPersistenceService:
         """
         turn_index = await self.get_or_calculate_turn_index()
 
-        if turn_index in self._persisted_queries:
-            logger.warning(
-                f"[ConversationPersistence] Query already created for thread_id={self.thread_id} "
-                f"turn_index={turn_index}, skipping"
-            )
-            return self._current_query_id
-
         try:
             query_id = str(uuid4())
 
-            await qr_db.create_query(
+            # ``qr_db.create_query`` is idempotent via
+            # ``ON CONFLICT (conversation_thread_id, turn_index) DO UPDATE`` —
+            # don't gate on the in-memory ``_persisted_queries`` set, that gate
+            # silently dropped new turns when the singleton's state diverged
+            # from the DB across workflow executions. Let the DB tell us
+            # whether the row already exists.
+            row = await qr_db.create_query(
                 conversation_query_id=query_id,
                 conversation_thread_id=self.thread_id,
                 turn_index=turn_index,
@@ -251,15 +258,24 @@ class ConversationPersistenceService:
                 created_at=timestamp
             )
 
-            self._persisted_queries.add(turn_index)
-            self._current_query_id = query_id
-
-            logger.debug(
-                f"[ConversationPersistence] Created query for thread_id={self.thread_id} "
-                f"turn_index={turn_index} query_id={query_id}"
+            # ON CONFLICT DO UPDATE keeps the existing primary key, so the
+            # row's actual ``conversation_query_id`` may differ from the
+            # freshly-generated UUID we sent. Trust the RETURNING value.
+            stored_query_id = (
+                row.get("conversation_query_id", query_id)
+                if isinstance(row, dict)
+                else query_id
             )
 
-            return query_id
+            self._persisted_queries.add(turn_index)
+            self._current_query_id = stored_query_id
+
+            logger.debug(
+                f"[ConversationPersistence] Persisted query for thread_id={self.thread_id} "
+                f"turn_index={turn_index} query_id={stored_query_id}"
+            )
+
+            return stored_query_id
 
         except Exception as e:
             logger.error(
