@@ -42,48 +42,7 @@ async def _register(registry: BackgroundTaskRegistry, task_id_override="abc"):
         registry._task_id_to_tool_call_id.pop(task.task_id, None)
         task.task_id = task_id_override
         registry._task_id_to_tool_call_id[task_id_override] = task.tool_call_id
-    _patch_capture(registry, task)
     return task
-
-
-def _patch_capture(registry: BackgroundTaskRegistry, task) -> None:
-    """Patch ``registry.append_captured_event`` to record into ``task._test_records``.
-
-    The production path spills to Redis; the registry under test has no
-    thread_id so the spill no-ops, and the deque it used to write to is
-    gone. The patched method preserves the bookkeeping side-effects
-    (seq counter, count, last_updated_at) and exposes the records on
-    ``task._test_records`` so assertions can read them.
-    """
-    import time as _time
-
-    task._test_records: list[dict] = []
-
-    async def recording_append(tool_call_id, event):
-        async with registry._lock:
-            t = registry._tasks.get(tool_call_id)
-            if not t:
-                return
-            t.captured_event_seq += 1
-            seq = t.captured_event_seq
-            ts = event.get("ts")
-            record = {
-                "seq": seq,
-                "event": event.get("event"),
-                "data": event.get("data") or {},
-                "agent_id": t.agent_id,
-            }
-            if ts is not None:
-                record["ts"] = ts
-            t.captured_event_count = seq
-            t._test_records.append(record)
-            if (
-                event.get("event") == "message_chunk"
-                and (event.get("data") or {}).get("content_type") == "text"
-            ):
-                t.last_updated_at = _time.time()
-
-    registry.append_captured_event = recording_append  # type: ignore[method-assign]
 
 
 @pytest.mark.asyncio
@@ -97,7 +56,7 @@ async def test_forwards_text_chunks_one_per_token():
     await fw.forward(_chunk(", world"))
     await fw.finalize()
 
-    events = task._test_records
+    events = list(task.captured_events_tail)
     text_chunks = [
         e for e in events
         if e["event"] == "message_chunk"
@@ -128,7 +87,7 @@ async def test_reasoning_lifecycle_emits_inline_start_and_complete_on_transition
     await fw.forward(_chunk("here is the answer"))
     await fw.finalize()
 
-    events = task._test_records
+    events = list(task.captured_events_tail)
     timeline = [
         (e["data"].get("content_type"), e["data"].get("content"))
         for e in events
@@ -162,7 +121,7 @@ async def test_finalize_closes_dangling_reasoning_signal():
     await fw.forward(_chunk({"type": "thinking", "thinking": "lone thought"}))
     await fw.finalize()
 
-    events = task._test_records
+    events = list(task.captured_events_tail)
     timeline = [
         (e["data"].get("content_type"), e["data"].get("content"))
         for e in events
@@ -206,7 +165,7 @@ async def test_finalize_emits_stream_end_sentinel():
     assert sentinel_calls == [task.tool_call_id]
     # The deque should hold only the real text chunk — no sentinel record.
     assert all(
-        e["event"] != "subagent_stream_end" for e in task._test_records
+        e["event"] != "subagent_stream_end" for e in task.captured_events_tail
     )
 
 
@@ -242,7 +201,7 @@ async def test_forward_error_appends_error_record():
 
     await fw.forward_error(RuntimeError("upstream blew up"))
 
-    error_records = [e for e in task._test_records if e["event"] == "error"]
+    error_records = [e for e in task.captured_events_tail if e["event"] == "error"]
     assert len(error_records) == 1
     assert error_records[0]["data"] == {
         "agent": "task:abc",
@@ -343,7 +302,7 @@ async def test_arun_subagent_streaming_emits_error_event_on_exception(monkeypatc
     finally:
         current_background_tool_call_id.reset(token)
 
-    events = task._test_records
+    events = list(task.captured_events_tail)
     error_records = [e for e in events if e["event"] == "error"]
     assert len(error_records) == 1, f"expected 1 error event, got events={events}"
     assert error_records[0]["data"]["message"] == "model crashed mid-stream"
@@ -368,7 +327,7 @@ async def test_message_id_change_closes_prior_reasoning():
     )
     await fw.finalize()
 
-    events = task._test_records
+    events = list(task.captured_events_tail)
     msg_ids_and_types = [
         (e["data"]["id"], e["data"].get("content_type"), e["data"].get("content"))
         for e in events
@@ -395,7 +354,7 @@ async def test_reasoning_via_additional_kwargs_is_normalized():
     await fw.forward(_chunk("", reasoning_kw="kw-only thought"))
     await fw.finalize()
 
-    events = task._test_records
+    events = list(task.captured_events_tail)
     types_and_content = [
         (e["data"].get("content_type"), e["data"].get("content"))
         for e in events
@@ -419,7 +378,7 @@ async def test_empty_chunks_are_skipped():
     await fw.forward(_chunk(None))
     await fw.finalize()
 
-    assert task._test_records == []
+    assert list(task.captured_events_tail) == []
 
 
 @pytest.mark.asyncio
@@ -451,7 +410,7 @@ async def test_tool_node_inner_llm_chunks_skipped():
     await fw.finalize()
 
     text_chunks = [
-        e for e in task._test_records
+        e for e in task.captured_events_tail
         if e["event"] == "message_chunk"
         and e["data"].get("content_type") in ("text", "reasoning")
     ]
@@ -476,7 +435,7 @@ async def test_no_metadata_does_not_skip():
 
     text = [
         e["data"]["content"]
-        for e in task._test_records
+        for e in task.captured_events_tail
         if e["data"].get("content_type") == "text"
     ]
     assert text == ["Plain content", "More content"]
@@ -552,7 +511,7 @@ async def test_atask_pipeline_forwards_messages_chunks_to_registry(monkeypatch):
         current_background_tool_call_id.reset(token)
 
     text_chunks = [
-        e for e in task._test_records
+        e for e in task.captured_events_tail
         if e["event"] == "message_chunk"
         and e["data"].get("content_type") == "text"
     ]
@@ -586,7 +545,7 @@ async def test_forward_custom_appends_context_window_event() -> None:
         }
     )
 
-    records = task._test_records
+    records = list(task.captured_events_tail)
     assert len(records) == 1
     rec = records[0]
     assert rec["event"] == "context_window"
@@ -611,7 +570,7 @@ async def test_forward_custom_ignores_non_dict() -> None:
     await fwd.forward_custom(None)
     await fwd.forward_custom(42)
 
-    assert task._test_records == []
+    assert list(task.captured_events_tail) == []
 
 
 @pytest.mark.asyncio
@@ -634,7 +593,7 @@ async def test_forward_custom_drops_non_whitelisted_event_types() -> None:
     # Missing ``type`` entirely — must not pass through (no implicit "custom").
     await fwd.forward_custom({"foo": "bar"})
 
-    assert task._test_records == []
+    assert list(task.captured_events_tail) == []
 
 
 @pytest.mark.asyncio
@@ -714,7 +673,7 @@ async def test_atask_pipeline_forwards_custom_events_to_registry(monkeypatch):
         current_background_tool_call_id.reset(token)
 
     cw_events = [
-        e for e in task._test_records if e["event"] == "context_window"
+        e for e in task.captured_events_tail if e["event"] == "context_window"
     ]
     assert len(cw_events) == 1
     data = cw_events[0]["data"]

@@ -63,9 +63,7 @@ class TestBufferEventRedisHappyPath:
 
         assert mock_cache.pipelined_event_buffer.await_count == 1
         call = mock_cache.pipelined_event_buffer.await_args
-        # Main workflow path is stream-only; persistence comes from
-        # StreamEventAccumulator, not from a separate List.
-        assert "events_key" not in call.kwargs
+        assert call.kwargs["events_key"] == "workflow:events:thread-1"
         assert call.kwargs["meta_key"] == "workflow:events:meta:thread-1"
         assert call.kwargs["stream_key"] == "workflow:stream:thread-1"
         assert call.kwargs["last_event_id"] == 42
@@ -73,14 +71,8 @@ class TestBufferEventRedisHappyPath:
         assert call.kwargs["ttl"] == 86400
 
     @pytest.mark.asyncio
-    async def test_malformed_event_id_is_dropped(self):
-        """An event without a parseable ``id:`` line bails out without writing.
-
-        Pre-cutover the legacy List RPUSH still captured these events. Now
-        that the Stream is the only durable store and XADD needs an explicit
-        ``<seq>-0`` id, we drop the event and skip the meta HINCRBY so the
-        next valid event keeps the counter in lock-step with the stream.
-        """
+    async def test_malformed_event_id_still_writes(self):
+        """An event without a parseable `id:` line still gets buffered."""
         btm = _make_btm()
         _register_task(btm)
 
@@ -94,7 +86,8 @@ class TestBufferEventRedisHappyPath:
         ):
             await btm._buffer_event_redis("thread-1", "event: x\ndata: hi\n\n")
 
-        assert mock_cache.pipelined_event_buffer.await_count == 0
+        assert mock_cache.pipelined_event_buffer.await_count == 1
+        assert mock_cache.pipelined_event_buffer.await_args.kwargs["last_event_id"] is None
 
 
 class TestBufferEventRedisFailureModes:
