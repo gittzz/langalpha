@@ -634,6 +634,12 @@ async def write_workspace_file(
             status_code=400, detail="Flash workspaces do not have a sandbox"
         )
 
+    if workspace.get("status") in ("stopped", "stopping", "starting"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot write files — workspace is {workspace.get('status')}. Wait for it to be running.",
+        )
+
     # User-profile virtual files are read-only through this API. Writes happen
     # via the dashboard widgets (portfolio/watchlist CRUD) or the agent's
     # CompositeFilesystemBackend → UserDataBackend route, both of which apply
@@ -648,12 +654,6 @@ async def write_workspace_file(
                 "User-profile JSON files are read-only through the file panel. "
                 "Edit via the dashboard widget or ask the agent to update it."
             ),
-        )
-
-    if workspace.get("status") in ("stopped", "stopping", "starting"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot write files — workspace is {workspace.get('status')}. Wait for it to be running.",
         )
 
     content_bytes = body.content.encode("utf-8")
