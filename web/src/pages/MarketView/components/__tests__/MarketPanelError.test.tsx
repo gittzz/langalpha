@@ -56,13 +56,13 @@ describe('MarketPanel renderErrorContent', () => {
   it('renders structured error with external link as <a> tag', () => {
     const error: StructuredError = {
       message: 'Daily credit limit reached (80/100 credits). Resets at midnight UTC.',
-      link: { url: 'https://ginlix.ai/account/usage', label: 'View Usage' },
+      link: { url: 'https://ginlix.ai/account/plans', label: 'Upgrade plan' },
     };
     render(<Wrapper error={error} />);
 
     expect(screen.getByText(/Daily credit limit reached/)).toBeInTheDocument();
-    const link = screen.getByRole('link', { name: 'View Usage' });
-    expect(link).toHaveAttribute('href', 'https://ginlix.ai/account/usage');
+    const link = screen.getByRole('link', { name: 'Upgrade plan' });
+    expect(link).toHaveAttribute('href', 'https://ginlix.ai/account/plans');
   });
 
   it('renders structured error with internal link using client-side navigation', async () => {

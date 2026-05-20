@@ -433,11 +433,12 @@ class TestEnforceCreditLimitByok:
 
     @pytest.mark.asyncio
     async def test_non_byok_allowed_false_raises_429(self):
-        """byok=False with allowed=False raises 429 (existing behaviour preserved)."""
+        """byok=False with allowed=False raises 429."""
         quota_response = {
             "quota": {
                 "allowed": False,
                 "limit_type": "credit_limit",
+                "message": "Daily credit limit reached",
                 "remaining_credits": 0,
                 "used_credits": 100.0,
                 "credit_limit": 100.0,
@@ -457,6 +458,28 @@ class TestEnforceCreditLimitByok:
 
             assert exc_info.value.status_code == 429
             assert exc_info.value.detail["type"] == "credit_limit"
+
+    @pytest.mark.asyncio
+    async def test_non_byok_forwards_platform_message_verbatim(self):
+        """Platform message + unknown limit_type pass through unchanged."""
+        quota_response = {
+            "quota": {
+                "allowed": False,
+                "limit_type": "some_future_limit",
+                "message": "A future limit string from platform",
+                "retry_after": 30,
+            }
+        }
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._call_validate_for_user", new_callable=AsyncMock, return_value=quota_response),
+        ):
+            from src.server.dependencies.usage_limits import enforce_credit_limit
+            with pytest.raises(HTTPException) as exc_info:
+                await enforce_credit_limit("user-1", byok=False)
+            assert exc_info.value.detail["type"] == "some_future_limit"
+            assert exc_info.value.detail["message"] == "A future limit string from platform"
 
     @pytest.mark.asyncio
     async def test_no_auth_service_url_returns_immediately(self):

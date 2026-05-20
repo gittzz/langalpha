@@ -25,7 +25,7 @@ from src.server.utils.api import get_current_user_id
 
 logger = logging.getLogger(__name__)
 
-# Default burst limit when ginlix-auth doesn't specify one
+# Default burst limit when the auth/quota service doesn't specify one
 _DEFAULT_MAX_CONCURRENT = int(os.getenv("BURST_MAX_CONCURRENT") or "10")
 _BURST_COUNTER_TTL = int(os.getenv("BURST_COUNTER_TTL") or "300")  # seconds
 
@@ -172,7 +172,7 @@ _BYOK_BALANCE_CACHE_TTL = 60  # seconds — negative balance changes slowly
 
 async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
     """
-    Check credit quota via ginlix-auth. Raises HTTPException(429) if exceeded.
+    Check credit quota via the auth/quota service. Raises HTTPException(429) if exceeded.
     No-op in OSS mode.
 
     BYOK path: blocks only on negative balance; cached 60 s (balance changes
@@ -198,17 +198,12 @@ async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
         return
 
     if not quota.get("allowed", True):
-        limit_type = quota.get("limit_type", "credit_limit")
-        if limit_type == "credit_limit":
-            message = "Daily credit limit reached"
-        else:
-            message = "Too many concurrent requests, please wait"
-
+        # Forward platform's `message` and `limit_type` verbatim; no copy authored here.
         raise HTTPException(
             status_code=429,
             detail={
-                "message": message,
-                "type": limit_type,
+                "message": quota.get("message"),
+                "type": quota.get("limit_type", "credit_limit"),
                 "used_credits": quota.get("used_credits"),
                 "credit_limit": quota.get("credit_limit"),
                 "remaining_credits": quota.get("remaining_credits"),
@@ -297,7 +292,7 @@ async def _call_validate_for_user(
     check_quota: Optional[str] = None,
     byok: bool = False,
 ) -> Optional[dict]:
-    """POST to ginlix-auth /api/auth/validate. Returns None in OSS mode or on failure."""
+    """POST to the auth/quota service at /api/auth/validate. Returns None in OSS mode or on failure."""
     if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
         return None
 
@@ -323,18 +318,18 @@ async def _call_validate_for_user(
         if resp.status_code == 200:
             return resp.json()
         logger.warning(
-            "ginlix-auth validate returned %d: %s", resp.status_code, resp.text[:200]
+            "auth/quota service validate returned %d: %s", resp.status_code, resp.text[:200]
         )
         return None
     except Exception as e:
-        logger.warning("ginlix-auth unreachable, failing open: %s", e)
+        logger.warning("auth/quota service unreachable, failing open: %s", e)
         return None
 
 
 async def enforce_workspace_limit(
     user_id: str = Depends(get_current_user_id),
 ) -> str:
-    """FastAPI dependency: enforce active workspace limit via ginlix-auth. No-op in OSS mode."""
+    """FastAPI dependency: enforce active workspace limit via the auth/quota service. No-op in OSS mode."""
     if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
         return user_id
 
@@ -348,11 +343,12 @@ async def enforce_workspace_limit(
         return user_id
 
     if not quota.get("allowed", True):
+        # Forward platform's `message` and `limit_type` verbatim; no copy authored here.
         raise HTTPException(
             status_code=429,
             detail={
-                "message": "Active workspace limit reached",
-                "type": "workspace_limit",
+                "message": quota.get("message"),
+                "type": quota.get("limit_type", "workspace_limit"),
                 "current": quota.get("active_workspaces"),
                 "limit": quota.get("workspace_limit"),
                 "remaining": 0,
@@ -426,7 +422,7 @@ _SCOPE_CACHE_TTL = 300  # 5 minutes
 
 
 async def _get_user_scopes(user_id: str) -> list[str]:
-    """Return user's scopes from ginlix-auth; in-process cache with 5 min TTL."""
+    """Return user's scopes from the auth/quota service; in-process cache with 5 min TTL."""
     import time
 
     now = time.time()

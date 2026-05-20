@@ -9,29 +9,54 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from './contexts/AuthContext';
 import { useIsMobile } from './hooks/useIsMobile';
 import { useSetupGate } from './hooks/useSetupGate';
+import { isPlatformMode } from './config/hostMode';
+import { OAUTH_BROADCAST_CHANNEL, type OAuthPopupMessage } from './lib/oauthPopup';
 import './App.css';
 
 const SetupWizard = React.lazy(() => import('./pages/Setup/SetupWizard'));
 const PrivacyPolicy = React.lazy(() => import('./pages/Legal/PrivacyPolicy'));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
+const LandingPage = React.lazy(() => import('./pages/Landing/LandingPage'));
 
-/** Handles the OAuth redirect from Supabase — shows a spinner then redirects to /dashboard. */
+// In platform mode, `/` is the landing page and `/app` is the application entry.
+// In OSS mode, `/` is the application entry (login or redirect to dashboard).
+const APP_ENTRY_PATH = isPlatformMode ? '/app' : '/';
+
+/**
+ * Handles the OAuth redirect from Supabase. Two modes:
+ * - Popup (opened by loginWithProvider): broadcast to the opener and close.
+ * - Top-level (fallback when the popup was blocked): navigate to /dashboard.
+ */
 function AuthCallback() {
   const { isLoggedIn } = useAuth();
   const navigate = useNavigate();
   const { t: tAuth } = useTranslation();
 
   useEffect(() => {
-    if (isLoggedIn) {
-      // Check for redirect parameter (e.g., from ginlix-auth account pages)
-      const params = new URLSearchParams(window.location.search);
-      const redirectTo = params.get('redirect');
-      if (redirectTo && (redirectTo.startsWith('/') || redirectTo.startsWith('http'))) {
-        window.location.href = redirectTo;
-        return;
+    if (!isLoggedIn) return;
+
+    const isPopup = typeof window !== 'undefined' && !!window.opener && window.opener !== window;
+    if (isPopup) {
+      try {
+        const channel = new BroadcastChannel(OAUTH_BROADCAST_CHANNEL);
+        const msg: OAuthPopupMessage = { type: 'oauth-complete' };
+        channel.postMessage(msg);
+        channel.close();
+      } catch {
+        // BroadcastChannel unsupported — the opener will pick up the cookie
+        // on its next session check (page focus, navigation, etc.).
       }
-      navigate('/dashboard', { replace: true });
+      window.close();
+      return;
     }
+
+    const params = new URLSearchParams(window.location.search);
+    const redirectTo = params.get('redirect');
+    if (redirectTo && (redirectTo.startsWith('/') || redirectTo.startsWith('http'))) {
+      window.location.href = redirectTo;
+      return;
+    }
+    navigate('/dashboard', { replace: true });
   }, [isLoggedIn, navigate]);
 
   return (
@@ -100,9 +125,29 @@ function App() {
     );
   }
 
+  const appEntryElement = isLoggedIn ? <RootRedirect /> : <LoginPage />;
+
   return (
     <Routes>
-      <Route path="/" element={isLoggedIn ? <RootRedirect /> : <LoginPage />} />
+      {isPlatformMode ? (
+        <>
+          <Route
+            path="/"
+            element={
+              <Suspense fallback={
+                <div className="flex items-center justify-center min-h-screen" style={{ backgroundColor: 'var(--color-bg-page)' }}>
+                  <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{t('common.loading')}</p>
+                </div>
+              }>
+                <LandingPage />
+              </Suspense>
+            }
+          />
+          <Route path="/app" element={appEntryElement} />
+        </>
+      ) : (
+        <Route path="/" element={appEntryElement} />
+      )}
       <Route path="/callback" element={<AuthCallback />} />
       <Route path="/s/:shareToken" element={<SharedChatView />} />
       <Route path="/privacy" element={
@@ -133,11 +178,11 @@ function App() {
             <SetupWizard />
           </Suspense>
         ) : (
-          <Navigate to="/" replace />
+          <Navigate to={APP_ENTRY_PATH} replace />
         )
       } />
       <Route path="/*" element={
-        isLoggedIn ? <AuthenticatedShell /> : <Navigate to="/" replace />
+        isLoggedIn ? <AuthenticatedShell /> : <Navigate to={APP_ENTRY_PATH} replace />
       } />
     </Routes>
   );

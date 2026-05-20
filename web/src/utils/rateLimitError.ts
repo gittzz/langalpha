@@ -3,13 +3,16 @@
  *
  * Constructs a structured error from a 429 response's `rateLimitInfo`
  * so both ChatAgent and MarketView produce identical messages and,
- * when the account portal URL is configured, a "View Usage" deep-link.
+ * when the account portal URL is configured, a deep-link to the Plans
+ * page (which hosts both plan upgrades and credit top-up).
  */
 
 export interface RateLimitErrorInfo {
   type?: string;
   used_credits?: number;
   credit_limit?: number;
+  remaining_credits?: number;
+  outstanding_debt?: number;
   current?: number;
   limit?: number;
   message?: string;
@@ -69,7 +72,12 @@ export function buildRateLimitError(
   if (info.type === 'credit_limit') {
     message = `Daily credit limit reached (${info.used_credits}/${info.credit_limit} credits). Resets at midnight UTC.`;
   } else if (info.type === 'negative_balance') {
-    message = (info.message as string) || 'Outstanding credit balance. Please add credits to continue.';
+    const debt = typeof info.outstanding_debt === 'number' ? info.outstanding_debt : undefined;
+    if (debt !== undefined && debt > 0) {
+      message = `Outstanding balance of ${debt} credits from prior platform usage. Top up to clear the debt and continue.`;
+    } else {
+      message = (info.message as string) || 'Outstanding credit balance. Top up to clear the debt and continue.';
+    }
   } else if (info.type === 'workspace_limit') {
     message = `Active workspace limit reached (${info.current}/${info.limit}). Stop or delete an existing workspace to free up a slot.`;
   } else if (info.type === 'burst_limit') {
@@ -78,10 +86,15 @@ export function buildRateLimitError(
     message = (info.message as string) || 'Rate limit exceeded. Please try again later.';
   }
 
-  const link =
-    accountUrl && (info.type === 'credit_limit' || info.type === 'negative_balance')
-      ? { url: `${accountUrl}/usage`, label: 'View Usage' }
-      : undefined;
+  // All credit-related limits route to /plans (which hosts both upgrade and top-up).
+  let link: { url: string; label: string } | undefined;
+  if (accountUrl) {
+    if (info.type === 'negative_balance' || info.type === 'permanent_credit_limit') {
+      link = { url: `${accountUrl}/plans`, label: 'Top up' };
+    } else if (info.type === 'credit_limit' || info.type === 'monthly_credit_limit') {
+      link = { url: `${accountUrl}/plans`, label: 'Upgrade plan' };
+    }
+  }
 
   return { message, link };
 }
