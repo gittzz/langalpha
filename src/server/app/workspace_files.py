@@ -109,7 +109,8 @@ async def _serialize_user_profile_file(client_path: str, user_id: str) -> str:
     else:  # preference.json
         prefs = await user_data_io.fetch_preferences_for_user(user_id)
         payload = user_data_io.serialize_preferences(prefs)
-    return user_data_io.serialize_json(payload)
+    visible = {k: v for k, v in payload.items() if k != "__version__"}
+    return user_data_io.serialize_json(visible)
 
 
 # Derived from shared constants (source of truth: ptc_agent.core.paths)
@@ -495,9 +496,11 @@ async def read_workspace_file(
             raise HTTPException(status_code=500, detail="Failed to read user profile data")
         if unlimited:
             content = text_content
+            truncated = False
         else:
             lines = text_content.splitlines()
             content = "\n".join(lines[offset : offset + limit])
+            truncated = len(lines) > offset + limit
         return {
             "workspace_id": workspace_id,
             "path": normalized_for_profile,
@@ -505,7 +508,7 @@ async def read_workspace_file(
             "limit": limit,
             "content": content,
             "mime": "application/json",
-            "truncated": False,
+            "truncated": truncated,
             "source": "user_data_backend",
         }
 
