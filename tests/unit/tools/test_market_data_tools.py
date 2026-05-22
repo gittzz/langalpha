@@ -346,9 +346,9 @@ class TestFetchCompanyOverview:
             }],
             earnings_calendar=[{
                 "date": "2025-07-24",
-                "eps": 1.52,
+                "epsActual": 1.52,
                 "epsEstimated": 1.45,
-                "revenue": 94_000_000_000,
+                "revenueActual": 94_000_000_000,
                 "revenueEstimated": 92_000_000_000,
                 "fiscalDateEnding": "2025-06-30",
             }],

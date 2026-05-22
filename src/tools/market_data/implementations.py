@@ -1139,7 +1139,7 @@ async def fetch_company_overview_data(symbol: str) -> Dict[str, Any]:
 
     # Earnings surprises (reported only, oldest-first)
     reported_for_artifact = [
-        e for e in earnings_calendar if e.get("eps") is not None
+        e for e in earnings_calendar if e.get("epsActual") is not None
     ]
     if reported_for_artifact:
         artifact["earningsSurprises"] = [
@@ -1148,9 +1148,9 @@ async def fetch_company_overview_data(symbol: str) -> Dict[str, Any]:
                     e.get("fiscalDateEnding"), e.get("date", "")
                 ),
                 "date": e.get("date"),
-                "epsActual": e.get("eps"),
+                "epsActual": e.get("epsActual"),
                 "epsEstimate": e.get("epsEstimated"),
-                "revenueActual": e.get("revenue"),
+                "revenueActual": e.get("revenueActual"),
                 "revenueEstimate": e.get("revenueEstimated"),
             }
             for e in reversed(reported_for_artifact)
@@ -1740,11 +1740,11 @@ No data found for symbol {symbol}"""
 
         # === NEXT EARNINGS REPORT ===
         if earnings_calendar:
-            # Find upcoming reports (eps is None) and pick the earliest one
+            # Find upcoming reports (epsActual is None) and pick the earliest one
             upcoming_reports = [
                 cal
                 for cal in earnings_calendar
-                if cal.get("eps") is None and cal.get("date")
+                if cal.get("epsActual") is None and cal.get("date")
             ]
 
             if upcoming_reports:
@@ -1788,8 +1788,8 @@ No data found for symbol {symbol}"""
                 output_lines.append("")
 
         # === EARNINGS PERFORMANCE ===
-        # Filter to get reported quarters only (eps is not None means already reported)
-        reported_earnings = [e for e in earnings_calendar if e.get("eps") is not None]
+        # Filter to get reported quarters only (epsActual is not None means already reported)
+        reported_earnings = [e for e in earnings_calendar if e.get("epsActual") is not None]
 
         if reported_earnings:
             output_lines.append("### Earnings Performance")
@@ -1799,9 +1799,9 @@ No data found for symbol {symbol}"""
             latest = reported_earnings[0]
             announce_date = latest.get("date", "N/A")
             fiscal_ending = latest.get("fiscalDateEnding")
-            eps_actual = latest.get("eps")
+            eps_actual = latest.get("epsActual")
             eps_estimate = latest.get("epsEstimated")
-            revenue_actual = latest.get("revenue")
+            revenue_actual = latest.get("revenueActual")
             revenue_estimate = latest.get("revenueEstimated")
 
             # Get fiscal period label
@@ -1854,8 +1854,8 @@ No data found for symbol {symbol}"""
                 for quarter in reported_earnings[:4]:
                     q_date = quarter.get("date", "N/A")
                     q_fiscal_ending = quarter.get("fiscalDateEnding")
-                    q_eps = quarter.get("eps")
-                    q_revenue = quarter.get("revenue")
+                    q_eps = quarter.get("epsActual")
+                    q_revenue = quarter.get("revenueActual")
 
                     # Get fiscal period label
                     q_fiscal_label = (
@@ -2218,7 +2218,7 @@ No data found for symbol {symbol}"""
 
         # Earnings surprises from earnings calendar (reported only, oldest-first)
         reported_for_artifact = [
-            e for e in earnings_calendar if e.get("eps") is not None
+            e for e in earnings_calendar if e.get("epsActual") is not None
         ]
         if reported_for_artifact:
             artifact["earningsSurprises"] = [
@@ -2227,9 +2227,9 @@ No data found for symbol {symbol}"""
                         e.get("fiscalDateEnding"), e.get("date", "")
                     ),
                     "date": e.get("date"),
-                    "epsActual": e.get("eps"),
+                    "epsActual": e.get("epsActual"),
                     "epsEstimate": e.get("epsEstimated"),
-                    "revenueActual": e.get("revenue"),
+                    "revenueActual": e.get("revenueActual"),
                     "revenueEstimate": e.get("revenueEstimated"),
                 }
                 for e in reversed(reported_for_artifact)

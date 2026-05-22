@@ -176,9 +176,9 @@ class TestFinancialDataSourceContract:
         row = data[0]
         assert row.get("symbol") == SYMBOL
         # Consumer (implementations.py L1148-1152, L2227-2231) reads
-        # fiscalDateEnding/date and eps/epsActual/epsEstimated.
-        assert has_any(row, "fiscalDateEnding", "date")
-        assert has_any(row, "eps", "epsActual")
+        # Stable returns date + epsActual/epsEstimated; fiscalDateEnding is dropped.
+        assert "date" in row
+        assert "epsActual" in row
         assert "epsEstimated" in row
 
     async def test_get_revenue_by_segment_product(self, source):

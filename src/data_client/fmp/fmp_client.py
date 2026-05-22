@@ -3,11 +3,10 @@ FMP (Financial Modeling Prep) API Client.
 
 Targets the **stable** API (`/stable/...`). Stable changed URL conventions
 relative to legacy v3/v4: symbols are query parameters, several endpoints
-were renamed, and some response keys differ. Two response normalizers
-remain for fields whose contracts are still in flight elsewhere in the
-codebase: quotes expose ``changesPercentage`` for tools/frontend that
-read it directly, and earnings-calendar rows expose ``eps``/``revenue``
-for the earnings-analysis path.
+were renamed, and some response keys differ. One response normalizer
+remains for ``changesPercentage`` (quotes + sector performance), which is
+read directly by tools and the frontend; stable returns ``changePercentage``
+on quotes and ``averageChange`` (numeric) on sector snapshots.
 """
 
 import json
@@ -25,19 +24,6 @@ def _stable_to_v3_quote(row: Dict[str, Any]) -> Dict[str, Any]:
     """Alias stable ``changePercentage`` back to v3 ``changesPercentage``."""
     if "changePercentage" in row and "changesPercentage" not in row:
         row["changesPercentage"] = row["changePercentage"]
-    return row
-
-
-def _stable_to_v3_earnings_calendar(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Add v3 earnings-calendar aliases (``eps``, ``revenue``).
-
-    Stable ``/earnings`` drops ``fiscalDateEnding`` and ``time`` entirely;
-    callers that read them already fall back to ``date``.
-    """
-    if "epsActual" in row and "eps" not in row:
-        row["eps"] = row["epsActual"]
-    if "revenueActual" in row and "revenue" not in row:
-        row["revenue"] = row["revenueActual"]
     return row
 
 
@@ -523,14 +509,15 @@ class FMPClient:
         """Historical + upcoming earnings calendar.
 
         Stable consolidates v3's ``historical/earning_calendar`` into
-        ``earnings``. We add ``eps``/``revenue`` aliases (was ``epsActual``/
-        ``revenueActual`` on stable). ``fiscalDateEnding`` and ``time``
-        (amc/bmo) are not present on stable — callers fall back to ``date``.
+        ``earnings``. Rows expose ``epsActual``/``revenueActual`` (reported)
+        and ``epsEstimated``/``revenueEstimated``. ``fiscalDateEnding`` and
+        ``time`` (amc/bmo) are not present on stable — callers fall back to
+        ``date``.
         """
         data = await self._make_request(
             "earnings", params={"symbol": symbol, "limit": limit}
         )
-        rows = [_stable_to_v3_earnings_calendar(row) for row in (data or [])]
+        rows = list(data or [])
         return rows[:limit] if limit else rows
 
     # =====================================================================

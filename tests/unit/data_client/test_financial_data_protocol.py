@@ -139,10 +139,10 @@ class TestFMPFinancialSource:
     @pytest.mark.asyncio
     async def test_get_earnings_history(self, source):
         src, client = source
-        client.get_historical_earnings_calendar.return_value = [{"eps": 1.5}]
+        client.get_historical_earnings_calendar.return_value = [{"epsActual": 1.5}]
         result = await src.get_earnings_history("AAPL", limit=5)
         client.get_historical_earnings_calendar.assert_awaited_once_with("AAPL", limit=5)
-        assert result == [{"eps": 1.5}]
+        assert result == [{"epsActual": 1.5}]
 
     @pytest.mark.asyncio
     async def test_get_revenue_by_segment_product(self, source):

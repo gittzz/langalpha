@@ -106,7 +106,7 @@ _CASHFLOW_KEY_MAP: dict[str, str] = {
 
 _EARNINGS_KEY_MAP: dict[str, str] = {
     "earnings_date": "date",
-    "reported_eps": "eps",
+    "reported_eps": "epsActual",
     "eps_estimate": "epsEstimated",
     "surprisepct": "surprisePercentage",
 }

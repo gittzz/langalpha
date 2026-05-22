@@ -158,7 +158,7 @@ class TestYFinanceFinancialSourceLive:
         e = result[0]
         # FMP-compatible keys
         assert "date" in e, f"Missing 'date', keys: {list(e.keys())}"
-        assert "eps" in e
+        assert "epsActual" in e
 
     async def test_search_stocks(self):
         from src.data_client.yfinance.financial_source import YFinanceFinancialSource
