@@ -75,7 +75,7 @@ curl -N -X POST "http://localhost:8000/api/v1/threads/messages" \
   }'
 ```
 
-The response includes a `thread_id` in SSE events for follow-up messages.
+The first SSE frame is `event: metadata` carrying `{thread_id, run_id}` — the canonical per-turn identity. The HTTP response also sets `Content-Location: /api/v1/threads/{thread_id}/messages/stream?run_id={run_id}` so the client knows the exact reconnect URL for this turn.
 
 ### Step 3: Continue the Conversation
 
@@ -90,8 +90,10 @@ curl -N -X POST "http://localhost:8000/api/v1/threads/THREAD_ID/messages" \
 
 ### Step 4: Reconnect if Disconnected
 
+Reconnect targets a specific run via `run_id`. If omitted, the server falls back to the latest run on the thread.
+
 ```bash
-curl -N "http://localhost:8000/api/v1/threads/THREAD_ID/messages/stream?last_event_id=42"
+curl -N "http://localhost:8000/api/v1/threads/THREAD_ID/messages/stream?run_id=RUN_ID&last_event_id=42"
 ```
 
 ### Step 5: Check Status
@@ -167,13 +169,16 @@ User identification is handled via:
 ## SSE Event Types
 
 The streaming endpoints emit Server-Sent Events. Key event types:
-- `message_chunk` — text/reasoning streaming
-- `tool_calls` / `tool_call_result` — tool execution
+- `metadata` — first frame of every stream, carries `{thread_id, run_id}` for reconnect/steering
+- `message_chunk` / `reasoning_content` / `reasoning_signal` — text + reasoning streaming
+- `tool_calls` / `tool_call_chunks` / `tool_call_result` — tool execution
 - `artifact` — file operations and outputs
-- `subagent_status` — background task status
+- `user_message` — echo of user input (including mid-turn steering)
+- `workflow_status` / `thread_created` — lifecycle signals
+- `steering_delivered` / `task_steering_accepted` — steering acknowledgements
 - `interrupt` — human-in-the-loop pause
-- `error` / `warning` / `keepalive` — control events
-- `done` — workflow completion
+- `error` / `keepalive` — control events
+- `finish` — workflow completion
 
 ## Versioning
 
