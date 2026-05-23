@@ -53,7 +53,7 @@ class TestYFinanceFinancialSourceLive:
         assert q["symbol"] == _SYMBOL
         assert q["price"] > 0
         assert q["volume"] > 0
-        assert "changesPercentage" in q
+        assert "changePercentage" in q
 
     async def test_get_income_statements(self):
         from src.data_client.yfinance.financial_source import YFinanceFinancialSource
@@ -185,8 +185,8 @@ class TestYFinanceFinancialSourceLive:
         assert "Energy" in sector_names
         # Check format
         for r in result:
-            assert "changesPercentage" in r
-            pct_str = r["changesPercentage"]
+            assert "changePctStr" in r
+            pct_str = r["changePctStr"]
             assert pct_str.endswith("%")
             # Should be parseable as float after stripping % and +
             float(pct_str.replace("%", "").replace("+", ""))

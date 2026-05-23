@@ -114,8 +114,7 @@ class TestFinancialDataSourceContract:
         row = data[0]
         assert row.get("symbol") == SYMBOL
         assert "price" in row
-        # implementations.py L1068/L1466/L2147 destructures changesPercentage.
-        assert has_any(row, "changesPercentage", "changePercentage")
+        assert "changePercentage" in row
         assert "marketCap" in row
 
     async def test_get_income_statements(self, source):
@@ -203,9 +202,10 @@ class TestFinancialDataSourceContract:
         assert isinstance(data, list) and len(data) > 0
         row = data[0]
         assert "sector" in row
-        # implementations.py L408/L2547 reads changesPercentage as a string-or-numeric
-        # change indicator. The stable endpoint uses averageChange.
-        assert has_any(row, "changesPercentage", "averageChange")
+        # _format_sector_change_pct renders averageChange into changePctStr;
+        # both keys are expected on the row.
+        assert "changePctStr" in row
+        assert row["changePctStr"].endswith("%")
 
     async def test_screen_stocks(self, source):
         data = await source.screen_stocks(
@@ -530,9 +530,9 @@ class TestLangChainFetcherContract:
         assert len(artifact["sectors"]) > 0
         s = artifact["sectors"][0]
         assert "sector" in s
-        # Consumer (UI) reads changesPercentage as a float.
-        assert "changesPercentage" in s
-        assert isinstance(s["changesPercentage"], (int, float))
+        # Artifact (consumed by UI) exposes numeric changePercentage.
+        assert "changePercentage" in s
+        assert isinstance(s["changePercentage"], (int, float))
 
     async def test_fetch_stock_screener(self):
         from src.tools.market_data.implementations import fetch_stock_screener

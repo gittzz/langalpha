@@ -490,9 +490,9 @@ export function SectorPerformanceChart({ data }: DataProps): React.ReactElement 
     const name = (s.sector as string) || 'N/A';
     return {
       name: SECTOR_ABBREVIATIONS[name] || name,
-      value: (s.changesPercentage as number) || 0,
-      fill: ((s.changesPercentage as number) || 0) >= 0 ? GREEN : RED,
-      label: formatPct((s.changesPercentage as number) || 0),
+      value: (s.changePercentage as number) || 0,
+      fill: ((s.changePercentage as number) || 0) >= 0 ? GREEN : RED,
+      label: formatPct((s.changePercentage as number) || 0),
     };
   });
 

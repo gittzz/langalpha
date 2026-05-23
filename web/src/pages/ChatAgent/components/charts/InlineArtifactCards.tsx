@@ -461,12 +461,12 @@ export function InlineSectorPerformanceCard({ artifact, onClick }: InlineCardPro
 
   const chartData = sectors
     .slice()
-    .sort((a, b) => ((b.changesPercentage as number) || 0) - ((a.changesPercentage as number) || 0))
+    .sort((a, b) => ((b.changePercentage as number) || 0) - ((a.changePercentage as number) || 0))
     .map((s) => ({
       name: abbreviateSector((s.sector as string) || 'N/A'),
-      value: (s.changesPercentage as number) || 0,
-      fill: ((s.changesPercentage as number) || 0) >= 0 ? GREEN : RED,
-      label: formatPct((s.changesPercentage as number) || 0),
+      value: (s.changePercentage as number) || 0,
+      fill: ((s.changePercentage as number) || 0) >= 0 ? GREEN : RED,
+      label: formatPct((s.changePercentage as number) || 0),
     }));
 
   const barHeight = isMobile ? 18 : 22;

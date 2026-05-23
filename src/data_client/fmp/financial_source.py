@@ -72,8 +72,10 @@ class FMPFinancialSource:
             symbol, **kwargs
         )
 
-    async def get_sector_performance(self) -> list[dict[str, Any]]:
-        return await self._client.get_sector_performance()
+    async def get_sector_performance(
+        self, target_date: str | None = None
+    ) -> list[dict[str, Any]]:
+        return await self._client.get_sector_performance(target_date)
 
     async def screen_stocks(self, **filters: Any) -> list[dict[str, Any]]:
         return await self._client.get_company_screener(**filters)

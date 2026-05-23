@@ -189,7 +189,7 @@ def _get_realtime_quote(symbol: str) -> list[dict[str, Any]]:
             "name": info.get("longName") or info.get("shortName"),
             "price": round(price, 4),
             "change": round(change, 4),
-            "changesPercentage": round(change_pct, 4),
+            "changePercentage": round(change_pct, 4),
             "previousClose": round(prev, 4),
             "open": round(float(fi.get("open", 0) or 0), 4),
             "dayHigh": round(float(fi.get("dayHigh", 0) or 0), 4),
@@ -427,7 +427,7 @@ def _get_single_sector_perf(sector_name: str, etf_symbol: str) -> dict[str, Any]
         sign = "+" if pct >= 0 else ""
         return {
             "sector": sector_name,
-            "changesPercentage": f"{sign}{pct:.2f}%",
+            "changePctStr": f"{sign}{pct:.2f}%",
         }
     except Exception:
         logger.debug("Failed to fetch sector perf for %s (%s)", sector_name, etf_symbol)
@@ -564,7 +564,11 @@ class YFinanceFinancialSource:
     ) -> list[dict[str, Any]]:
         return []  # Not available in yfinance
 
-    async def get_sector_performance(self) -> list[dict[str, Any]]:
+    async def get_sector_performance(
+        self, target_date: str | None = None
+    ) -> list[dict[str, Any]]:
+        # yfinance has no date-aware sector endpoint; we always return today's snapshot.
+        del target_date
         tasks = [
             asyncio.to_thread(_get_single_sector_perf, name, etf)
             for name, etf in _SECTOR_ETFS.items()

@@ -145,7 +145,7 @@ class FMPDataSource:
             "name": q.get("name"),
             "price": q.get("price"),
             "change": q.get("change"),
-            "change_percent": q.get("changesPercentage"),
+            "change_percent": q.get("changePercentage"),
             "previous_close": q.get("previousClose"),
             "open": q.get("open"),
             "high": q.get("dayHigh"),

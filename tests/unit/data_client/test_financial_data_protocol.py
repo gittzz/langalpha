@@ -165,7 +165,15 @@ class TestFMPFinancialSource:
         src, client = source
         client.get_sector_performance.return_value = [{"sector": "Tech"}]
         result = await src.get_sector_performance()
-        client.get_sector_performance.assert_awaited_once_with()
+        client.get_sector_performance.assert_awaited_once_with(None)
+        assert result == [{"sector": "Tech"}]
+
+    @pytest.mark.asyncio
+    async def test_get_sector_performance_with_date(self, source):
+        src, client = source
+        client.get_sector_performance.return_value = [{"sector": "Tech"}]
+        result = await src.get_sector_performance(target_date="2026-05-22")
+        client.get_sector_performance.assert_awaited_once_with("2026-05-22")
         assert result == [{"sector": "Tech"}]
 
     @pytest.mark.asyncio

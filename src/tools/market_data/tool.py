@@ -207,7 +207,7 @@ async def get_sector_performance(
     Returns:
         List of dictionaries with sector performance data including:
         - sector: Sector name (e.g., "Technology", "Healthcare")
-        - changesPercentage: Performance percentage (e.g., "1.50%")
+        - changePctStr: Performance percentage as a string (e.g., "+1.50%")
 
     Available sectors typically include:
         - Basic Materials
@@ -228,8 +228,8 @@ async def get_sector_performance(
 
         # Find best performing sector
         if sectors:
-            best = max(sectors, key=lambda x: float(x.get('changesPercentage', '0%').rstrip('%')))
-            print(f"Best sector: {best['sector']} at {best['changesPercentage']}")
+            best = max(sectors, key=lambda x: float(x.get('changePctStr', '0%').rstrip('%').lstrip('+')))
+            print(f"Best sector: {best['sector']} at {best['changePctStr']}")
     """
     content, artifact = await fetch_sector_performance(date)
     return content, artifact

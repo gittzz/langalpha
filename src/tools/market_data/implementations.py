@@ -405,7 +405,7 @@ def _format_sectors_as_table(sectors_data: List[Dict[str, Any]]) -> str:
     parsed_sectors = []
     for sector in sectors_data:
         sector_name = sector.get("sector", "N/A")
-        change_str = sector.get("changesPercentage", "0%")
+        change_str = sector.get("changePctStr", "0%")
 
         # Parse percentage (handle formats like "+1.50%" or "-0.42%")
         try:
@@ -1065,7 +1065,7 @@ async def fetch_company_overview_data(symbol: str) -> Dict[str, Any]:
         artifact["quote"] = {
             "price": quote.get("price"),
             "change": quote.get("change"),
-            "changePct": quote.get("changesPercentage"),
+            "changePct": quote.get("changePercentage"),
             "dayHigh": quote.get("dayHigh"),
             "dayLow": quote.get("dayLow"),
             "yearHigh": quote.get("yearHigh"),
@@ -1463,7 +1463,7 @@ No data found for symbol {symbol}"""
 
                 q_price = quote.get("price", 0)
                 q_change = quote.get("change", 0)
-                q_change_pct = quote.get("changesPercentage", 0)
+                q_change_pct = quote.get("changePercentage", 0)
                 change_sign = "+" if q_change >= 0 else ""
                 output_lines.append(
                     f"**Price:** ${q_price:.2f} ({change_sign}{q_change:.2f} / {change_sign}{q_change_pct:.2f}%)"
@@ -2144,7 +2144,7 @@ No data found for symbol {symbol}"""
             artifact["quote"] = {
                 "price": quote.get("price"),
                 "change": quote.get("change"),
-                "changePct": quote.get("changesPercentage"),
+                "changePct": quote.get("changePercentage"),
                 "dayHigh": quote.get("dayHigh"),
                 "dayLow": quote.get("dayLow"),
                 "yearHigh": quote.get("yearHigh"),
@@ -2544,14 +2544,14 @@ async def fetch_sector_performance(
         sectors = []
         for sector in raw_results:
             sector_name = sector.get("sector", "N/A")
-            change_str = sector.get("changesPercentage", "0%")
+            change_str = sector.get("changePctStr", "0%")
             try:
                 change_val = float(change_str.replace("%", "").replace("+", ""))
             except (ValueError, AttributeError):
                 change_val = 0.0
-            sectors.append({"sector": sector_name, "changesPercentage": change_val})
+            sectors.append({"sector": sector_name, "changePercentage": change_val})
         # Sort descending by performance
-        sectors.sort(key=lambda x: x["changesPercentage"], reverse=True)
+        sectors.sort(key=lambda x: x["changePercentage"], reverse=True)
         return {"type": "sector_performance", "sectors": sectors}
 
     try:
@@ -2566,32 +2566,19 @@ async def fetch_sector_performance(
 
 """
 
-        # Try protocol-based provider first
+        # Protocol path — passes date through to FMP's date-aware endpoint;
+        # yfinance ignores `target_date` and always returns today's snapshot.
         if provider.financial is not None:
             try:
-                results = await provider.financial.get_sector_performance()
-                if results:
-                    logger.debug(f"Retrieved performance data for {len(results)} sectors")
-                    content = header + _format_sectors_as_table(results)
-                    return content, _build_sector_artifact(results)
-            except Exception:
-                pass
-
-        # Fallback to stable version with date if provided
-        if date:
-            try:
-                results = await _fmp_request(
-                    "_make_request",
-                    "sector-performance-snapshot",
-                    params={"date": date},
-                    version="stable",
+                results = await provider.financial.get_sector_performance(
+                    target_date=date
                 )
                 if results:
                     logger.debug(f"Retrieved performance data for {len(results)} sectors")
                     content = header + _format_sectors_as_table(results)
                     return content, _build_sector_artifact(results)
             except Exception:
-                pass
+                logger.exception("Sector performance provider call failed")
 
         logger.warning(
             "No sector performance data found - endpoint may not be available on this FMP plan"

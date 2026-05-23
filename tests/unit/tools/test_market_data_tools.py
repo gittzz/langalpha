@@ -363,7 +363,7 @@ class TestFetchCompanyOverview:
             price_target_consensus=[{"targetMedian": 260.0, "targetLow": 200.0, "targetHigh": 300.0, "targetConsensus": "Buy"}],
             grades_summary=[{"strongBuy": 10, "buy": 15, "hold": 5, "sell": 1, "strongSell": 0, "consensus": "Buy"}],
             quote_data=[{
-                "price": 235.50, "change": 2.30, "changesPercentage": 0.99,
+                "price": 235.50, "change": 2.30, "changePercentage": 0.99,
                 "dayHigh": 237.0, "dayLow": 233.0, "yearHigh": 260.0, "yearLow": 165.0,
                 "open": 234.0, "previousClose": 233.20, "volume": 55_000_000, "avgVolume": 60_000_000,
                 "marketCap": 3_500_000_000_000,
@@ -425,7 +425,7 @@ class TestFetchCompanyOverview:
         financial = _make_fake_financial_source(
             profile_data=full_profile,
             quote_data=[{
-                "price": 235.50, "change": 2.30, "changesPercentage": 0.99,
+                "price": 235.50, "change": 2.30, "changePercentage": 0.99,
                 "dayHigh": 237.0, "dayLow": 233.0, "yearHigh": 260.0, "yearLow": 165.0,
                 "open": 234.0, "previousClose": 233.20, "volume": 55_000_000,
                 "avgVolume": 60_000_000, "marketCap": 3_500_000_000_000,
@@ -543,9 +543,9 @@ class TestFetchSectorPerformance:
     async def test_normal_sector_data(self):
         """Normal data should produce formatted sector table."""
         sector_data = [
-            {"sector": "Technology", "changesPercentage": "+1.50%"},
-            {"sector": "Healthcare", "changesPercentage": "-0.42%"},
-            {"sector": "Energy", "changesPercentage": "+0.85%"},
+            {"sector": "Technology", "changePctStr": "+1.50%"},
+            {"sector": "Healthcare", "changePctStr": "-0.42%"},
+            {"sector": "Energy", "changePctStr": "+0.85%"},
         ]
         financial = _make_fake_financial_source(sector_data=sector_data)
         provider = _make_fake_financial_provider(financial=financial)
@@ -576,21 +576,19 @@ class TestFetchSectorPerformance:
 
     @pytest.mark.asyncio
     async def test_with_date_parameter(self):
-        """Passing a date should fall back to _fmp_request if protocol returns []."""
+        """Passing a date should be forwarded to provider.get_sector_performance."""
         sector_data = [
-            {"sector": "Technology", "changesPercentage": "+1.50%"},
+            {"sector": "Technology", "changePctStr": "+1.50%"},
         ]
-        financial = _make_fake_financial_source(sector_data=[])
+        financial = _make_fake_financial_source(sector_data=sector_data)
         provider = _make_fake_financial_provider(financial=financial)
 
-        with (
-            patch(f"{_MOD}.get_financial_data_provider", return_value=provider),
-            patch(f"{_MOD}._fmp_request", return_value=sector_data),
-        ):
+        with patch(f"{_MOD}.get_financial_data_provider", return_value=provider):
             content, artifact = await fetch_sector_performance(date="2025-01-15")
 
         assert "Technology" in content
         assert artifact["type"] == "sector_performance"
+        financial.get_sector_performance.assert_awaited_once_with(target_date="2025-01-15")
 
 
 # ---------------------------------------------------------------------------

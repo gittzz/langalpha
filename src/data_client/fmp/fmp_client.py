@@ -1,12 +1,7 @@
-"""
-FMP (Financial Modeling Prep) API Client.
+"""FMP (Financial Modeling Prep) async client — targets the stable API.
 
-Targets the **stable** API (`/stable/...`). Stable changed URL conventions
-relative to legacy v3/v4: symbols are query parameters, several endpoints
-were renamed, and some response keys differ. One response normalizer
-remains for ``changesPercentage`` (quotes + sector performance), which is
-read directly by tools and the frontend; stable returns ``changePercentage``
-on quotes and ``averageChange`` (numeric) on sector snapshots.
+Responses pass through unchanged except for the sector performance snapshot;
+see :func:`_format_sector_change_pct`.
 """
 
 import json
@@ -20,25 +15,22 @@ import httpx
 _CACHE_MAX_SIZE = 512
 
 
-def _stable_to_v3_quote(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Alias stable ``changePercentage`` back to v3 ``changesPercentage``."""
-    if "changePercentage" in row and "changesPercentage" not in row:
-        row["changesPercentage"] = row["changePercentage"]
-    return row
+def _format_sector_change_pct(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Render sector snapshot's numeric ``averageChange`` as a percentage string.
 
-
-def _stable_to_v3_sector(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert numeric ``averageChange`` to v3 ``changesPercentage`` string.
-
-    Consumers like ``fetch_sector_performance`` parse the v3 string format
-    ``"-0.11647%"`` with ``float(s.replace("%", ""))``.
+    Stable returns ``averageChange`` as a float (e.g. ``-0.0011647``); this is
+    the canonical shape this codebase uses for sector daily change at the data
+    boundary — a percentage string like ``"-0.11647%"`` under ``changePctStr``.
+    Sector consumers downstream parse it back to a numeric for the artifact /
+    UI under the separate ``changePercentage`` key, so the string here lives
+    alongside the numeric without ambiguity.
     """
-    if "averageChange" in row and "changesPercentage" not in row:
+    if "averageChange" in row and "changePctStr" not in row:
         val = row["averageChange"]
         if isinstance(val, (int, float)):
-            row["changesPercentage"] = f"{val:.5f}%"
+            row["changePctStr"] = f"{val:.5f}%"
         else:
-            row["changesPercentage"] = str(val)
+            row["changePctStr"] = str(val)
     return row
 
 
@@ -554,10 +546,9 @@ class FMPClient:
     # =====================================================================
 
     async def get_quote(self, symbol: str) -> List[Dict]:
-        data = await self._make_request(
+        return await self._make_request(
             "quote", params={"symbol": symbol}, use_cache=False
         )
-        return [_stable_to_v3_quote(row) for row in (data or [])]
 
     async def get_aftermarket_quote(self, symbol: str) -> List[Dict]:
         return await self._make_request(
@@ -594,10 +585,9 @@ class FMPClient:
         return flat
 
     async def get_batch_quotes(self, symbols: List[str]) -> List[Dict]:
-        data = await self._make_request(
+        return await self._make_request(
             "batch-quote", params={"symbols": ",".join(symbols)}
         )
-        return [_stable_to_v3_quote(row) for row in (data or [])]
 
     async def get_batch_market_cap(self, symbols: List[str]) -> List[Dict]:
         return await self._make_request(
@@ -674,17 +664,18 @@ class FMPClient:
     ) -> List[Dict]:
         """Daily snapshot of US sector performance.
 
-        Stable replaces v3's ``sectors-performance`` (no date) with
-        ``sector-performance-snapshot?date=`` (requires a date — defaults
-        to today). The numeric ``averageChange`` is aliased to a v3-style
-        string ``changesPercentage`` for the existing parser.
+        Stable's ``sector-performance-snapshot?date=`` requires a date —
+        defaults to today. The numeric ``averageChange`` is also rendered
+        as a percentage string under ``changePctStr`` (see
+        :func:`_format_sector_change_pct`) — that's the canonical shape
+        sector consumers parse.
         """
         if not target_date:
             target_date = date.today().isoformat()
         data = await self._make_request(
             "sector-performance-snapshot", params={"date": target_date}
         )
-        return [_stable_to_v3_sector(row) for row in (data or [])]
+        return [_format_sector_change_pct(row) for row in (data or [])]
 
     # =====================================================================
     # Technical Indicators
