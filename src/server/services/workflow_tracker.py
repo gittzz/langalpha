@@ -246,7 +246,8 @@ class WorkflowTracker:
     async def mark_interrupted(
         self,
         thread_id: str,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        run_id: Optional[str] = None,
     ) -> bool:
         """
         Mark workflow as interrupted (paused for human-in-the-loop review).
@@ -254,12 +255,9 @@ class WorkflowTracker:
         The workflow is waiting for user input (e.g., plan approval) and is
         NOT actively streaming. Uses the same TTL as completed workflows.
 
-        Args:
-            thread_id: Thread/workflow identifier
-            metadata: Optional metadata about the interrupt
-
-        Returns:
-            True if successfully marked, False otherwise
+        When `run_id` is supplied, the write is skipped if the stored status
+        belongs to a different run — prevents a stale HITL interrupt from
+        clobbering a newer turn's ACTIVE status.
         """
         if not self.enabled:
             return False
@@ -269,7 +267,8 @@ class WorkflowTracker:
             new_status=WorkflowStatus.INTERRUPTED,
             timestamp_field="interrupted_at",
             metadata=metadata,
-            ttl=None  # No TTL - workflow can be resumed at any time
+            ttl=None,  # No TTL - workflow can be resumed at any time
+            run_id=run_id,
         )
 
         if success:

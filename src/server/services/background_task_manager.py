@@ -1198,7 +1198,8 @@ class BackgroundTaskManager:
                     tracker = WorkflowTracker.get_instance()
                     await tracker.mark_interrupted(
                         thread_id=thread_id,
-                        metadata={"interrupt_reason": interrupt_reason, "run_id": run_id},
+                        run_id=run_id,
+                        metadata={"interrupt_reason": interrupt_reason},
                     )
                 except Exception as persist_error:
                     logger.error(

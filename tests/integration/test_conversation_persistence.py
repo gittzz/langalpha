@@ -186,7 +186,10 @@ class TestQueryCRUD:
     async def test_idempotent_query_insert(
         self, seed_workspace, patched_get_db_connection
     ):
+        import pytest
+
         from src.server.database.conversation import (
+            QueryConflictError,
             create_query,
             create_thread,
             get_queries_for_thread,
@@ -210,19 +213,33 @@ class TestQueryCRUD:
             query_type="initial",
             idempotent=True,
         )
-        # Re-insert with same thread+turn_index but different content
+
+        # Same (thread, turn_index, content) is a true no-op.
         await create_query(
-            conversation_query_id=query_id,
+            conversation_query_id=str(uuid.uuid4()),
             conversation_thread_id=thread_id,
             turn_index=0,
-            content="Updated",
+            content="Original",
             query_type="initial",
             idempotent=True,
         )
 
+        # Same (thread, turn_index) with different content raises — the
+        # content-gated upsert refuses to silently overwrite a concurrent
+        # write's row.
+        with pytest.raises(QueryConflictError):
+            await create_query(
+                conversation_query_id=str(uuid.uuid4()),
+                conversation_thread_id=thread_id,
+                turn_index=0,
+                content="Updated",
+                query_type="initial",
+                idempotent=True,
+            )
+
         queries, total = await get_queries_for_thread(thread_id)
         assert total == 1
-        assert queries[0]["content"] == "Updated"
+        assert queries[0]["content"] == "Original"
 
 
 class TestResponseCRUD:
