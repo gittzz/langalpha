@@ -1989,6 +1989,75 @@ export function useChatMessages(
     currentReasoningIdRef.current = null;
     currentToolCallIdRef.current = null;
 
+    // Strip interrupt segments populated by history replay before the reconnect stream
+    // re-delivers them; otherwise the same question/proposal renders twice (once on the
+    // history bubble, once on the reconnect bubble). The reconnect stream is
+    // authoritative for live interrupt state. Also redirect any unresolved-interrupt
+    // refs to point at the new reconnect bubble so the tool_call_result history-resolver
+    // writes resolution status to where the proposal actually lives now.
+    const stripList = unresolvedHistoryInterruptRef.current;
+    if (stripList.length > 0) {
+      const stripsByMsgId = new Map<string, HistoryInterruptInfo[]>();
+      for (const info of stripList) {
+        const arr = stripsByMsgId.get(info.assistantMessageId) || [];
+        arr.push(info);
+        stripsByMsgId.set(info.assistantMessageId, arr);
+      }
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (m.role !== 'assistant') return m;
+          const strips = stripsByMsgId.get(m.id);
+          if (!strips) return m;
+          const msg = m as AssistantMessage;
+          const stripQuestionIds = new Set(
+            strips.filter((s) => s.type === 'ask_user_question' && s.questionId).map((s) => s.questionId!),
+          );
+          const stripProposalIds = new Set(strips.filter((s) => s.proposalId).map((s) => s.proposalId!));
+          const stripPlanApprovalIds = new Set(
+            strips.filter((s) => s.type === 'plan_approval' && s.planApprovalId).map((s) => s.planApprovalId!),
+          );
+          const newSegments = (msg.contentSegments || []).filter((seg) => {
+            if (seg.type === 'user_question') return !stripQuestionIds.has(seg.questionId);
+            if (
+              seg.type === 'create_workspace' ||
+              seg.type === 'start_question' ||
+              seg.type === 'ptc_agent' ||
+              seg.type === 'delete_workspace' ||
+              seg.type === 'stop_workspace' ||
+              seg.type === 'delete_thread'
+            ) {
+              return !stripProposalIds.has(seg.proposalId);
+            }
+            if (seg.type === 'plan_approval') return !stripPlanApprovalIds.has(seg.planApprovalId);
+            return true;
+          });
+          const next: AssistantMessage = { ...msg, contentSegments: newSegments };
+          if (stripQuestionIds.size > 0 && msg.userQuestions) {
+            const map = { ...msg.userQuestions };
+            for (const qid of stripQuestionIds) delete map[qid];
+            next.userQuestions = map;
+          }
+          if (stripProposalIds.size > 0) {
+            for (const key of ['workspaceProposals', 'questionProposals', 'ptcAgentProposals', 'secretaryActionProposals'] as const) {
+              const bucket = msg[key];
+              if (!bucket) continue;
+              const map = { ...bucket };
+              for (const pid of stripProposalIds) delete (map as Record<string, unknown>)[pid];
+              (next as unknown as Record<string, unknown>)[key] = map;
+            }
+          }
+          if (stripPlanApprovalIds.size > 0 && msg.planApprovals) {
+            const map = { ...msg.planApprovals };
+            for (const pid of stripPlanApprovalIds) delete map[pid];
+            next.planApprovals = map;
+          }
+          return next;
+        }),
+      );
+      // Redirect refs so the tool_call_result history-resolver targets the new bubble.
+      for (const info of stripList) info.assistantMessageId = assistantMessageId;
+    }
+
     {
       const assistantMessage = createAssistantMessage(assistantMessageId);
       // Replace trailing empty history assistant message (created by history replay for the
