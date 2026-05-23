@@ -18,7 +18,7 @@ import { type SubagentTokenUsage, ZERO_USAGE, extractTokenUsageDelta, accumulate
 import { computeSteeringBoundary, shouldSkipSteeringRollback } from '../utils/steeringRollback';
 export { removeStoredThreadId } from './utils/threadStorage';
 import { createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, type AttachmentMeta } from './utils/messageHelpers';
-import type { ChatMessage, AssistantMessage } from '@/types/chat';
+import type { ChatMessage, AssistantMessage, UserMessage } from '@/types/chat';
 import type { ActionRequest, ToolCallData, TodoItem } from '@/types/sse';
 import type { HtmlWidgetData, PreviewData } from './utils/types';
 import { createRecentlySentTracker } from './utils/recentlySentTracker';
@@ -149,6 +149,7 @@ interface SSEEvent {
   active_tasks?: string[];
   can_reconnect?: boolean;
   is_shared?: boolean;
+  run_id?: string;
   [key: string]: unknown;
 }
 
@@ -602,6 +603,12 @@ export function useChatMessages(
 
   // Track the last received SSE event ID for reconnection
   const lastEventIdRef = useRef<number | string | null>(null);
+  // Track the active run_id for this thread. Populated from the SSE
+  // ``metadata`` event (first event of every workflow stream) so reconnect
+  // can target the exact ``workflow:stream:{tid}:{rid}`` key and so the
+  // steering handler can detect when a POST was routed as a new turn
+  // (race: status flipped terminal between isLoading check and POST land).
+  const currentRunIdRef = useRef<string | null>(null);
   // Ref-based thread ID for use inside closures (avoids stale React state in callbacks)
   const threadIdRef = useRef(threadId);
   // Batch back-to-back offload events into a single notification
@@ -2103,7 +2110,12 @@ export function useChatMessages(
       // Replay buffered events first — this processes artifact{task,spawned} events
       // which create subagent cards with the correct description/type. Per-task streams
       // are opened AFTER so they merge into existing cards instead of creating empty ones.
-      const result = await reconnectToWorkflowStream(threadId, lastEventIdRef.current as number | null, processEvent);
+      const result = await reconnectToWorkflowStream(
+        threadId,
+        currentRunIdRef.current,
+        lastEventIdRef.current as number | null,
+        processEvent,
+      );
       if (result?.disconnected) {
         throw new Error('Reconnection stream disconnected');
       }
@@ -2649,6 +2661,16 @@ export function useChatMessages(
       // Track last event ID for reconnection
       if (event._eventId != null) {
         lastEventIdRef.current = event._eventId;
+      }
+
+      // The ``metadata`` event is the first event of every workflow stream
+      // and carries the authoritative run_id for this turn. Latch it so
+      // reconnect targets ``workflow:stream:{tid}:{rid}`` precisely.
+      if (eventType === 'metadata') {
+        if (event.run_id) {
+          currentRunIdRef.current = event.run_id;
+        }
+        return;
       }
 
       // compaction_chunk is the side channel for LLM output from the
@@ -3654,6 +3676,16 @@ export function useChatMessages(
   /**
    * Handles sending a message while the agent is already streaming (steering).
    * The backend will accept it for injection before the next LLM call.
+   *
+   * Demotion path: the frontend's ``isLoading`` lags the backend's task status by
+   * the SSE-drain window. If the user sends after the workflow has flipped to a
+   * terminal status but before the terminal SSE event reaches us, ``wait_or_steer``
+   * routes this POST as a new turn instead of steering. The backend emits an
+   * authoritative ``metadata`` event (with a fresh ``run_id``) as the first event
+   * of the new turn's stream — receipt of any ``metadata`` event on the steering
+   * POST means we got routed as a new turn. We demote the user bubble (strip the
+   * badge) and switch subsequent events to the standard stream processor so the
+   * new turn renders normally.
    */
   const handleSendSteering = async (message: string, planMode: boolean = false, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null) => {
     // Show user message in chat with steering indicator
@@ -3661,6 +3693,55 @@ export function useChatMessages(
     const userMessage: MessageRecord = { ...userMsg, steering: true };
     recentlySentTrackerRef.current.track(message.trim(), userMessage.timestamp, userMessage.id);
     setMessages((prev) => appendMessage(prev,userMessage));
+
+    let demotedToNewTurn = false;
+    let demotedProcessor: ((event: SSEEvent) => void) | null = null;
+    let demotedAssistantId: string | null = null;
+    const demotedInterruptedRef = { current: false };
+    // Stash the Content-Location run_id but DO NOT commit it to
+    // currentRunIdRef until we've seen evidence that this POST actually
+    // started a new workflow (i.e., demoteToNewTurn fires). Committing
+    // eagerly on Content-Location alone would overwrite the active
+    // workflow's run_id when the backend routes this as steering-only.
+    let pendingRunIdFromHeader: string | null = null;
+
+    const demoteToNewTurn = (): void => {
+      demotedToNewTurn = true;
+      if (pendingRunIdFromHeader) {
+        currentRunIdRef.current = pendingRunIdFromHeader;
+      }
+      setMessages((prev) =>
+        updateMessage(prev, userMessage.id as string, (msg) => {
+          if (msg.role !== 'user') return msg;
+          const next: UserMessage & { queuePosition?: unknown; queueError?: unknown } = { ...msg };
+          delete next.steering;
+          delete next.queuePosition;
+          delete next.queueError;
+          return next;
+        })
+      );
+      const newAssistantId = `assistant-${Date.now()}`;
+      demotedAssistantId = newAssistantId;
+      contentOrderCounterRef.current = 0;
+      currentReasoningIdRef.current = null;
+      currentToolCallIdRef.current = null;
+      const assistantMessage = createAssistantMessage(newAssistantId);
+      setMessages((prev) => appendMessage(prev, assistantMessage));
+      currentMessageRef.current = newAssistantId;
+      isStreamingRef.current = true;
+      setIsLoading(true);
+      const refs = {
+        contentOrderCounterRef,
+        currentReasoningIdRef,
+        currentToolCallIdRef,
+        steeringAtOrderRef,
+        updateTodoListCard: updateTodoListCard || undefined,
+        isNewConversation: false,
+        subagentStateRefs: subagentStateRefsRef.current,
+        updateSubagentCard: updateSubagentCard || (() => {}),
+      };
+      demotedProcessor = createStreamEventProcessor(newAssistantId, refs, getTaskIdFromEvent, demotedInterruptedRef);
+    };
 
     try {
       // Send to same endpoint — backend will auto-accept steering and return steering_accepted SSE
@@ -3686,6 +3767,20 @@ export function useChatMessages(
                 queuePosition: event.position,
               }))
             );
+            return;
+          }
+          // First non-steering event = backend routed as a new turn (race: status
+          // flipped to terminal before our POST landed). The first frame in that
+          // case is the authoritative ``metadata`` event (carrying a fresh
+          // run_id) per the backend SSE protocol; we also accept any other
+          // non-steering event here as defense-in-depth (e.g. an early error
+          // before workflow start). The demoted processor handles ``metadata``
+          // itself — it stores ``run_id`` into ``currentRunIdRef``.
+          if (!demotedToNewTurn) {
+            demoteToNewTurn();
+          }
+          if (demotedProcessor) {
+            demotedProcessor(event);
           }
         },
         additionalContext,
@@ -3698,9 +3793,47 @@ export function useChatMessages(
         null,
         null,
         platform,
+        // Stash the Content-Location run_id but defer the commit until
+        // demoteToNewTurn fires. Backend emits Content-Location on every
+        // POST including pure-steering responses; committing eagerly would
+        // overwrite the active workflow's run_id with a stream key that
+        // never gets written to.
+        (runId) => {
+          pendingRunIdFromHeader = runId;
+        },
       );
+      if (demotedToNewTurn) {
+        const finalId = currentMessageRef.current || demotedAssistantId;
+        if (finalId) {
+          setMessages((prev) =>
+            updateMessage(prev, finalId, (msg) => ({
+              ...msg,
+              isStreaming: false,
+            }))
+          );
+          if (!demotedInterruptedRef.current) {
+            cleanupAfterStreamEnd(finalId);
+          }
+        }
+      }
     } catch (err: unknown) {
       console.error('Error sending steering:', err);
+      if (demotedToNewTurn && demotedAssistantId) {
+        // Demoted path: the failure belongs to the new turn's assistant, not the steering badge.
+        const finalAssistantId = demotedAssistantId;
+        setMessages((prev) =>
+          updateMessage(prev, finalAssistantId, (msg) => ({
+            ...msg,
+            content: msg.content || 'Failed to send message. Please try again.',
+            isStreaming: false,
+            error: true,
+          }))
+        );
+        setMessageError((err as Error).message || 'Failed to send message');
+        isStreamingRef.current = false;
+        setIsLoading(false);
+        return;
+      }
       // Update user message to show steering failure
       setMessages((prev) =>
         updateMessage(prev,userMessage.id as string, (msg) => ({
@@ -3794,6 +3927,10 @@ export function useChatMessages(
     contentOrderCounterRef.current = 0;
     currentReasoningIdRef.current = null;
     currentToolCallIdRef.current = null;
+    // Clear the active run_id; the new turn's metadata frame will repopulate
+    // it. Prevents a stale run_id from biasing a reconnect into an older
+    // ``workflow:stream:{tid}:{rid}`` key.
+    currentRunIdRef.current = null;
 
     const assistantMessage = createAssistantMessage(assistantMessageId);
 
@@ -3838,6 +3975,12 @@ export function useChatMessages(
         reasoningEffort || null,
         fastMode || null,
         platform,
+        // Latch run_id from Content-Location BEFORE the first SSE body byte —
+        // closes the reconnect race window if the stream drops between our
+        // pre-POST clear (line ~3916) and the new turn's first metadata event.
+        (runId) => {
+          currentRunIdRef.current = runId;
+        },
       );
 
       if (result?.disconnected) {
@@ -3937,6 +4080,10 @@ export function useChatMessages(
     contentOrderCounterRef.current = 0;
     currentReasoningIdRef.current = null;
     currentToolCallIdRef.current = null;
+    // HITL resume always opens a fresh run on the backend (1:1 with
+    // ``conversation_response_id``); clear the stale ref so the new turn's
+    // metadata frame is the source of truth.
+    currentRunIdRef.current = null;
 
     const assistantMessage = createAssistantMessage(assistantMessageId);
     setMessages((prev) => appendMessage(prev, assistantMessage));
@@ -3970,7 +4117,15 @@ export function useChatMessages(
         processEvent,
         planMode,
         lastModelOptionsRef.current as { model?: string; reasoningEffort?: string; fastMode?: boolean },
-        agentMode
+        agentMode,
+        // Latch the fresh run_id from response headers before the first SSE
+        // body byte. Without this, an early disconnect (between the pre-POST
+        // clear at line ~4063 and the metadata frame) would let
+        // attemptReconnectAfterDisconnect fall back to the prior
+        // SOFT_INTERRUPTED TaskInfo and silently hang.
+        (runId) => {
+          currentRunIdRef.current = runId;
+        },
       );
 
       if (result?.disconnected) {
@@ -4260,6 +4415,9 @@ export function useChatMessages(
     contentOrderCounterRef.current = 0;
     currentReasoningIdRef.current = null;
     currentToolCallIdRef.current = null;
+    // Edit/regenerate opens a fresh backend run; clear the prior run_id so
+    // the new metadata frame becomes the source of truth.
+    currentRunIdRef.current = null;
 
     const assistantMessage = createAssistantMessage(assistantMessageId);
     const userMessage = message ? createUserMessage(message) : null;
@@ -4313,6 +4471,11 @@ export function useChatMessages(
         modelOptions.reasoningEffort || null,
         modelOptions.fastMode || null,
         platform,
+        // Latch run_id from response headers — see handleSendMessage for the
+        // same closing-the-race rationale.
+        (runId) => {
+          currentRunIdRef.current = runId;
+        },
       );
 
       if (result?.disconnected) {

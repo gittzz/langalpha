@@ -1,6 +1,7 @@
 /** SSE event type union and per-event interfaces */
 
 export type SSEEventType =
+  | 'metadata'
   | 'reasoning_signal'
   | 'reasoning_content'
   | 'message_chunk'
@@ -23,6 +24,17 @@ export interface BaseSSEEvent {
   agent?: string;
   _eventId?: number | string;
   timestamp?: string | number;
+}
+
+/**
+ * First event of every workflow stream. Announces the authoritative
+ * ``run_id`` for this turn so the client can latch reconnect/demotion
+ * logic onto it. Mirrors the langgraph_sdk SSE ``metadata`` payload.
+ */
+export interface MetadataEvent extends BaseSSEEvent {
+  event: 'metadata';
+  run_id: string;
+  thread_id: string;
 }
 
 export interface ReasoningSignalEvent extends BaseSSEEvent {
@@ -181,6 +193,7 @@ export interface FinishEvent extends BaseSSEEvent {
 
 /** Discriminated union of all SSE events */
 export type SSEEvent =
+  | MetadataEvent
   | ReasoningSignalEvent
   | ReasoningContentEvent
   | MessageChunkEvent

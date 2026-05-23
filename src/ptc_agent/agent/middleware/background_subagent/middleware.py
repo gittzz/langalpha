@@ -389,6 +389,16 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
             else ""
         )
 
+        # Extract the current turn's run_id from the LangGraph config so the
+        # registry can stamp it on newly-spawned subagents without relying on
+        # ``registry.current_run_id`` (which races when two concurrent turns
+        # on the same thread share the per-thread registry).
+        current_run_id = (
+            request.runtime.config.get("run_id")
+            if request.runtime
+            else None
+        )
+
         # --- Action-based routing ---
         if action == "update":
             # --- UPDATE: Instruct a running task via Redis ---
@@ -579,6 +589,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 prompt=prompt,
                 subagent_type=subagent_type,
                 asyncio_task=None,  # Will be set after task creation
+                run_id=current_run_id,
             )
             logger.info(
                 "Intercepting task tool call for background execution",

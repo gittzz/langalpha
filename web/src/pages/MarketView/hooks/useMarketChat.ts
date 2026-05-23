@@ -130,6 +130,14 @@ export function useMarketChat(): UseMarketChatReturn {
   const threadIdRef = useRef('__default__');
   const contentOrderCounterRef = useRef(0);
   const currentReasoningIdRef = useRef<string | null>(null);
+  // Track the active run_id for this thread. Populated from the SSE
+  // ``metadata`` event (first event of every workflow stream) so any
+  // future reconnect path can target ``workflow:stream:{tid}:{rid}``
+  // precisely. MarketView's flash chat currently has no SSE reconnect
+  // surface (only the market-data WebSocket reconnects); captured here
+  // for parity with ChatAgent's useChatMessages so the ref is ready if
+  // a reconnect helper is added later.
+  const currentRunIdRef = useRef<string | null>(null);
 
   // --- Batching infrastructure ---
   // Pending updates accumulate here; flushed on a timer
@@ -394,6 +402,10 @@ export function useMarketChat(): UseMarketChatReturn {
     const assistantMessageId = `assistant-${Date.now()}`;
     contentOrderCounterRef.current = 0;
     currentReasoningIdRef.current = null;
+    // Clear the active run_id so the new turn's ``metadata`` frame becomes
+    // the source of truth. Prevents a stale run_id from biasing any future
+    // reconnect into a prior run's buffered stream.
+    currentRunIdRef.current = null;
 
     const assistantMessage = createAssistantMessage(assistantMessageId);
     setMessages((prev) => appendMessage(prev, assistantMessage));
@@ -416,6 +428,18 @@ export function useMarketChat(): UseMarketChatReturn {
           // Update thread_id if provided in the event
           if (event.thread_id && event.thread_id !== threadIdRef.current && event.thread_id !== '__default__') {
             threadIdRef.current = event.thread_id as string;
+          }
+
+          // The ``metadata`` event is the first event of every workflow
+          // stream and carries the authoritative run_id for this turn.
+          // Latch it so any future reconnect path can target
+          // ``workflow:stream:{tid}:{rid}`` precisely. Return early so it
+          // doesn't fall through to the message handlers.
+          if (eventType === 'metadata') {
+            if (event.run_id) {
+              currentRunIdRef.current = event.run_id as string;
+            }
+            return;
           }
 
           // Handle different event types

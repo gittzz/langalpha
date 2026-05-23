@@ -168,21 +168,63 @@ async def extract_text_from_thread(thread_id: str) -> dict[str, Any]:
 async def _extract_from_redis(thread_id: str) -> str:
     """Extract text content from Redis SSE event buffer.
 
-    Reads the tail of the per-thread Redis Stream (``workflow:stream:{tid}``)
-    and decodes the pre-rendered SSE wire string from each entry's
-    ``b"event"`` field. The Stream replaced the legacy Redis List spill;
-    XREVRANGE with COUNT yields the most-recent 500 entries cheaply, then
-    we reverse to chronological order to mirror the old RPUSH semantics.
+    Reads the tail of the per-run Redis Stream
+    (``workflow:stream:{tid}:{run_id}``) and decodes the pre-rendered SSE
+    wire string from each entry's ``b"event"`` field. The run_id is
+    resolved from the in-process ``BackgroundTaskManager`` for the most
+    recent turn on the thread. When no in-process TaskInfo exists (process
+    restart, all entries TTL'd out), falls back to the legacy
+    ``workflow:stream:{tid}`` key for backward compat during the deploy
+    window. XREVRANGE with COUNT yields the most-recent 500 entries
+    cheaply, then we reverse to chronological order to mirror the old
+    RPUSH semantics.
     """
+    # Local imports to avoid load-order coupling with the server package
+    # at agent import time.
+    from src.server.services.background_task_manager import (
+        BackgroundTaskManager,
+        stream_key,
+    )
     from src.utils.cache.redis_cache import get_cache_client
+
+    # Resolve the per-run stream key: prefer in-process BTM, then the
+    # cross-process WorkflowTracker blob, then fall back to the legacy
+    # thread-only key. The tracker path covers post-restart reconnects
+    # where BTM is empty but the active run's run_id is still in Redis.
+    key = f"workflow:stream:{thread_id}"
+    resolved_run_id: str | None = None
+    try:
+        manager = BackgroundTaskManager.get_instance()
+        async with manager.task_lock:
+            info = manager._find_latest_for_thread(thread_id)
+        if info is not None and getattr(info, "run_id", None):
+            resolved_run_id = info.run_id
+    except Exception as e:
+        logger.warning(
+            f"Failed to resolve run_id from BTM for thread {thread_id}: {e}"
+        )
+
+    if resolved_run_id is None:
+        try:
+            from src.server.services.workflow_tracker import WorkflowTracker
+
+            tracker = WorkflowTracker.get_instance()
+            status_obj = await tracker.get_status(thread_id)
+            if status_obj is not None:
+                resolved_run_id = status_obj.get("run_id")
+        except Exception as e:
+            logger.warning(
+                f"Failed to resolve run_id from tracker for thread {thread_id}: {e}"
+            )
+
+    if resolved_run_id is not None:
+        key = stream_key(thread_id, resolved_run_id)
 
     try:
         cache = get_cache_client()
         if not getattr(cache, "enabled", False) or cache.client is None:
             return ""
-        entries = await cache.client.xrevrange(
-            f"workflow:stream:{thread_id}", count=500
-        )
+        entries = await cache.client.xrevrange(key, count=500)
     except Exception as e:
         logger.error(f"Failed to read Redis events for thread {thread_id}: {e}")
         return ""

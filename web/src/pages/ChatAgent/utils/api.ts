@@ -133,12 +133,47 @@ export async function updateThreadTitle(threadId: string, title: string | null) 
 
 // --- Streaming (fetch + ReadableStream; axios not used) ---
 
+/**
+ * Parse a `run_id` query parameter out of a backend `Content-Location` header
+ * value such as `/api/v1/threads/{tid}/messages/stream?run_id={uuid}`.
+ * Returns `null` when the value is missing or has no `run_id` param.
+ */
+export function parseRunIdFromContentLocation(
+  contentLocation: string | null | undefined,
+): string | null {
+  if (!contentLocation) return null;
+  const qIdx = contentLocation.indexOf('?');
+  if (qIdx === -1) return null;
+  try {
+    const params = new URLSearchParams(contentLocation.slice(qIdx + 1));
+    const runId = params.get('run_id');
+    return runId && runId.length > 0 ? runId : null;
+  } catch {
+    return null;
+  }
+}
+
 async function streamFetch(
   url: string,
   opts: RequestInit,
-  onEvent: (event: Record<string, unknown>) => void
-) {
+  onEvent: (event: Record<string, unknown>) => void,
+  onHeaders?: (contentLocation: string | null) => void,
+): Promise<{ disconnected: boolean; contentLocation: string | null }> {
   const res = await fetch(`${baseURL}${url}`, opts);
+  // Snapshot Content-Location before body errors so callers can recover the
+  // canonical reconnect URL (carries ?run_id=…) even when a 4xx aborts later.
+  const contentLocation = res.headers.get('Content-Location');
+  // Notify the caller of headers IMMEDIATELY — well before any SSE body byte —
+  // so the run_id can be latched before the first `metadata` event arrives.
+  // Closes the reconnect race window between "clear stale run_id" and "new
+  // turn's first metadata frame" (see useChatMessages.resumeWithHitlResponse).
+  if (onHeaders) {
+    try {
+      onHeaders(contentLocation);
+    } catch (e) {
+      console.warn('[api] onHeaders callback threw', e);
+    }
+  }
   if (!res.ok) {
     // Handle 429 (rate limit) with structured detail
     if (res.status === 429) {
@@ -224,7 +259,7 @@ async function streamFetch(
       throw error;
     }
   }
-  return { disconnected };
+  return { disconnected, contentLocation };
 }
 
 export async function replayThreadHistory(threadId: string, onEvent: (event: Record<string, unknown>) => void = () => {}) {
@@ -250,6 +285,7 @@ export async function sendChatMessageStream(
   reasoningEffort: string | null = null,
   fastMode: boolean | null = null,
   platform: string | null = null,
+  onRunIdResolved: ((runId: string) => void) | null = null,
 ) {
   // For checkpoint replay (regenerate/retry), send empty messages
   const messages = checkpointId && !message
@@ -293,7 +329,13 @@ export async function sendChatMessageStream(
       },
       body: JSON.stringify(body),
     },
-    onEvent
+    onEvent,
+    onRunIdResolved
+      ? (contentLocation) => {
+          const runId = parseRunIdFromContentLocation(contentLocation);
+          if (runId) onRunIdResolved(runId);
+        }
+      : undefined,
   );
 }
 
@@ -370,18 +412,29 @@ export function watchThread(
 }
 
 /**
- * Reconnect to an in-progress workflow stream (replays buffered events, then live stream)
+ * Reconnect to an in-progress workflow stream (replays buffered events, then live stream).
+ *
+ * When ``runId`` is provided, the backend targets the exact per-run Redis
+ * stream key (``workflow:stream:{tid}:{rid}``). When omitted, the backend
+ * falls back to the latest run on the thread.
+ *
  * @param {string} threadId - The thread ID to reconnect to
+ * @param {string|null} runId - The specific run to target; null = latest
  * @param {number|null} lastEventId - Last received event ID for deduplication
  * @param {Function} onEvent - Callback for each SSE event
  */
 export async function reconnectToWorkflowStream(
   threadId: string,
+  runId: string | null = null,
   lastEventId: number | null = null,
   onEvent: (event: Record<string, unknown>) => void = () => {}
 ) {
   if (!threadId) throw new Error('Thread ID is required');
-  const queryParam = lastEventId != null ? `?last_event_id=${lastEventId}` : '';
+  const params = new URLSearchParams();
+  if (runId) params.set('run_id', runId);
+  if (lastEventId != null) params.set('last_event_id', String(lastEventId));
+  const query = params.toString();
+  const queryParam = query ? `?${query}` : '';
   const authHeaders = await getAuthHeaders();
   return await streamFetch(
     `/api/v1/threads/${threadId}/messages/stream${queryParam}`,
@@ -544,7 +597,8 @@ export async function sendHitlResponse(
   onEvent: (event: Record<string, unknown>) => void = () => {},
   planMode: boolean = false,
   modelOptions: { model?: string; reasoningEffort?: string; fastMode?: boolean } = {},
-  agentMode: string = 'ptc'
+  agentMode: string = 'ptc',
+  onRunIdResolved: ((runId: string) => void) | null = null,
 ) {
   const body: Record<string, unknown> = {
     workspace_id: workspaceId,
@@ -568,7 +622,13 @@ export async function sendHitlResponse(
       },
       body: JSON.stringify(body),
     },
-    onEvent
+    onEvent,
+    onRunIdResolved
+      ? (contentLocation) => {
+          const runId = parseRunIdFromContentLocation(contentLocation);
+          if (runId) onRunIdResolved(runId);
+        }
+      : undefined,
   );
 }
 

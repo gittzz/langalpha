@@ -147,6 +147,7 @@ describe('ChatAgent API utilities', () => {
       global.fetch = vi.fn().mockResolvedValue({
         ok: true,
         status: 200,
+        headers: new Headers(),
         body: {
           getReader: () => ({
             read: vi.fn().mockResolvedValue({ done: true, value: undefined }),
@@ -200,6 +201,67 @@ describe('ChatAgent API utilities', () => {
       expect(body.llm_model).toBe('gpt-4o');
       expect(body.reasoning_effort).toBe('high');
       expect(body.fast_mode).toBe(true);
+    });
+
+    it('invokes onRunIdResolved with the run_id from Content-Location BEFORE reading the body', async () => {
+      // Track ordering: did onRunIdResolved fire before any reader.read() call?
+      const callOrder: string[] = [];
+      const readMock = vi.fn().mockImplementation(() => {
+        callOrder.push('body-read');
+        return Promise.resolve({ done: true, value: undefined });
+      });
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          'Content-Location': '/api/v1/threads/t-1/messages/stream?run_id=abc-123',
+        }),
+        body: {
+          getReader: () => ({ read: readMock }),
+        },
+      });
+
+      const onRunIdResolved = vi.fn().mockImplementation((rid: string) => {
+        callOrder.push(`run-id:${rid}`);
+      });
+
+      await sendHitlResponse(
+        'ws-1', 't-1',
+        { int1: { decisions: [{ type: 'approve' }] } },
+        () => {},
+        false,
+        {},
+        'ptc',
+        onRunIdResolved,
+      );
+
+      expect(onRunIdResolved).toHaveBeenCalledTimes(1);
+      expect(onRunIdResolved).toHaveBeenCalledWith('abc-123');
+      // The run_id MUST be latched before any body byte is read.
+      expect(callOrder[0]).toBe('run-id:abc-123');
+    });
+
+    it('does NOT invoke onRunIdResolved when Content-Location lacks run_id', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'Content-Location': '/api/v1/threads/t-1/messages/stream' }),
+        body: {
+          getReader: () => ({ read: vi.fn().mockResolvedValue({ done: true, value: undefined }) }),
+        },
+      });
+
+      const onRunIdResolved = vi.fn();
+      await sendHitlResponse(
+        'ws-1', 't-1',
+        { int1: { decisions: [{ type: 'approve' }] } },
+        () => {},
+        false,
+        {},
+        'ptc',
+        onRunIdResolved,
+      );
+      expect(onRunIdResolved).not.toHaveBeenCalled();
     });
   });
 });
