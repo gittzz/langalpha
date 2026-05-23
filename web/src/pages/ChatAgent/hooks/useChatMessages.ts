@@ -3698,9 +3698,18 @@ export function useChatMessages(
     let demotedProcessor: ((event: SSEEvent) => void) | null = null;
     let demotedAssistantId: string | null = null;
     const demotedInterruptedRef = { current: false };
+    // Stash the Content-Location run_id but DO NOT commit it to
+    // currentRunIdRef until we've seen evidence that this POST actually
+    // started a new workflow (i.e., demoteToNewTurn fires). Committing
+    // eagerly on Content-Location alone would overwrite the active
+    // workflow's run_id when the backend routes this as steering-only.
+    let pendingRunIdFromHeader: string | null = null;
 
     const demoteToNewTurn = (): void => {
       demotedToNewTurn = true;
+      if (pendingRunIdFromHeader) {
+        currentRunIdRef.current = pendingRunIdFromHeader;
+      }
       setMessages((prev) =>
         updateMessage(prev, userMessage.id as string, (msg) => {
           if (msg.role !== 'user') return msg;
@@ -3784,11 +3793,13 @@ export function useChatMessages(
         null,
         null,
         platform,
-        // If the backend demotes this steering POST to a new turn, latch the
-        // fresh run_id from response headers immediately so a mid-stream
-        // disconnect can reconnect to the right workflow:stream key.
+        // Stash the Content-Location run_id but defer the commit until
+        // demoteToNewTurn fires. Backend emits Content-Location on every
+        // POST including pure-steering responses; committing eagerly would
+        // overwrite the active workflow's run_id with a stream key that
+        // never gets written to.
         (runId) => {
-          currentRunIdRef.current = runId;
+          pendingRunIdFromHeader = runId;
         },
       );
       if (demotedToNewTurn) {

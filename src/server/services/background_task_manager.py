@@ -1374,7 +1374,7 @@ class BackgroundTaskManager:
 
         try:
             tracker = WorkflowTracker.get_instance()
-            await tracker.mark_failed(thread_id, error=error)
+            await tracker.mark_failed(thread_id, error=error, run_id=run_id)
         except Exception as tracker_err:
             logger.warning(
                 f"[BackgroundTaskManager] tracker.mark_failed failed for {key}: {tracker_err}"
@@ -1478,7 +1478,7 @@ class BackgroundTaskManager:
 
         try:
             tracker = WorkflowTracker.get_instance()
-            await tracker.mark_soft_interrupted(thread_id)
+            await tracker.mark_soft_interrupted(thread_id, run_id=run_id)
         except Exception as tracker_err:
             logger.warning(
                 f"[BackgroundTaskManager] tracker.mark_soft_interrupted failed for {key}: {tracker_err}"
@@ -1830,7 +1830,7 @@ class BackgroundTaskManager:
 
         try:
             tracker = WorkflowTracker.get_instance()
-            await tracker.mark_cancelled(thread_id)
+            await tracker.mark_cancelled(thread_id, run_id=run_id)
         except Exception as tracker_err:
             logger.warning(
                 f"[BackgroundTaskManager] tracker.mark_cancelled failed for {key}: {tracker_err}"

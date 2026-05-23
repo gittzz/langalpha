@@ -178,11 +178,13 @@ async def _consume_background_gen(
             status = await tracker.get_status(thread_id)
             if status and status.get("status") == "active":
                 meta = status.get("metadata", {})
-                if meta.get("dispatched") and meta.get("run_id") == run_id:
+                if meta.get("dispatched") and status.get("run_id") == run_id:
                     if _ok:
-                        await tracker.mark_completed(thread_id)
+                        await tracker.mark_completed(thread_id, run_id=run_id)
                     else:
-                        await tracker.mark_failed(thread_id, error=_error_text)
+                        await tracker.mark_failed(
+                            thread_id, error=_error_text, run_id=run_id
+                        )
         except Exception:
             pass
     return _ok

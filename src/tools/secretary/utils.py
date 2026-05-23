@@ -187,20 +187,38 @@ async def _extract_from_redis(thread_id: str) -> str:
     )
     from src.utils.cache.redis_cache import get_cache_client
 
-    # Resolve the per-run stream key from the in-process task table;
-    # fall back to the legacy thread-only key when no TaskInfo survives.
+    # Resolve the per-run stream key: prefer in-process BTM, then the
+    # cross-process WorkflowTracker blob, then fall back to the legacy
+    # thread-only key. The tracker path covers post-restart reconnects
+    # where BTM is empty but the active run's run_id is still in Redis.
     key = f"workflow:stream:{thread_id}"
+    resolved_run_id: str | None = None
     try:
         manager = BackgroundTaskManager.get_instance()
         async with manager.task_lock:
             info = manager._find_latest_for_thread(thread_id)
         if info is not None and getattr(info, "run_id", None):
-            key = stream_key(thread_id, info.run_id)
+            resolved_run_id = info.run_id
     except Exception as e:
         logger.warning(
-            f"Failed to resolve run_id for thread {thread_id}, "
-            f"falling back to legacy key: {e}"
+            f"Failed to resolve run_id from BTM for thread {thread_id}: {e}"
         )
+
+    if resolved_run_id is None:
+        try:
+            from src.server.services.workflow_tracker import WorkflowTracker
+
+            tracker = WorkflowTracker.get_instance()
+            status_obj = await tracker.get_status(thread_id)
+            if status_obj is not None:
+                resolved_run_id = status_obj.get("run_id")
+        except Exception as e:
+            logger.warning(
+                f"Failed to resolve run_id from tracker for thread {thread_id}: {e}"
+            )
+
+    if resolved_run_id is not None:
+        key = stream_key(thread_id, resolved_run_id)
 
     try:
         cache = get_cache_client()

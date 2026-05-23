@@ -258,6 +258,17 @@ async def stream_from_log(
             run_id = info.run_id
 
     if run_id is None:
+        # In-process TaskInfo gone (process restart). Before falling back to
+        # the legacy thread-only key, consult WorkflowTracker — the status
+        # blob is cross-process and now carries the active turn's run_id.
+        # Lets a post-restart reconnect still resolve to the per-run stream
+        # key without false-routing to the empty legacy key.
+        tracker = WorkflowTracker.get_instance()
+        status_obj = await tracker.get_status(thread_id)
+        if status_obj is not None:
+            run_id = status_obj.get("run_id")
+
+    if run_id is None:
         # Fall back to the legacy thread-only key. Compat shim for reconnects
         # to a pre-deploy in-flight workflow whose TaskInfo was lost on
         # restart. Drop in the next deploy once no in-flight workflows are

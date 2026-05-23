@@ -755,7 +755,10 @@ async def handle_workflow_error(
             # error path runs outside BackgroundTaskManager's _mark_failed,
             # so this is the only chance to update tracker.
             try:
-                await tracker.mark_failed(thread_id, error=error_msg)
+                _expected = persistence_service.run_id if persistence_service else None
+                await tracker.mark_failed(
+                    thread_id, error=error_msg, run_id=_expected
+                )
             except Exception as tracker_err:
                 logger.warning(
                     f"[{log_prefix}] tracker.mark_failed failed for "

@@ -455,8 +455,8 @@ async def astream_flash_workflow(
                     metadata={
                         "completed_at": datetime.now().isoformat(),
                         "execution_time": execution_time,
-                        "run_id": run_id,
                     },
+                    run_id=run_id,
                 )
 
                 # Backfill query records for steering messages that produced

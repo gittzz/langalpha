@@ -109,26 +109,14 @@ class WorkflowTracker:
         timestamp_field: str,
         metadata: Optional[Dict[str, Any]] = None,
         ttl: Optional[int] = None,
+        run_id: Optional[str] = None,
     ) -> bool:
         """
         Helper to update workflow status with metadata preservation.
 
-        Consolidates the common pattern of:
-        1. Get existing status from Redis
-        2. Create default if not exists
-        3. Update status and timestamp fields
-        4. Merge metadata
-        5. Save with optional TTL
-
-        Args:
-            thread_id: Thread/workflow identifier
-            new_status: New status to set
-            timestamp_field: Field name for timestamp (e.g., "completed_at")
-            metadata: Optional metadata to merge
-            ttl: Optional TTL in seconds
-
-        Returns:
-            True if successful, False otherwise
+        When ``run_id`` is provided, the update is skipped if the
+        stored blob's ``run_id`` doesn't match — prevents a late terminal
+        from run A overwriting active status set by run B.
         """
         try:
             key = f"{self.STATUS_PREFIX}{thread_id}"
@@ -140,6 +128,16 @@ class WorkflowTracker:
                     "thread_id": thread_id,
                     "started_at": datetime.now().isoformat()
                 }
+
+            if run_id is not None:
+                stored_run_id = existing.get("run_id")
+                if stored_run_id is not None and stored_run_id != run_id:
+                    logger.debug(
+                        f"[WorkflowTracker] Skipping {new_status} update for "
+                        f"thread_id={thread_id}: stored run_id={stored_run_id} "
+                        f"!= expected={run_id}"
+                    )
+                    return False
 
             # Update status and timestamp
             existing["status"] = new_status
@@ -214,19 +212,15 @@ class WorkflowTracker:
     async def mark_completed(
         self,
         thread_id: str,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        run_id: Optional[str] = None,
     ) -> bool:
         """
         Mark workflow as completed (finished executing).
 
         Sets TTL per redis.ttl.workflow_status config (keeps brief history).
-
-        Args:
-            thread_id: Thread/workflow identifier
-            metadata: Optional completion metadata
-
-        Returns:
-            True if successfully marked, False otherwise
+        Pass ``run_id`` to no-op the write when the active run has
+        already advanced to a different turn.
         """
         if not self.enabled:
             return False
@@ -237,7 +231,8 @@ class WorkflowTracker:
             new_status=WorkflowStatus.COMPLETED,
             timestamp_field="completed_at",
             metadata=metadata,
-            ttl=ttl
+            ttl=ttl,
+            run_id=run_id,
         )
 
         if success:
@@ -284,16 +279,12 @@ class WorkflowTracker:
 
         return success
 
-    async def mark_cancelled(self, thread_id: str) -> bool:
-        """
-        Mark workflow as cancelled (explicitly stopped by user).
-
-        Args:
-            thread_id: Thread/workflow identifier
-
-        Returns:
-            True if successfully marked, False otherwise
-        """
+    async def mark_cancelled(
+        self,
+        thread_id: str,
+        run_id: Optional[str] = None,
+    ) -> bool:
+        """Mark workflow as cancelled (explicitly stopped by user)."""
         if not self.enabled:
             return False
 
@@ -302,7 +293,8 @@ class WorkflowTracker:
             new_status=WorkflowStatus.CANCELLED,
             timestamp_field="cancelled_at",
             metadata=None,
-            ttl=get_redis_ttl_workflow_status()
+            ttl=get_redis_ttl_workflow_status(),
+            run_id=run_id,
         )
 
         if success:
@@ -316,13 +308,9 @@ class WorkflowTracker:
         self,
         thread_id: str,
         error: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> bool:
-        """Mark workflow as failed (uncaught exception or unrecoverable error).
-
-        Mirrors mark_completed/mark_cancelled — bounded TTL so /status correctly
-        reports a terminal state instead of leaving the key as ACTIVE until
-        natural Redis expiry.
-        """
+        """Mark workflow as failed (uncaught exception or unrecoverable error)."""
         if not self.enabled:
             return False
 
@@ -332,6 +320,7 @@ class WorkflowTracker:
             timestamp_field="failed_at",
             metadata={"error": error} if error else None,
             ttl=get_redis_ttl_workflow_status(),
+            run_id=run_id,
         )
 
         if success:
@@ -341,7 +330,11 @@ class WorkflowTracker:
 
         return success
 
-    async def mark_soft_interrupted(self, thread_id: str) -> bool:
+    async def mark_soft_interrupted(
+        self,
+        thread_id: str,
+        run_id: Optional[str] = None,
+    ) -> bool:
         """Mark workflow as soft-interrupted (main agent paused, subagents can still complete).
 
         Distinct from INTERRUPTED (HITL pause, indefinite TTL): SOFT_INTERRUPTED
@@ -356,6 +349,7 @@ class WorkflowTracker:
             timestamp_field="soft_interrupted_at",
             metadata=None,
             ttl=get_redis_ttl_workflow_status(),
+            run_id=run_id,
         )
 
         if success:

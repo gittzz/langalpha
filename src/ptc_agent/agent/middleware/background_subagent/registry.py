@@ -218,8 +218,16 @@ class BackgroundTaskRegistry:
         prompt: str,
         subagent_type: str,
         asyncio_task: asyncio.Task | None = None,
+        run_id: str | None = None,
     ) -> BackgroundTask:
-        """Register a new background task and return it."""
+        """Register a new background task and return it.
+
+        ``run_id`` is the LangGraph run_id of the dispatching turn, stamped on
+        the task so the collector can filter prior-turn subagents. Callers
+        should always pass it explicitly (read from request config) rather
+        than relying on ``self.current_run_id``, which would race when two
+        concurrent turns share the registry.
+        """
         async with self._lock:
             # Generate short alphanumeric task_id
             task_id = secrets.token_urlsafe(4)[:6]
@@ -234,7 +242,7 @@ class BackgroundTaskRegistry:
                 asyncio_task=asyncio_task,
                 agent_id=agent_id,
                 spawned_turn_index=self.current_turn_index,
-                spawned_run_id=self.current_run_id,
+                spawned_run_id=run_id if run_id is not None else self.current_run_id,
             )
             self._tasks[tool_call_id] = task
             self._task_id_to_tool_call_id[task_id] = tool_call_id

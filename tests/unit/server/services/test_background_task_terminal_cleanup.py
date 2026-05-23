@@ -177,7 +177,9 @@ class TestMarkFailedReleases:
         assert info.metadata["user_id"] == "u-1"
         # Wiring: tracker.mark_failed called so /status reports FAILED with
         # bounded TTL instead of leaving the key as ACTIVE.
-        mock_tracker.mark_failed.assert_awaited_once_with("t-1", error="boom")
+        mock_tracker.mark_failed.assert_awaited_once_with(
+            "t-1", error="boom", run_id="r-1"
+        )
 
 
 class TestMarkCancelledReleases:
@@ -198,7 +200,7 @@ class TestMarkCancelledReleases:
         assert info.graph is None
         # Wiring: tracker.mark_cancelled called from the canonical site so
         # stale-cancel reaper / soft-interrupt-abort paths also update Redis.
-        mock_tracker.mark_cancelled.assert_awaited_once_with("t-1")
+        mock_tracker.mark_cancelled.assert_awaited_once_with("t-1", run_id="r-1")
 
 
 class TestMarkSoftInterruptedReleases:
@@ -217,7 +219,7 @@ class TestMarkSoftInterruptedReleases:
 
         assert info.persistence_complete.is_set()
         assert info.graph is None
-        mock_tracker.mark_soft_interrupted.assert_awaited_once_with("t-1")
+        mock_tracker.mark_soft_interrupted.assert_awaited_once_with("t-1", run_id="r-1")
 
 
 # ---------------------------------------------------------------------------

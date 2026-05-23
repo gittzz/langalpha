@@ -882,8 +882,8 @@ async def astream_ptc_workflow(
                     metadata={
                         "completed_at": datetime.now().isoformat(),
                         "execution_time": execution_time,
-                        "run_id": run_id,
                     },
+                    run_id=run_id,
                 )
 
                 # Backfill query records for steering messages that produced orphan responses
