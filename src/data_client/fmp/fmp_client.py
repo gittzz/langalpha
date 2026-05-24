@@ -406,11 +406,10 @@ class FMPClient:
     async def get_rating(self, symbol: str) -> List[Dict]:
         """Stock rating snapshot.
 
-        Stable replaces v3's ``rating`` with ``ratings-snapshot``.
+        Stable replaces v3's ``rating`` with ``ratings-snapshot``; this
+        delegates to :meth:`get_ratings_snapshot` so the two stay in sync.
         """
-        return await self._make_request(
-            "ratings-snapshot", params={"symbol": symbol}
-        )
+        return await self.get_ratings_snapshot(symbol)
 
     async def get_ratings_snapshot(self, symbol: str) -> List[Dict]:
         return await self._make_request(
