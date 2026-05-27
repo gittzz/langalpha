@@ -115,3 +115,48 @@ class ChatCodexOpenAI(ChatOpenAI):
         # Codex API rejects role:"system" — promote to instructions field
         _extract_system_to_instructions(payload)
         return payload
+
+
+def _install_responses_output_guard() -> None:
+    """Coerce a null Responses-API ``output`` to ``[]`` before langchain iterates it.
+
+    The chatgpt.com Codex backend ships ``response.output = null`` on terminal
+    stream frames. langchain_openai (through 1.2.2, latest) iterates it unguarded
+    in ``_construct_lc_result_from_responses_api`` and raises
+    ``TypeError('NoneType' object is not iterable)``, killing the turn. The
+    backend rejects the request-side ``exclude`` workaround with HTTP 400, so we
+    patch the single chokepoint all read paths (sync, async, streaming) funnel
+    through. Streamed text is already captured from ``output_text.delta`` events,
+    so an empty terminal output loses no content.
+    """
+    try:
+        import langchain_openai.chat_models.base as _base
+
+        orig = _base._construct_lc_result_from_responses_api
+    except (ImportError, AttributeError):
+        # langchain_openai internals moved. Degrade to no guard rather than
+        # breaking module import (which would take down all codex-oauth).
+        logger.warning(
+            "[codex] Responses output guard not installed — "
+            "langchain_openai._construct_lc_result_from_responses_api is gone; "
+            "codex-oauth may crash on a null terminal output frame"
+        )
+        return
+
+    if getattr(orig, "_codex_output_guarded", False):
+        return
+
+    def _guarded(response, *args, **kwargs):
+        if getattr(response, "output", None) is None:
+            logger.debug("[codex] coerced null Responses output to [] (backend sent output=null)")
+            try:
+                response.output = []
+            except Exception:
+                object.__setattr__(response, "output", [])
+        return orig(response, *args, **kwargs)
+
+    _guarded._codex_output_guarded = True
+    _base._construct_lc_result_from_responses_api = _guarded
+
+
+_install_responses_output_guard()
