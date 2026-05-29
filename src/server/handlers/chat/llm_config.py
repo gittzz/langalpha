@@ -109,6 +109,29 @@ async def _walk_byok_candidates(
     return None, None
 
 
+def _inherit_custom_provider_sdk(custom_config, parent_provider, provider_def, mc):
+    """Make a custom provider inherit its manifest parent's SDK/headers (#221).
+
+    A user-defined custom provider slug isn't in the manifest, so
+    ``from_custom_config`` derives ``sdk`` from an empty ``provider_info`` and
+    defaults to ``"openai"`` — which 404s an Anthropic-shaped endpoint
+    (``/chat/completions`` vs ``/v1/messages``). Rewriting ``provider`` to the
+    manifest parent fixes the SDK and ``default_headers``.
+
+    Skip the rewrite for openai parents: the default already yields
+    ``sdk="openai"``, and inheriting the manifest openai entry would force
+    ``use_response_api`` / ``prompt_cache_key`` onto OpenAI-compatible gateways
+    (vLLM/LiteLLM/OpenRouter) that only speak ``/chat/completions``. The custom
+    provider's own ``use_response_api`` opt-in is honoured either way.
+    """
+    updates: dict = {}
+    if mc.get_provider_info(parent_provider).get("sdk") not in (None, "openai"):
+        updates["provider"] = parent_provider
+    if provider_def.get("use_response_api"):
+        updates["_use_response_api"] = True
+    return {**custom_config, **updates} if updates else custom_config
+
+
 async def _resolve_custom_model_byok(
     user_id: str,
     model_name: str,
@@ -139,9 +162,9 @@ async def _resolve_custom_model_byok(
     if cp_by_name:
         byok_config = await get_byok_config_for_provider(user_id, model_name)
         if byok_config:
-            base_url = byok_config.get("base_url") or mc.get_provider_info(cp_by_name["parent_provider"]).get("base_url")
-            if cp_by_name.get("use_response_api"):
-                custom_config = {**custom_config, "_use_response_api": True}
+            parent = cp_by_name["parent_provider"]
+            base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
+            custom_config = _inherit_custom_provider_sdk(custom_config, parent, cp_by_name, mc)
             return byok_config, base_url, custom_config
 
     # 2. Provider field is a custom sub-provider
@@ -149,9 +172,9 @@ async def _resolve_custom_model_byok(
     if cp_by_provider:
         byok_config = await get_byok_config_for_provider(user_id, provider)
         if byok_config:
-            base_url = byok_config.get("base_url") or mc.get_provider_info(cp_by_provider["parent_provider"]).get("base_url")
-            if cp_by_provider.get("use_response_api"):
-                custom_config = {**custom_config, "_use_response_api": True}
+            parent = cp_by_provider["parent_provider"]
+            base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
+            custom_config = _inherit_custom_provider_sdk(custom_config, parent, cp_by_provider, mc)
             return byok_config, base_url, custom_config
 
     # 3. System provider — walk [provider → parent → sibling variants] for a
