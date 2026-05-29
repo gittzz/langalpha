@@ -9,7 +9,7 @@ The compiler handles:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -17,6 +17,9 @@ from ptc_agent.agent.middleware.skills.content import load_skill_content
 from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
 from ptc_agent.agent.prompts import build_tool_summary_from_registry, get_loader
 from ptc_agent.agent.subagents.definition import SubagentDefinition
+
+if TYPE_CHECKING:
+    from ptc_agent.config.agent import AgentConfig
 
 logger = structlog.get_logger(__name__)
 
@@ -67,7 +70,7 @@ class SubagentCompiler:
         user_profile: dict[str, Any] | None = None,
         current_time: str | None = None,
         thread_id: str = "",
-        config: Any | None = None,
+        config: AgentConfig | None = None,
     ) -> None:
         self._sandbox = sandbox
         self._mcp_registry = mcp_registry

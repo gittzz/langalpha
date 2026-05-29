@@ -646,6 +646,161 @@ def role_registry(config, enabled_subagents, subagent_defs) -> list[LLMRole]:
     return [r for r in roles if r.model]
 
 
+async def _prefetch_byok_cache(
+    user_id: str, config, effective_model: str, model_pref: dict,
+) -> dict[str, dict | None]:
+    """Best-effort batch BYOK prefetch → tri-state cache for ``_walk_byok_candidates``.
+
+    Gathers candidate provider slugs across the main model, every role model,
+    and every fallback model, issues ONE ``get_byok_configs_for_providers``
+    query, and seeds the cache. Pure perf: every walk is cache-miss-safe (a slug
+    absent from the cache falls back to a direct lookup), so this must never
+    become a correctness dependency. On any error returns ``{}`` — each walk
+    then does its own direct lookup (correct, just unoptimized).
+    """
+    from src.llms.llm import LLM as LLMFactory
+
+    try:
+        mc = LLMFactory.get_model_config()
+        candidate_models = [effective_model]
+        candidate_models += [m for m in (config.llm.compaction, config.llm.fetch) if m]
+        candidate_models += list(config.llm.fallback or [])
+        all_slugs: set[str] = set()
+        for m in candidate_models:
+            src_, cfg = await classify_model(user_id, m, _pref_cache=model_pref)
+            # SYSTEM (models.json) and CUSTOM (user config) both carry a
+            # "provider" slug; UNKNOWN carries nothing.
+            prov = cfg.get("provider") if src_ != ModelSource.UNKNOWN else None
+            if prov:
+                all_slugs.update(_candidate_slugs(prov, mc))
+        if not all_slugs:
+            return {}
+        from src.server.database.api_keys import get_byok_configs_for_providers
+
+        slugs = list(all_slugs)
+        configs = await get_byok_configs_for_providers(user_id, slugs)
+        return {slug: configs.get(slug) for slug in slugs}
+    except Exception:
+        logger.warning(
+            "[CHAT] BYOK batch prefetch failed; falling back to per-walk lookups",
+            exc_info=True,
+        )
+        return {}
+
+
+async def _resolve_role_clients(
+    config, user_id: str, enabled_subagents: list[str], model_pref: dict,
+    byok_cache: dict, *, is_byok: bool, cache_key: str | None,
+) -> None:
+    """Resolve compaction/fetch/subagent role clients onto ``config`` in place.
+
+    Assumes ``config`` is already a copy and ``config.credential_source`` /
+    ``config.llm_client`` are set. Roles never get an eager platform client
+    (``allow_platform_fallback=False``); a keyless role for an OAUTH/BYOK user
+    is seeded with a copy of the main client (BYOK-pure), while PLATFORM/NONE
+    users store nothing so the cheap name-based path stays.
+    """
+    try:
+        from ptc_agent.agent.subagents.registry import SubagentRegistry
+
+        registry = SubagentRegistry(user_definitions=config.subagents.definitions)
+        subagent_defs = {name: registry.get(name) for name in enabled_subagents}
+    except Exception:
+        logger.error(
+            "[CHAT] Failed to build subagent registry; skipping subagent roles",
+            exc_info=True,
+        )
+        subagent_defs = {}
+
+    roles = role_registry(config, enabled_subagents, subagent_defs)
+
+    for role in roles:
+        try:
+            rc = await resolve_model_client(
+                user_id, role.model, is_byok=is_byok, cache_key=cache_key,
+                allow_platform_fallback=False, service_tier=None,
+                _pref_cache=model_pref, _byok_cache=byok_cache,
+            )
+        except Exception:
+            logger.error(
+                "[CHAT] Failed to resolve role %s model %s, skipping",
+                role.key, role.model, exc_info=True,
+            )
+            continue
+        if rc.client is not None:
+            config.subsidiary_llm_clients[role.key] = rc.client
+        elif rc.model_source is not None and rc.model_source != ModelSource.SYSTEM:
+            logger.warning(
+                "[CHAT] Role '%s' model '%s' is a custom model without a usable "
+                "BYOK key — falling back to default.",
+                role.key, role.model,
+            )
+
+    # BYOK-pure write-time materialization. Gate purely on the credential
+    # SIGNAL: by the primitive's invariant OAUTH/BYOK ⟹ llm_client is set, so a
+    # main-client copy is safe. PLATFORM/NONE users store nothing → cheap name
+    # path stays (a non-BYOK reasoning user's PLATFORM client is NOT copied).
+    if config.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK):
+        for role in roles:
+            if role.fallback_to_main and role.key not in config.subsidiary_llm_clients:
+                config.subsidiary_llm_clients[role.key] = config.llm_client.model_copy()
+                logger.info(
+                    "[CHAT] Role '%s' has no own key; falling back to the user's "
+                    "main client (cost shifts to main-model rate).",
+                    role.key,
+                )
+
+
+async def _resolve_fallback_clients(
+    config, user_id: str, model_pref: dict, byok_cache: dict,
+    *, is_byok: bool, cache_key: str | None,
+) -> None:
+    """Resolve ``config.llm.fallback`` names into client instances in place.
+
+    Platform fallback is ON so a SYSTEM fallback name without a user key still
+    yields a platform client (no model silently dropped). Custom/unknown
+    fallbacks without a usable key warn + skip.
+    """
+    fallback_models = config.llm.fallback or []
+    if not fallback_models:
+        return
+
+    merged_fallbacks = []
+    byok_count = 0
+    for model_name in fallback_models:
+        try:
+            fc = await resolve_model_client(
+                user_id, model_name, is_byok=is_byok, cache_key=cache_key,
+                allow_platform_fallback=True,
+                _pref_cache=model_pref, _byok_cache=byok_cache,
+            )
+        except Exception:
+            logger.error(
+                "[CHAT] Failed to resolve fallback model %s, skipping",
+                model_name, exc_info=True,
+            )
+            continue
+        if fc.client is not None:
+            merged_fallbacks.append(fc.client)
+            if fc.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK):
+                byok_count += 1
+        elif fc.model_source is not None and fc.model_source != ModelSource.SYSTEM:
+            logger.warning(
+                "[CHAT] Fallback model '%s' is a custom model without a "
+                "usable BYOK key — skipping. Add a key in Settings to enable.",
+                model_name,
+            )
+        # else: SYSTEM with no client (shouldn't happen with platform fallback
+        # on) — guard by skipping.
+
+    if merged_fallbacks:
+        config.fallback_llm_clients = merged_fallbacks
+        if byok_count:
+            logger.debug(
+                f"[CHAT] Resolved {byok_count}/{len(fallback_models)} fallback models via OAuth/BYOK"
+            )
+
+
 async def resolve_llm_config(
     base_config,
     user_id: str,
@@ -680,6 +835,13 @@ async def resolve_llm_config(
 
     model_field, pref_key = _MODE_MODEL_MAP[mode]
     config = base_config
+
+    def _cow():
+        """Copy-on-write: deep-copy base_config the first time we mutate it."""
+        nonlocal config
+        if config is base_config:
+            config = config.model_copy(deep=True)
+
     model_pref = await get_model_preference(user_id)
     _enabled_subagents = (
         enabled_subagents
@@ -695,7 +857,7 @@ async def resolve_llm_config(
             raise ValueError(
                 "No model configured. Set llm in agent_config.yaml or select a model in Settings."
             )
-        config = config.model_copy(deep=True)
+        _cow()
         config.llm = LLMConfig(
             name=resolved_name if mode == "ptc" else "placeholder",
             flash=resolved_name if mode == "flash" else model_pref.get("preferred_flash_model"),
@@ -710,14 +872,14 @@ async def resolve_llm_config(
         config.llm_client = None
         logger.debug(f"[CHAT] No system default LLM; bootstrapped from user preferences: {resolved_name}")
     elif request_model:
-        config = config.model_copy(deep=True)
+        _cow()
         setattr(config.llm, model_field, request_model)
         config.llm_client = None
         logger.debug(f"[CHAT] Using per-request LLM model: {request_model}")
     else:
         preferred = model_pref.get(pref_key)
         if preferred:
-            config = config.model_copy(deep=True)
+            _cow()
             setattr(config.llm, model_field, preferred)
             config.llm_client = None
             logger.debug(f"[CHAT] Using {pref_key}: {preferred}")
@@ -739,14 +901,12 @@ async def resolve_llm_config(
     for pref_key_other, config_field in _other_model_keys:
         user_val = model_pref.get(pref_key_other)
         if user_val:
-            if config is base_config:
-                config = config.model_copy(deep=True)
+            _cow()
             setattr(config.llm, config_field, user_val)
 
     user_fallback = model_pref.get("fallback_models")
     if user_fallback is not None:
-        if config is base_config:
-            config = config.model_copy(deep=True)
+        _cow()
         config.llm.fallback = user_fallback
 
     # Compaction profile: a named preset (aggressive/moderate/extended/relaxed)
@@ -762,8 +922,7 @@ async def resolve_llm_config(
         else None
     )
     if preset:
-        if config is base_config:
-            config = config.model_copy(deep=True)
+        _cow()
         for field, value in preset.items():
             setattr(config.compaction, field, value)
 
@@ -798,8 +957,8 @@ async def resolve_llm_config(
     # falls through so the downstream error surfaces the config bug.
     if source == ModelSource.UNKNOWN and not is_custom_provider:
         # Only the five scalar keys feed ``effective_model`` — fallback_models
-        # is tried by ``_resolve_one_with_fallbacks`` on a separate path and
-        # never flows through here, so it's intentionally excluded from this
+        # is resolved separately in ``_resolve_fallback_clients`` and never
+        # flows through here, so it's intentionally excluded from this
         # attribution check (the scrub in ``_cleanup_stale_model_preferences``
         # still filters fallback_models once it fires).
         from_pref = any(
@@ -815,8 +974,7 @@ async def resolve_llm_config(
 
     # Thread custom model input_modalities onto config
     if custom_cm and custom_cm.get("input_modalities"):
-        if config is base_config:
-            config = config.model_copy(deep=True)
+        _cow()
         config.input_modalities = custom_cm["input_modalities"]
 
     # Resolve reasoning effort: per-request > user pref > None (use model default)
@@ -830,44 +988,12 @@ async def resolve_llm_config(
         effective_fast = model_pref.get("fast_mode")
     effective_service_tier = "priority" if effective_fast else None
 
-    # STEP 0 — best-effort batch BYOK prefetch. Pure perf: ``_walk_byok_candidates``
-    # is cache-miss-safe (a slug absent from the cache falls back to a direct
-    # lookup), so this query never needs to be exhaustive and must never become a
-    # correctness dependency. Gather candidate provider slugs for the main model +
-    # every role model + every fallback model, issue ONE query, and seed the
-    # tri-state cache. On any error fall back to an empty cache (every walk then
-    # does its own direct lookup — correct, just unoptimized).
-    byok_cache: dict[str, dict | None] = {}
-    if is_byok:
-        try:
-            from src.llms.llm import LLM as LLMFactory
-
-            mc = LLMFactory.get_model_config()
-            _candidate_models = [effective_model]
-            _candidate_models += [
-                m for m in (config.llm.compaction, config.llm.fetch) if m
-            ]
-            _candidate_models += list(config.llm.fallback or [])
-            all_slugs: set[str] = set()
-            for _m in _candidate_models:
-                _src, _cfg = await classify_model(user_id, _m, _pref_cache=model_pref)
-                # SYSTEM entries (models.json) and CUSTOM entries (user config)
-                # both carry a "provider" slug; UNKNOWN carries nothing.
-                _prov = _cfg.get("provider") if _src != ModelSource.UNKNOWN else None
-                if _prov:
-                    all_slugs.update(_candidate_slugs(_prov, mc))
-            if all_slugs:
-                from src.server.database.api_keys import get_byok_configs_for_providers
-
-                _slugs = list(all_slugs)
-                _configs = await get_byok_configs_for_providers(user_id, _slugs)
-                byok_cache = {slug: _configs.get(slug) for slug in _slugs}
-        except Exception:
-            logger.warning(
-                "[CHAT] BYOK batch prefetch failed; falling back to per-walk lookups",
-                exc_info=True,
-            )
-            byok_cache = {}
+    # STEP 0 — best-effort batch BYOK prefetch (pure perf; see helper docstring).
+    byok_cache: dict[str, dict | None] = (
+        await _prefetch_byok_cache(user_id, config, effective_model, model_pref)
+        if is_byok
+        else {}
+    )
 
     # Main model — single primitive call. OAuth-first → BYOK → platform fallback
     # (only when allow_platform_fallback and the model is SYSTEM). The
@@ -881,8 +1007,7 @@ async def resolve_llm_config(
         allow_platform_fallback=bool(effective_reasoning),
         _pref_cache=model_pref, _byok_cache=byok_cache,
     )
-    if config is base_config:
-        config = config.model_copy(deep=True)
+    _cow()
     # Always store credential_source (even NONE) — single source of truth
     # downstream (credit gate, materialization gate, billing signal).
     config.credential_source = main.credential_source
@@ -897,110 +1022,15 @@ async def resolve_llm_config(
     if thread_id and config.cache_key != thread_id:
         config.cache_key = thread_id
 
-    # Build the subagent definition map via the registry so built-ins are
-    # included (raw ``config.subagents.definitions`` only holds user overrides).
-    # ``get`` returns None for unknown names (skip); ``get_enabled`` would raise.
-    try:
-        from ptc_agent.agent.subagents.registry import SubagentRegistry
-
-        _registry = SubagentRegistry(user_definitions=config.subagents.definitions)
-        subagent_defs = {name: _registry.get(name) for name in _enabled_subagents}
-    except Exception:
-        logger.error("[CHAT] Failed to build subagent registry; skipping subagent roles", exc_info=True)
-        subagent_defs = {}
-
-    roles = role_registry(config, _enabled_subagents, subagent_defs)
-
-    # Resolve each role through the primitive. Roles never get an eager platform
-    # client (allow_platform_fallback=False): a role's own system model with no
-    # user key resolves to None here — the cheap name-based platform path
-    # (compaction/fetch) or the string-name OSS path (subagents) handles it.
-    # service_tier (priority) is main-only.
-    for role in roles:
-        try:
-            rc = await resolve_model_client(
-                user_id, role.model, is_byok=is_byok, cache_key=thread_id,
-                allow_platform_fallback=False, service_tier=None,
-                _pref_cache=model_pref, _byok_cache=byok_cache,
-            )
-        except Exception:
-            logger.error(
-                "[CHAT] Failed to resolve role %s model %s, skipping",
-                role.key, role.model, exc_info=True,
-            )
-            continue
-        if rc.client is not None:
-            # ``compaction``/``fetch`` are consumed today (agent.py / _common.py);
-            # ``subagent:<name>`` clients are read by the subagent compiler
-            # injection landing later in this refactor (via ``client_for_role``).
-            config.subsidiary_llm_clients[role.key] = rc.client
-        elif rc.model_source is not None and rc.model_source != ModelSource.SYSTEM:
-            logger.warning(
-                "[CHAT] Role '%s' model '%s' is a custom model without a usable "
-                "BYOK key — falling back to default.",
-                role.key, role.model,
-            )
-
-    # BYOK-pure write-time materialization. Gate on the credential SIGNAL, not on
-    # llm_client presence (Codex #2): a non-BYOK reasoning user has
-    # credential_source=PLATFORM with a platform llm_client that must NOT be
-    # copied into roles. Only OAUTH/BYOK users seed keyless roles with a main
-    # copy. PLATFORM/NONE users store nothing → cheap name path stays.
-    has_user_cred = config.credential_source in (
-        CredentialSource.OAUTH, CredentialSource.BYOK,
+    # Subsidiary role clients (compaction / fetch / subagent:*) + BYOK-pure
+    # materialization, then fallback models. Both resolve through the primitive.
+    await _resolve_role_clients(
+        config, user_id, _enabled_subagents, model_pref, byok_cache,
+        is_byok=is_byok, cache_key=thread_id,
     )
-    if has_user_cred and config.llm_client is not None:
-        for role in roles:
-            if role.fallback_to_main and role.key not in config.subsidiary_llm_clients:
-                # ``subagent:<name>`` main-client copies are read by the subagent
-                # compiler injection landing later in this refactor (via
-                # ``client_for_role``); compaction/fetch are read today.
-                config.subsidiary_llm_clients[role.key] = config.llm_client.model_copy()
-                logger.info(
-                    "[CHAT] Role '%s' has no own key; falling back to the user's "
-                    "main client (cost shifts to main-model rate).",
-                    role.key,
-                )
-
-    # Fallback models — route each through the primitive with platform fallback
-    # ON (SYSTEM names without a user key still get a platform client so no model
-    # is silently dropped). Custom/unknown fallbacks without a usable key warn +
-    # skip. Preserve the byok_count debug log.
-    fallback_models = config.llm.fallback or []
-    if fallback_models:
-        merged_fallbacks = []
-        byok_count = 0
-        for model_name in fallback_models:
-            try:
-                fc = await resolve_model_client(
-                    user_id, model_name, is_byok=is_byok, cache_key=thread_id,
-                    allow_platform_fallback=True,
-                    _pref_cache=model_pref, _byok_cache=byok_cache,
-                )
-            except Exception:
-                logger.error(
-                    "[CHAT] Failed to resolve fallback model %s, skipping",
-                    model_name, exc_info=True,
-                )
-                continue
-            if fc.client is not None:
-                merged_fallbacks.append(fc.client)
-                if fc.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK):
-                    byok_count += 1
-            elif fc.model_source is not None and fc.model_source != ModelSource.SYSTEM:
-                logger.warning(
-                    "[CHAT] Fallback model '%s' is a custom model without a "
-                    "usable BYOK key — skipping. Add a key in Settings to enable.",
-                    model_name,
-                )
-            # else: SYSTEM with no client (shouldn't happen with platform
-            # fallback on) — guard by skipping.
-
-        if merged_fallbacks:
-            config.fallback_llm_clients = merged_fallbacks
-            if byok_count:
-                logger.debug(
-                    f"[CHAT] Resolved {byok_count}/{len(fallback_models)} fallback models via OAuth/BYOK"
-                )
+    await _resolve_fallback_clients(
+        config, user_id, model_pref, byok_cache,
+        is_byok=is_byok, cache_key=thread_id,
+    )
 
     return config
