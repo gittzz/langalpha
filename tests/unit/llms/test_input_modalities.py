@@ -48,7 +48,7 @@ class TestGetInputModalities:
 
     def test_oauth_variant_inherits_modalities(self, model_config):
         """OAuth models should have explicit modalities, not fall back to default."""
-        result = model_config.get_input_modalities("claude-opus-4-7-oauth")
+        result = model_config.get_input_modalities("claude-opus-4-8-oauth")
         assert "image" in result
         assert "pdf" in result
 

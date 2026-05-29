@@ -124,12 +124,12 @@
     ],
     "anthropic": [
       {
-        "id": "claude-opus-4-7",
-        "name": "Claude 4.7 Opus",
+        "id": "claude-opus-4-8",
+        "name": "Claude 4.8 Opus",
         "is_reasoning": true,
-        "description": "Claude 4.7 Opus model",
+        "description": "Claude 4.8 Opus model",
         "alias": [
-          "claude-opus-4.7"
+          "claude-opus-4.8"
         ],
         "pricing": {
           "input": 5.0,
@@ -276,9 +276,9 @@
         "context_window": 1000000,
         "max_output": 384000,
         "pricing": {
-          "input": 1.74,
-          "cached_input": 0.145,
-          "output": 3.48,
+          "input": 0.435,
+          "cached_input": 0.003625,
+          "output": 0.87,
           "unit": "per_1m_tokens"
         }
       },
@@ -291,7 +291,7 @@
         "max_output": 384000,
         "pricing": {
           "input": 0.14,
-          "cached_input": 0.028,
+          "cached_input": 0.0028,
           "output": 0.28,
           "unit": "per_1m_tokens"
         }
@@ -687,36 +687,17 @@
     ],
     "dashscope": [
       {
-        "id": "qwen3.6-max-preview",
-        "name": "Qwen3.6 Max Preview",
+        "id": "qwen3.7-max",
+        "name": "Qwen3.7 Max",
         "is_reasoning": true,
-        "description": "Alibaba's largest and most capable Qwen3.6 Max Preview — improved vibe coding, coding agent execution, and frontend development",
-        "context_window": 262144,
+        "description": "Alibaba's largest and most capable Qwen3.7 Max — flagship agentic model excelling at coding, office/productivity, and long-horizon autonomous execution",
+        "context_window": 1000000,
         "max_output": 65536,
         "pricing": {
-          "input_tiers": [
-            {
-              "max_tokens": 128000,
-              "rate": 1.291,
-              "cached_input": 0.129
-            },
-            {
-              "max_tokens": 256000,
-              "rate": 2.152,
-              "cached_input": 0.215
-            }
-          ],
-          "output_tiers": [
-            {
-              "max_tokens": 128000,
-              "rate": 7.747
-            },
-            {
-              "max_tokens": 256000,
-              "rate": 12.912
-            }
-          ],
-          "output_pricing_mode": "input_dependent",
+          "input": 1.714,
+          "cached_input": 0.343,
+          "cache_5m": 2.143,
+          "output": 5.143,
           "unit": "per_1m_tokens"
         }
       },
@@ -962,36 +943,17 @@
     ],
     "dashscope-intl": [
       {
-        "id": "qwen3.6-max-preview",
-        "name": "Qwen3.6 Max Preview (SG)",
+        "id": "qwen3.7-max",
+        "name": "Qwen3.7 Max (SG)",
         "is_reasoning": true,
-        "description": "Alibaba's Qwen3.6 Max Preview — Singapore international region",
-        "context_window": 262144,
+        "description": "Alibaba's Qwen3.7 Max — Singapore international region",
+        "context_window": 1000000,
         "max_output": 65536,
         "pricing": {
-          "input_tiers": [
-            {
-              "max_tokens": 128000,
-              "rate": 1.398,
-              "cached_input": 0.140
-            },
-            {
-              "max_tokens": 256000,
-              "rate": 2.150,
-              "cached_input": 0.215
-            }
-          ],
-          "output_tiers": [
-            {
-              "max_tokens": 128000,
-              "rate": 8.387
-            },
-            {
-              "max_tokens": 256000,
-              "rate": 12.902
-            }
-          ],
-          "output_pricing_mode": "input_dependent",
+          "input": 2.677,
+          "cached_input": 0.535,
+          "cache_5m": 3.346,
+          "output": 8.030,
           "unit": "per_1m_tokens"
         }
       },
