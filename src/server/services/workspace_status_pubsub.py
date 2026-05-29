@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 _pubsub_client: Optional[redis.Redis] = None
 _pubsub_pool: Optional[ConnectionPool] = None
 _pubsub_init_lock = asyncio.Lock()
+# Sticky flag set when dedicated-pool construction fails (deterministic — a bad
+# URL fails every time). Lets later calls return the shared client via the
+# lock-free fast path instead of re-acquiring the lock and retrying a build that
+# can't succeed. NOT stored in _pubsub_client: that would make
+# close_status_pubsub_pool aclose() the shared cache client. Reset on shutdown.
+_pubsub_fallback = False
 
 # Backoff after a broken-connection get_message so error paths don't busy-spin.
 _BROKEN_CONN_BACKOFF_S = 1.0
@@ -46,12 +52,16 @@ async def _get_pubsub_client(cache: RedisCacheClient) -> redis.Redis:
     Falls back to the shared cache client if the dedicated pool can't be
     created — correctness is unaffected, only the pool isolation is lost.
     """
-    global _pubsub_client, _pubsub_pool
+    global _pubsub_client, _pubsub_pool, _pubsub_fallback
     if _pubsub_client is not None:
         return _pubsub_client
+    if _pubsub_fallback:
+        return cache.client
     async with _pubsub_init_lock:
         if _pubsub_client is not None:
             return _pubsub_client
+        if _pubsub_fallback:
+            return cache.client
         try:
             _pubsub_pool = ConnectionPool.from_url(
                 cache.url,
@@ -65,15 +75,18 @@ async def _get_pubsub_client(cache: RedisCacheClient) -> redis.Redis:
                 "Failed to init dedicated pubsub pool, using shared cache pool: %s",
                 exc,
             )
+            _pubsub_fallback = True
             return cache.client
     return _pubsub_client
 
 
 async def close_status_pubsub_pool() -> None:
     """Tear down the dedicated pubsub pool on shutdown. Best-effort."""
-    global _pubsub_client, _pubsub_pool
+    global _pubsub_client, _pubsub_pool, _pubsub_fallback
     client, _pubsub_client = _pubsub_client, None
     pool, _pubsub_pool = _pubsub_pool, None
+    # Clear the sticky fallback so a restart can re-attempt the dedicated pool.
+    _pubsub_fallback = False
     if client is not None:
         try:
             await client.aclose()

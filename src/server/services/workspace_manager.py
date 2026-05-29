@@ -1311,7 +1311,7 @@ class WorkspaceManager:
                 # itself is tearing down, reap_stuck_starting_workspaces() is
                 # the backstop on the next process. Re-raise to preserve
                 # cancellation semantics.
-                revert = asyncio.ensure_future(
+                revert = asyncio.create_task(
                     self._revert_unpromoted_lazy_start(workspace_id)
                 )
                 try:
@@ -1477,7 +1477,7 @@ class WorkspaceManager:
             # kind. Publishing it on the status channel lets every consumer
             # show the right spinner regardless of who owns the start.
             if state == "archived":
-                task = asyncio.ensure_future(
+                task = asyncio.create_task(
                     publish_status_change(
                         workspace_id, "starting", extra={"sandbox_state": state}
                     )
