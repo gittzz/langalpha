@@ -36,10 +36,15 @@ from src.server.database.workspace import (
     delete_workspace as db_delete_workspace,
     get_workspace as db_get_workspace,
     get_workspaces_by_status,
+    try_claim_workspace_for_start,
     update_workspace_activity,
     update_workspace_status,
 )
 from src.server.services.persistence.file import FilePersistenceService
+from src.server.services.workspace_status_pubsub import (
+    publish_status_change,
+    subscribe_to_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +62,30 @@ class WorkspaceManager:
         config: AgentConfig,
         idle_timeout: int = 1800,  # 30 minutes default
         cleanup_interval: int = 300,  # 5 minutes
+        start_wait_timeout: float = 300.0,
+        start_wait_poll_interval: float = 0.5,
+        reap_stuck_after: float | None = None,
     ):
         self.config = config
         self.idle_timeout = idle_timeout
         self.cleanup_interval = cleanup_interval
+        # Cross-worker start-mutex polling — see _wait_for_start_completion.
+        # 300s covers the worst-case archived-sandbox cold restore and the
+        # ceiling for how long a loser waits on the claim winner.
+        self.start_wait_timeout = start_wait_timeout
+        self.start_wait_poll_interval = start_wait_poll_interval
+        # Reaper age threshold — MUST be strictly greater than the worst-case
+        # legit start (start_wait_timeout), or the reaper races an in-flight
+        # archived restore: it would flip the row to 'stopped' AND discard its
+        # _pending_lazy_sync membership, silently no-op'ing the owner's later
+        # promotion (ready session, 'stopped' DB row) and triggering a
+        # duplicate restart. 2x gives headroom past the 60-300s worst case;
+        # only a genuinely-wedged start exceeds it.
+        self.reap_stuck_after = (
+            reap_stuck_after
+            if reap_stuck_after is not None
+            else start_wait_timeout * 2
+        )
 
         # In-memory session cache (workspace_id -> Session)
         self._sessions: Dict[str, Session] = {}
@@ -72,6 +97,22 @@ class WorkspaceManager:
         # Per-workspace locks (replaces global _lock to avoid cross-workspace blocking)
         self._lock_registry_mu = asyncio.Lock()  # protects _workspace_locks dict only
         self._workspace_locks: Dict[str, asyncio.Lock] = {}
+
+        # In-worker Phase 2 dedupe — when the warm endpoint + a chat
+        # message race, both arrive in ``get_session_for_workspace`` for
+        # the same workspace within the warm window. The per-workspace
+        # lock serializes the cache check but Phase 2 (ensure_sandbox_ready
+        # + sync_sandbox_assets) runs OUTSIDE the lock, so the second
+        # caller would otherwise duplicate the work. The first caller
+        # installs an event here; the second awaits it and returns the
+        # cached session the first caller hydrated.
+        self._phase2_events: Dict[str, asyncio.Event] = {}
+
+        # Strong refs to fire-and-forget sandbox-state broadcast publishes
+        # spawned from the (sync) on_state_observed callback. asyncio holds
+        # only weak refs to tasks, so without this they could be GC'd before
+        # the PUBLISH lands. Discarded in each task's done callback.
+        self._status_publish_tasks: set[asyncio.Task] = set()
 
         # Track last sync time per workspace for cooldown
         self._last_sync_at: Dict[str, float] = {}
@@ -701,6 +742,7 @@ class WorkspaceManager:
         workspace_id: str,
         user_id: str | None = None,
         on_state_observed: Callable[[str], None] | None = None,
+        _attempt: int = 0,
     ) -> Session:
         """
         Get or restart session for workspace.
@@ -738,6 +780,7 @@ class WorkspaceManager:
         session: Session | None = None
         needs_sync = False
         needs_deferred_sync = False
+        pending_start_wait = False
         workspace_user_id = user_id
 
         async with self._observed_lock(
@@ -813,64 +856,38 @@ class WorkspaceManager:
             # No usable cached session — handle based on status
             if session is None:
                 if status in ("stopped", "starting"):
-                    # "starting" means a prior lazy init is either in flight or
-                    # failed after clearing the cached session; re-entering the
-                    # restart flow is idempotent — it resets status to
-                    # "starting" (no-op) and kicks off a fresh lazy init.
-                    logger.info(
-                        f"Restarting workspace {workspace_id} from status={status}"
-                    )
-                    session = await self._restart_workspace(
-                        workspace,
-                        user_id=workspace_user_id,
-                        lazy_init=True,
-                        on_state_observed=on_state_observed,
-                    )
-                    # Don't return immediately for lazy init — fall through
-                    # to Phase 2 which waits for init and handles SandboxGoneError.
-                    needs_sync = True
-                    needs_deferred_sync = True
-
-                elif status == "running":
-                    core_config = self.config.to_core_config()
-                    session = SessionManager.get_session(workspace_id, core_config)
-
-                    if not session._initialized:
-                        sandbox_id = workspace.get("sandbox_id")
-                        try:
-                            await session.initialize(
-                                sandbox_id=sandbox_id,
-                                on_state_observed=on_state_observed,
-                            )
-                        except SandboxGoneError as e:
-                            await self._clear_session(workspace_id)
-                            logger.warning(
-                                f"Sandbox {sandbox_id} unavailable for workspace "
-                                f"{workspace_id} ({e}). Creating fresh sandbox."
-                            )
-                            return await self._recover_sandbox(
-                                workspace_id, workspace_user_id, core_config
-                            )
-                        _mark("session_initialize")
-
-                        await self._sync_sandbox_assets(
+                    # Cross-worker mutex: only one worker may transition
+                    # stopped → starting at a time. Try the claim HERE (a fast
+                    # atomic UPDATE) but NEVER wait under the lock — a 60-300s
+                    # archived cold-start would head-of-line block every other
+                    # op on this workspace (stop/delete/concurrent get) until
+                    # the 60s lock-acquire ceiling. The winner restarts and
+                    # owes Phase 2; losers (and arrivals already at 'starting')
+                    # set pending_start_wait and wait OUTSIDE the lock below.
+                    if status == "stopped":
+                        session = await self._claim_and_restart(
                             workspace_id,
                             workspace_user_id,
-                            session.sandbox,
-                            reusing_sandbox=sandbox_id is not None,
+                            on_state_observed,
                         )
-                        _mark("cold_asset_sync")
-
-                        # Check if sandbox needs config migration
-                        migrated = await self._maybe_migrate_sandbox(
-                            workspace_id, workspace_user_id, session, workspace
-                        )
-                        if migrated is not None:
-                            session = migrated
-                    else:
+                    if session is not None:
+                        # Winner: lazy-init Phase 2 needs to sync + promote.
                         needs_sync = True
+                        needs_deferred_sync = True
+                    else:
+                        # Lost the claim, or status was already 'starting'.
+                        pending_start_wait = True
 
-                    self._sessions[workspace_id] = session
+                elif status == "running":
+                    session, did_init = await self._attach_running_session(
+                        workspace,
+                        workspace_user_id,
+                        on_state_observed,
+                        _mark,
+                    )
+                    if not did_init:
+                        # Session was already initialized — refresh via Phase 2 sync.
+                        needs_sync = True
 
                 elif status == "creating":
                     raise RuntimeError(
@@ -1013,28 +1030,184 @@ class WorkspaceManager:
                 else:
                     raise RuntimeError(f"Unknown workspace status: {status}")
 
-        # ── Phase 2: Expensive sync operations OUTSIDE the lock ──
-        # These are safe to call concurrently (idempotent or have their own internal guards).
-        # Wrapped in try/except because a concurrent stop_workspace could invalidate
-        # the session while we're syncing. The session is already cached and usable;
-        # sync is best-effort — next request will retry if it failed.
+            # In-worker Phase 2 dedupe gate. Set up while still inside the
+            # per-workspace lock so two same-worker callers can't both
+            # install events for the same workspace.
+            phase2_owner = False
+            phase2_event: Optional[asyncio.Event] = None
+            if needs_sync and session is not None and session.sandbox is not None:
+                existing_event = self._phase2_events.get(workspace_id)
+                if existing_event is not None and not existing_event.is_set():
+                    phase2_event = existing_event
+                else:
+                    phase2_event = asyncio.Event()
+                    self._phase2_events[workspace_id] = phase2_event
+                    phase2_owner = True
+
+        # ── Phase 1.5: cross-worker start wait, OUTSIDE the per-workspace lock ──
+        # A caller that lost the claim (or arrived at status 'starting') waits
+        # for the owning worker to finish, then attaches the now-running session
+        # (or retries the claim once if the owner failed). Outside the lock so a
+        # slow archived cold-start (60-300s) doesn't head-of-line block other
+        # ops on this workspace behind the 60s lock-acquire ceiling.
+        if pending_start_wait:
+            return await self._await_in_flight_start(
+                workspace_id,
+                user_id=user_id,
+                workspace_user_id=workspace_user_id,
+                on_state_observed=on_state_observed,
+                mark=_mark,
+                attempt=_attempt,
+            )
+
+        # ── Phase 2: expensive sync OUTSIDE the lock (idempotent / self-guarded).
+        # Coalesces same-worker callers on the dedupe gate, promotes a lazy start
+        # to 'running' only once the sandbox is fully ready, and reverts to
+        # 'stopped' on any failure. See _complete_phase2_sync.
         _mark("lock_and_init")
+        session = await self._complete_phase2_sync(
+            workspace_id,
+            session,
+            workspace_user_id=workspace_user_id,
+            needs_sync=needs_sync,
+            needs_deferred_sync=needs_deferred_sync,
+            phase2_owner=phase2_owner,
+            phase2_event=phase2_event,
+            mark=_mark,
+        )
+
+        if _session_phases:
+            total = sum(_session_phases.values())
+            phases = " ".join(f"{k}={v:.0f}ms" for k, v in _session_phases.items())
+            logger.info(
+                f"[SESSION_TIMING] workspace_id={workspace_id} total={total:.0f}ms ({phases})"
+            )
+            # Classify path: cold_resume = lazy-restart path (needs_deferred_sync),
+            # warm_sync = cached session that needed a sync refresh, cold_create =
+            # first session for this workspace (not previously cached).
+            if needs_deferred_sync:
+                session_path = "cold_resume"
+            elif _was_cached:
+                session_path = "warm_sync"
+            else:
+                session_path = "cold_create"
+            safe_add(session_path_counter, 1, {"path": session_path})
+            safe_record(session_acquire_total_ms, total, {"session_path": session_path})
+            for _phase, _ms in _session_phases.items():
+                safe_record(
+                    session_acquire_phase_duration_ms,
+                    _ms,
+                    {"phase": _phase, "session_path": session_path},
+                )
+
+        return session
+
+    async def _await_in_flight_start(
+        self,
+        workspace_id: str,
+        *,
+        user_id: str | None,
+        workspace_user_id: str | None,
+        on_state_observed: Callable[[str], None] | None,
+        mark: Callable[[str], None],
+        attempt: int,
+    ) -> Session:
+        """Wait for another worker's in-flight start, then attach (or retry once).
+
+        Entered when this caller lost the stopped→starting claim or arrived
+        while status was already 'starting'. Runs OUTSIDE the per-workspace
+        lock; re-acquires it only briefly to attach the now-running session.
+
+        Raises:
+            RuntimeError: the start ended in an unexpected status.
+        """
+        ws_done = await self._wait_for_start_completion(workspace_id)
+        wait_status = ws_done["status"]
+        if wait_status == "running":
+            async with self._observed_lock(workspace_id, "workspace.session.attach"):
+                session, _ = await self._attach_running_session(
+                    ws_done, workspace_user_id, on_state_observed, mark
+                )
+            return session
+        if wait_status == "stopped" and attempt == 0:
+            # Owner failed and reverted to 'stopped'. Retry the whole start
+            # once: the recursive call re-enters Phase 1 and re-claims,
+            # becoming the owner with a full Phase 2 — so we don't have to
+            # duplicate the claim+sync+promote logic here. Bounded to one
+            # retry by the attempt guard.
+            logger.info(
+                f"Workspace {workspace_id} reverted to 'stopped' "
+                "(prior owner failed); retrying start"
+            )
+            return await self.get_session_for_workspace(
+                workspace_id,
+                user_id=user_id,
+                on_state_observed=on_state_observed,
+                _attempt=attempt + 1,
+            )
+        raise RuntimeError(
+            f"Workspace {workspace_id} ended start in unexpected "
+            f"status '{wait_status}' after waiting"
+        )
+
+    async def _complete_phase2_sync(
+        self,
+        workspace_id: str,
+        session: Session | None,
+        *,
+        workspace_user_id: str | None,
+        needs_sync: bool,
+        needs_deferred_sync: bool,
+        phase2_owner: bool,
+        phase2_event: Optional[asyncio.Event],
+        mark: Callable[[str], None],
+    ) -> Session | None:
+        """Run the post-lock sync/promote step and return the usable session.
+
+        Expensive operations (ensure_sandbox_ready, asset sync, file restore)
+        run OUTSIDE the per-workspace lock — they're idempotent or self-guarded.
+        Same-worker callers coalesce on ``phase2_event``: the owner runs the
+        work, waiters await the gate then trust the authoritative DB row. A lazy
+        start is promoted to 'running' only after the sandbox is fully ready;
+        any failure reverts the row to 'stopped' so it never lingers half-ready.
+        Returns the session to hand back (possibly one freshly recovered from a
+        SandboxGoneError).
+        """
         if needs_sync and session and session.sandbox:
+            if not phase2_owner:
+                # Another caller on this worker is already running Phase 2.
+                # Wait for them and return the session they hydrated.
+                assert phase2_event is not None
+                try:
+                    await asyncio.wait_for(
+                        phase2_event.wait(),
+                        timeout=self.start_wait_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Phase 2 wait timed out for workspace %s after %.0fs",
+                        workspace_id,
+                        self.start_wait_timeout,
+                    )
+                mark("phase2_wait")
+                # The Phase 2 owner is the authoritative status writer:
+                # 'running' on success, 'stopped'/'error' on failure. Trust the
+                # DB, not the cached session — on owner failure the cache may
+                # hold a stale or half-initialized session, and returning it
+                # would silently hand back a broken sandbox.
+                ws_after = await db_get_workspace(workspace_id)
+                if ws_after is not None and ws_after["status"] == "running":
+                    return self._sessions.get(workspace_id, session)
+                raise RuntimeError(
+                    f"Workspace {workspace_id} did not reach 'running' after "
+                    f"Phase 2 (status={ws_after['status'] if ws_after else 'deleted'})"
+                )
+
             try:
                 await session.sandbox.ensure_sandbox_ready()
-                _mark("sandbox_ready")
+                mark("sandbox_ready")
 
                 if needs_deferred_sync:
-                    # Only promote when a lazy init actually happened (row is
-                    # still in _pending_lazy_sync). A forced non-lazy restart
-                    # already flipped status to running + stamped activity
-                    # inside _restart_workspace — no-op here.
-                    if workspace_id in self._pending_lazy_sync:
-                        await update_workspace_status(
-                            workspace_id=workspace_id,
-                            status="running",
-                        )
-                        await update_workspace_activity(workspace_id)
                     logger.debug(
                         f"Completing deferred sync for lazy-init workspace {workspace_id}"
                     )
@@ -1044,10 +1217,23 @@ class WorkspaceManager:
                         session.sandbox,
                         reusing_sandbox=True,
                     )
-                    _mark("asset_sync")
+                    mark("asset_sync")
                     await self._maybe_restore_files(workspace_id, session.sandbox)
-                    _mark("file_restore")
-                    self._pending_lazy_sync.discard(workspace_id)
+                    mark("file_restore")
+                    # Promote to 'running' ONLY after the sandbox is ready AND
+                    # assets + files are synced — so 'running' (and its pub/sub
+                    # notification + SSE close) truthfully means "usable". Any
+                    # failure above is caught below and reverts the row to
+                    # 'stopped', never leaving a half-ready 'running'. A forced
+                    # non-lazy restart already promoted inside _restart_workspace
+                    # (not in _pending_lazy_sync) — no-op here.
+                    if workspace_id in self._pending_lazy_sync:
+                        await update_workspace_status(
+                            workspace_id=workspace_id,
+                            status="running",
+                        )
+                        await update_workspace_activity(workspace_id)
+                        self._pending_lazy_sync.discard(workspace_id)
 
                 self._record_sync(workspace_id)
             except SandboxGoneError as e:
@@ -1090,6 +1276,10 @@ class WorkspaceManager:
                     # would tear down the healthy replacement's MCP+provider.
                     # Pass evict_session so the pop inside _clear_session is
                     # also identity-guarded across its own await boundary.
+                    # Revert BEFORE clearing the session — _clear_session
+                    # discards _pending_lazy_sync, which would make the revert
+                    # a no-op (it keys off pending membership).
+                    await self._revert_unpromoted_lazy_start(workspace_id)
                     if self._sessions.get(workspace_id) is session:
                         await self._clear_session(workspace_id, evict_session=session)
                     raise
@@ -1097,37 +1287,293 @@ class WorkspaceManager:
                     f"Phase 2 sync transient for workspace {workspace_id} "
                     f"(will retry next request): {e}"
                 )
+                await self._revert_unpromoted_lazy_start(workspace_id)
+            except asyncio.CancelledError:
+                # A client disconnect or server shutdown mid-Phase-2 cancels
+                # this coroutine. CancelledError is a BaseException, so without
+                # this clause it bypasses every revert handler and leaves the
+                # row wedged in 'starting' forever (no reaper would promote it,
+                # and /start rejects non-'stopped'). Revert on a shielded task
+                # so the DB write survives the cancellation; if the event loop
+                # itself is tearing down, reap_stuck_starting_workspaces() is
+                # the backstop on the next process. Re-raise to preserve
+                # cancellation semantics.
+                revert = asyncio.ensure_future(
+                    self._revert_unpromoted_lazy_start(workspace_id)
+                )
+                try:
+                    await asyncio.shield(revert)
+                except asyncio.CancelledError:
+                    pass
+                raise
             except Exception as e:
                 logger.warning(
-                    f"Phase 2 sync failed for workspace {workspace_id} "
-                    f"(will retry next request): {e}"
+                    f"Phase 2 sync failed for workspace {workspace_id}: {e}"
                 )
-
-        if _session_phases:
-            total = sum(_session_phases.values())
-            phases = " ".join(f"{k}={v:.0f}ms" for k, v in _session_phases.items())
-            logger.info(
-                f"[SESSION_TIMING] workspace_id={workspace_id} total={total:.0f}ms ({phases})"
-            )
-            # Classify path: cold_resume = lazy-restart path (needs_deferred_sync),
-            # warm_sync = cached session that needed a sync refresh, cold_create =
-            # first session for this workspace (not previously cached).
-            if needs_deferred_sync:
-                session_path = "cold_resume"
-            elif _was_cached:
-                session_path = "warm_sync"
-            else:
-                session_path = "cold_create"
-            safe_add(session_path_counter, 1, {"path": session_path})
-            safe_record(session_acquire_total_ms, total, {"session_path": session_path})
-            for _phase, _ms in _session_phases.items():
-                safe_record(
-                    session_acquire_phase_duration_ms,
-                    _ms,
-                    {"phase": _phase, "session_path": session_path},
-                )
+                # Capture before reverting — the revert clears _pending_lazy_sync.
+                was_unpromoted_lazy = workspace_id in self._pending_lazy_sync
+                await self._revert_unpromoted_lazy_start(workspace_id)
+                if was_unpromoted_lazy:
+                    # Lazy start failed before promotion: we just reverted the
+                    # row to 'stopped' and the sandbox never finished asset/file
+                    # sync. Returning the session would hand the agent a
+                    # half-initialized sandbox while the DB says 'stopped'.
+                    # Surface the failure so the caller re-claims cleanly.
+                    raise
+                # Already-'running' re-sync hit a transient error; the sandbox
+                # was usable before this periodic sync, so keep the cached
+                # session and let the next request retry the sync.
+            finally:
+                # Release the dedupe gate so any waiter on this worker can
+                # proceed. Identity-check the registry slot so a fresh event
+                # installed by the NEXT caller (already past our finally)
+                # isn't accidentally evicted.
+                if phase2_event is not None:
+                    phase2_event.set()
+                    if self._phase2_events.get(workspace_id) is phase2_event:
+                        self._phase2_events.pop(workspace_id, None)
+        elif phase2_owner and phase2_event is not None:
+            # We installed a dedupe event under the lock, but the Phase 2
+            # precondition (session.sandbox) no longer holds — e.g. a
+            # concurrent stop_workspace nulled the sandbox between lock
+            # release and here. Release the gate so waiters (and any future
+            # caller that would attach to this event) don't hang out the
+            # full start timeout on an event nobody will ever set.
+            phase2_event.set()
+            if self._phase2_events.get(workspace_id) is phase2_event:
+                self._phase2_events.pop(workspace_id, None)
 
         return session
+
+    async def _revert_unpromoted_lazy_start(self, workspace_id: str) -> None:
+        """Revert a lazy-start owner's row to 'stopped' when Phase 2 fails
+        before promotion.
+
+        The cross-worker mutex parks losers in ``_wait_for_start_completion``
+        until the row leaves 'starting'. If the claim winner fails in Phase 2
+        (ensure_sandbox_ready / asset sync / file restore) the row would
+        otherwise stay 'starting' with no reaper, so every loser waits out the
+        full ``start_wait_timeout``. Reverting to 'stopped' (and publishing via
+        ``update_workspace_status``) lets losers retry the claim immediately.
+
+        No-op once the row has been promoted to 'running' (the owner discards
+        it from ``_pending_lazy_sync`` on promotion), and for non-lazy restarts
+        (never added to ``_pending_lazy_sync``).
+        """
+        if workspace_id not in self._pending_lazy_sync:
+            return
+        self._pending_lazy_sync.discard(workspace_id)
+        try:
+            await update_workspace_status(workspace_id=workspace_id, status="stopped")
+        except Exception:
+            # Best-effort — if the revert itself fails, the start_wait_timeout
+            # still recovers losers, just with worse latency.
+            logger.exception(
+                "Failed to revert workspace %s to 'stopped' after Phase 2 failure",
+                workspace_id,
+            )
+
+    async def _attach_running_session(
+        self,
+        workspace: Dict[str, Any],
+        workspace_user_id: str | None,
+        on_state_observed: Callable[[str], None] | None,
+        mark: Callable[[str], None],
+    ) -> tuple[Session, bool]:
+        """Acquire/initialize a session for a workspace whose DB status is 'running'.
+
+        Shared between the running-status branch and the cross-worker wait
+        paths (where another worker just promoted status to 'running').
+        Caller must hold the per-workspace `_observed_lock`.
+
+        Returns:
+            (session, did_init) — ``did_init`` is True when this call performed
+            the cold initialization, False when the cached session was already
+            initialized (caller should run Phase 2 sync).
+        """
+        workspace_id = str(workspace["workspace_id"])
+        core_config = self.config.to_core_config()
+        session = SessionManager.get_session(workspace_id, core_config)
+        did_init = False
+
+        if not session._initialized:
+            sandbox_id = workspace.get("sandbox_id")
+            try:
+                await session.initialize(
+                    sandbox_id=sandbox_id,
+                    on_state_observed=on_state_observed,
+                )
+            except SandboxGoneError as e:
+                await self._clear_session(workspace_id)
+                logger.warning(
+                    f"Sandbox {sandbox_id} unavailable for workspace "
+                    f"{workspace_id} ({e}). Creating fresh sandbox."
+                )
+                recovered = await self._recover_sandbox(
+                    workspace_id, workspace_user_id, core_config
+                )
+                return recovered, True
+            mark("session_initialize")
+
+            await self._sync_sandbox_assets(
+                workspace_id,
+                workspace_user_id,
+                session.sandbox,
+                reusing_sandbox=sandbox_id is not None,
+            )
+            mark("cold_asset_sync")
+
+            migrated = await self._maybe_migrate_sandbox(
+                workspace_id, workspace_user_id, session, workspace
+            )
+            if migrated is not None:
+                session = migrated
+            did_init = True
+
+        self._sessions[workspace_id] = session
+        return session, did_init
+
+    async def _claim_and_restart(
+        self,
+        workspace_id: str,
+        workspace_user_id: str | None,
+        on_state_observed: Callable[[str], None] | None,
+    ) -> Optional[Session]:
+        """Try to win the stopped→starting claim and restart the workspace.
+
+        On exception during restart, revert the row back to 'stopped' so other
+        callers can retry immediately instead of waiting out the 300s timeout.
+
+        Returns:
+            Session if we won the claim and restarted, None if another worker
+            had already moved the row out of 'stopped'.
+        """
+        claimed = await try_claim_workspace_for_start(workspace_id)
+        if claimed is None:
+            return None
+
+        def _observe_and_broadcast(state: str) -> None:
+            # Forward to the caller's own observer (the chat path uses it to
+            # drive its in-conversation spinner).
+            if on_state_observed is not None:
+                on_state_observed(state)
+            # Broadcast a slow-restore hint cross-worker. The pre-start sandbox
+            # state is observed only by whoever wins the claim; without this,
+            # a worker that lost the claim (or the /events SSE the frontend
+            # opened on entry) never learns the restore is the slow 'archived'
+            # kind. Publishing it on the status channel lets every consumer
+            # show the right spinner regardless of who owns the start.
+            if state == "archived":
+                task = asyncio.ensure_future(
+                    publish_status_change(
+                        workspace_id, "starting", extra={"sandbox_state": state}
+                    )
+                )
+                self._status_publish_tasks.add(task)
+                task.add_done_callback(self._status_publish_tasks.discard)
+
+        try:
+            logger.info(
+                f"Restarting workspace {workspace_id} (claimed for start)"
+            )
+            return await self._restart_workspace(
+                claimed,
+                user_id=workspace_user_id,
+                lazy_init=True,
+                on_state_observed=_observe_and_broadcast,
+            )
+        except Exception:
+            # Best-effort revert — if it fails, the 300s timeout still recovers,
+            # just with worse UX. Don't shadow the original exception.
+            try:
+                await update_workspace_status(
+                    workspace_id=workspace_id,
+                    status="stopped",
+                )
+            except Exception:
+                logger.exception(
+                    f"Failed to revert workspace {workspace_id} status after start error"
+                )
+            raise
+
+    async def _wait_for_start_completion(
+        self,
+        workspace_id: str,
+        max_wait_s: float | None = None,
+        poll_interval_s: float | None = None,
+    ) -> Dict[str, Any]:
+        """Wait for an in-flight start to resolve, using pub/sub + DB safety net.
+
+        Used by the cross-worker mutex path: when ``try_claim_workspace_for_start``
+        returns None, another worker (or process) is mid-start. We subscribe
+        to the Redis status channel BEFORE re-reading the DB to close the
+        race where the publish landed during the lock window, then await
+        notifications with a 30 s ceiling so a missed message still re-reads
+        the DB instead of waiting out the full timeout.
+
+        When Redis is unavailable, falls back to the original exponential-
+        backoff DB poll (0.5 s → 2 s cap).
+
+        Returns the updated workspace dict.
+
+        Raises:
+            ValueError: Workspace deleted while waiting.
+            RuntimeError: Status went to 'error', or timeout exceeded.
+        """
+        timeout = self.start_wait_timeout if max_wait_s is None else max_wait_s
+        base_interval = (
+            self.start_wait_poll_interval if poll_interval_s is None else poll_interval_s
+        )
+        max_interval = max(base_interval, 2.0)
+        deadline = time.monotonic() + timeout
+
+        async with subscribe_to_status(workspace_id) as wait_for_notify:
+            # Read DB AFTER subscribing — closes the race where the
+            # publish landed before our SUBSCRIBE completed.
+            workspace = await db_get_workspace(workspace_id)
+            if not workspace:
+                raise ValueError(
+                    f"Workspace {workspace_id} not found while waiting for start"
+                )
+            status = workspace["status"]
+            if status == "running":
+                return workspace
+            if status == "error":
+                raise RuntimeError(f"Workspace {workspace_id} failed to start")
+            if status != "starting":
+                return workspace
+
+            interval = base_interval
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                if wait_for_notify is not None:
+                    # Pub/sub fast path. Cap at 30 s so a dropped publish
+                    # still triggers a periodic DB re-read.
+                    await wait_for_notify(min(remaining, 30.0))
+                else:
+                    await asyncio.sleep(min(interval, remaining))
+                    interval = min(interval * 2, max_interval)
+
+                workspace = await db_get_workspace(workspace_id)
+                if not workspace:
+                    raise ValueError(
+                        f"Workspace {workspace_id} not found while waiting for start"
+                    )
+                status = workspace["status"]
+                if status == "running":
+                    return workspace
+                if status == "error":
+                    raise RuntimeError(f"Workspace {workspace_id} failed to start")
+                if status != "starting":
+                    return workspace
+
+        raise RuntimeError(
+            f"Workspace {workspace_id} stuck in 'starting' after {timeout:.0f}s; "
+            "another worker may have died mid-start"
+        )
 
     async def _restart_workspace(
         self,
@@ -1476,6 +1922,76 @@ class WorkspaceManager:
 
         return stopped_count
 
+    async def reap_stuck_starting_workspaces(self) -> int:
+        """Revert workspaces wedged in 'starting' back to 'stopped'.
+
+        Backstop for the cross-worker start mutex: if a claim winner's Phase 2
+        dies without reverting (worker crash, event-loop teardown that beats the
+        CancelledError revert, or a publish that never lands), the row stays
+        'starting' with no other recovery path — every later caller waits out
+        start_wait_timeout then raises, and /start rejects non-'stopped'.
+
+        Never reaps a start THIS process is still running: an in-flight lazy
+        owner holds ``_pending_lazy_sync`` membership and will promote (on
+        success) or revert (on failure) the row itself. Reaping it would discard
+        that membership and silently no-op the owner's promotion, stranding a
+        ready session behind a 'stopped' row and triggering a duplicate restart.
+        That guard makes the in-process case correct regardless of how slow the
+        restore is. The ``reap_stuck_after`` threshold (2x start_wait_timeout by
+        default) then only governs the cross-process backstop — rows wedged by a
+        crashed/recycled worker, which carry no local membership.
+
+        Returns:
+            Number of workspaces reverted.
+        """
+        now = datetime.now(timezone.utc)
+        reverted = 0
+
+        starting_workspaces = await get_workspaces_by_status("starting", limit=1000)
+        if len(starting_workspaces) == 1000:
+            logger.warning(
+                "reap_stuck_starting hit the 1000-row scan cap; more stuck "
+                "rows may remain and will be reaped on the next cycle"
+            )
+        for workspace in starting_workspaces:
+            updated_at = workspace.get("updated_at")
+            if not updated_at:
+                continue
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            if (now - updated_at).total_seconds() <= self.reap_stuck_after:
+                continue
+
+            workspace_id = str(workspace["workspace_id"])
+            if workspace_id in self._pending_lazy_sync:
+                # A lazy-start owner on THIS worker is still mid-flight. It
+                # owns the row's transition (promote on success, revert on
+                # failure); reaping here would discard its membership and
+                # no-op that promotion, leaving a ready session behind a
+                # 'stopped' row. Cross-process stuck rows have no local
+                # membership and fall through to the reap below.
+                continue
+            logger.warning(
+                f"Reaping workspace {workspace_id} stuck in 'starting' for "
+                f"{(now - updated_at).total_seconds():.0f}s "
+                f"(threshold {self.reap_stuck_after:.0f}s); reverting to 'stopped'"
+            )
+            try:
+                await update_workspace_status(
+                    workspace_id=workspace_id, status="stopped"
+                )
+                self._pending_lazy_sync.discard(workspace_id)
+                reverted += 1
+            except Exception as e:
+                logger.error(
+                    f"Error reaping stuck-starting workspace {workspace_id}: {e}"
+                )
+
+        if reverted > 0:
+            logger.info(f"Reaped {reverted} workspaces stuck in 'starting'")
+
+        return reverted
+
     async def start_cleanup_task(self) -> None:
         """Start background cleanup task."""
         if self._cleanup_task is not None:
@@ -1489,6 +2005,7 @@ class WorkspaceManager:
                     await asyncio.sleep(self.cleanup_interval)
                     if not self._shutdown:
                         await self.cleanup_idle_workspaces()
+                        await self.reap_stuck_starting_workspaces()
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
