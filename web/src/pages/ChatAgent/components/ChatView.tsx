@@ -2271,7 +2271,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       files={workspaceFiles}
                       tokenUsage={tokenUsage}
                       onAction={handleAction}
-                      initialModel={lastThreadModel || null}
+                      initialModel={lastThreadModel}
                       threadModels={threadModels}
                       mode={isFlashMode ? 'fast' : 'ptc'}
                     />
