@@ -14,10 +14,14 @@ Endpoints:
 - DELETE /api/v1/workspaces/{workspace_id} - Delete workspace
 """
 
+import asyncio
+import json
 import logging
+import time
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response, StreamingResponse
 
 from src.server.utils.api import CurrentUserId, require_workspace_owner
 from src.server.dependencies.usage_limits import WorkspaceLimitCheck
@@ -38,6 +42,7 @@ from src.server.models.workspace import (
 )
 from src.server.models.workspace_refresh import WorkspaceRefreshResponse
 from src.server.services.workspace_manager import WorkspaceManager
+from src.server.services.workspace_status_pubsub import subscribe_to_status
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +192,155 @@ async def list_workspaces(
         raise HTTPException(status_code=500, detail="Failed to list workspaces")
 
 
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+_EVENTS_KEEPALIVE_S = 30.0
+_EVENTS_MAX_DURATION_S = 600.0
+_EVENTS_TERMINAL = {"running", "error", "deleted"}
+
+
+def _sse_status_event(
+    workspace_id: str, status: str, sandbox_state: str | None = None
+) -> str:
+    data = {"workspace_id": workspace_id, "status": status}
+    if sandbox_state:
+        data["sandbox_state"] = sandbox_state
+    return f"event: status\ndata: {json.dumps(data)}\n\n"
+
+
+@router.get("/{workspace_id}/events")
+async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
+    """Push workspace lifecycle status changes to the client via SSE.
+
+    Replaces the previous 4-second interval polling on the frontend. The
+    handler emits the current status immediately, then one ``status``
+    event per transition (stopped → starting → running). Closes once the
+    status is terminal (``running``, ``error``, ``deleted``), or after a
+    600 s hard cap. A ``: ping\\n\\n`` keepalive is sent every 30 s.
+
+    Falls back to DB polling at the keepalive interval when Redis pub/sub
+    is unavailable so the FE never needs an interval-polling sidecar.
+    """
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+
+    initial_status = workspace["status"]
+
+    async def event_generator():
+        started = time.monotonic()
+        last_status = initial_status
+        last_sandbox_state: str | None = None
+
+        async def reconcile() -> tuple[str | None, bool]:
+            """Re-read the authoritative DB row and diff against last_status.
+
+            Returns ``(event_to_yield_or_None, should_close)``. Closes the
+            stream when the workspace is gone or has reached a terminal status.
+            Single source of the read → diff → emit logic shared by the
+            post-subscribe read, the keepalive tick, the pub/sub hint confirm,
+            and the Redis-disabled poll.
+            """
+            nonlocal last_status
+            ws = await db_get_workspace(workspace_id)
+            if ws is None:
+                return None, True
+            if ws["status"] == last_status:
+                return None, False
+            last_status = ws["status"]
+            return (
+                _sse_status_event(workspace_id, last_status),
+                last_status in _EVENTS_TERMINAL,
+            )
+
+        yield _sse_status_event(workspace_id, last_status)
+        if last_status in _EVENTS_TERMINAL:
+            return
+
+        async with subscribe_to_status(workspace_id) as wait_for_notify:
+            # Always re-read after subscribing — the publish for the current
+            # status could have fired between the initial DB read above and
+            # the SUBSCRIBE below.
+            event, close = await reconcile()
+            if event:
+                yield event
+            if close:
+                return
+
+            while time.monotonic() - started < _EVENTS_MAX_DURATION_S:
+                if wait_for_notify is not None:
+                    payload = await wait_for_notify(_EVENTS_KEEPALIVE_S)
+                    if payload is None:
+                        # Keepalive tick or a missed message — re-read to be
+                        # safe, then send keepalive.
+                        event, close = await reconcile()
+                        if event:
+                            yield event
+                        if close:
+                            return
+                        yield ": ping\n\n"
+                        continue
+                    # Forward a sandbox sub-state refinement (e.g. 'archived')
+                    # immediately. It's a non-terminal hint during the
+                    # 'starting' phase — it can't close the stream and isn't
+                    # persisted in the DB, so it's emitted directly without a
+                    # DB re-read. Lets the FE escalate to the slow-restore
+                    # spinner even when a background warm (not this client's
+                    # chat) owns the start.
+                    sandbox_state = payload.get("sandbox_state")
+                    hinted = payload.get("status")
+                    # Pair the refinement with the payload's own status, not the
+                    # cached last_status. A publish can carry {status:'starting',
+                    # sandbox_state:'archived'} while reconcile() still has
+                    # last_status on 'stopped' (the 'starting' publish raced ahead
+                    # of its commit). Emitting 'stopped' here makes the FE drop
+                    # the archived hint, and the follow-up plain 'starting' (from
+                    # reconcile) carries no refinement — the spinner is lost.
+                    event_status = hinted if isinstance(hinted, str) else last_status
+                    if (
+                        sandbox_state
+                        and sandbox_state != last_sandbox_state
+                        and event_status not in _EVENTS_TERMINAL
+                    ):
+                        # Guard on event_status (what we emit), not last_status —
+                        # this is a non-terminal hint, so it must never carry a
+                        # terminal status. reconcile() owns terminal transitions.
+                        last_sandbox_state = sandbox_state
+                        yield _sse_status_event(
+                            workspace_id, event_status, sandbox_state=sandbox_state
+                        )
+                    # Treat the status hint as advisory only. A publish can race
+                    # ahead of its transaction commit (or be spurious), and a
+                    # terminal status closes the stream — so confirm against the
+                    # authoritative DB row (via reconcile) before trusting it.
+                    if not hinted or hinted == last_status:
+                        continue
+                    event, close = await reconcile()
+                    if event:
+                        yield event
+                    if close:
+                        return
+                else:
+                    # Redis-disabled fallback: server-side keepalive-paced poll.
+                    await asyncio.sleep(_EVENTS_KEEPALIVE_S)
+                    event, close = await reconcile()
+                    if event:
+                        yield event
+                    if close:
+                        return
+                    yield ": ping\n\n"
+
+        yield "event: timeout\ndata: {}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
+
 @router.get("/{workspace_id}", response_model=WorkspaceResponse)
 async def get_workspace(workspace_id: str, x_user_id: CurrentUserId):
     """
@@ -255,10 +409,59 @@ async def update_workspace(
         raise HTTPException(status_code=500, detail="Failed to update workspace")
 
 
+# Strong references to in-flight warm tasks. asyncio holds only *weak*
+# references to tasks, so a fire-and-forget create_task whose handle goes out
+# of scope can be garbage-collected mid-flight — which, after the row was
+# claimed to 'starting', would wedge the workspace. Hold a strong ref until
+# the task finishes (discarded in the done callback below).
+_warm_tasks: set[asyncio.Task] = set()
+
+
+def _log_warm_task_exception(workspace_id: str, task: asyncio.Task) -> None:
+    """Surface background warm-task failures (silent create_task is dangerous)."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.exception(
+            "Background warm task for workspace %s failed: %s",
+            workspace_id,
+            exc,
+            exc_info=exc,
+        )
+
+
+async def drain_warm_tasks() -> None:
+    """Cancel and await in-flight warm tasks on shutdown.
+
+    A warm task cancelled mid-Phase-2 triggers the CancelledError revert in
+    WorkspaceManager.get_session_for_workspace, which resets the row from
+    'starting' back to 'stopped'. Without this drain the event loop tears the
+    tasks down abruptly during shutdown and the revert may not land, leaving
+    rows wedged in 'starting' until the next process reaps them. Call from the
+    app lifespan shutdown BEFORE WorkspaceManager.shutdown().
+    """
+    if not _warm_tasks:
+        return
+    tasks = list(_warm_tasks)
+    logger.info("Draining %d in-flight warm task(s) on shutdown", len(tasks))
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @router.post("/{workspace_id}/start", response_model=WorkspaceActionResponse)
 async def start_workspace(
     workspace_id: str,
     x_user_id: CurrentUserId,
+    lazy: bool = Query(
+        False,
+        description=(
+            "If true, schedule the restart in the background and return 202 "
+            "immediately with status='starting'. If false (default), block "
+            "until the session is ready and return status='running'."
+        ),
+    ),
 ):
     """
     Start a stopped workspace.
@@ -266,8 +469,15 @@ async def start_workspace(
     This restarts the Daytona sandbox, which is much faster than creating
     a new one (~5 seconds vs ~60 seconds).
 
+    With ``lazy=true``, the endpoint returns 202 immediately and continues
+    the restart in a background task — used by the proactive warm-on-entry
+    UI flow to avoid blocking the request for stopped-hot (~5s) or
+    archived (~60-300s) restores.
+
     Args:
         workspace_id: Workspace UUID
+        lazy: When true, return 202 + 'starting' immediately and continue
+            the restart in the background. Default false (blocking).
 
     Returns:
         Action result
@@ -302,7 +512,32 @@ async def start_workspace(
                 detail=f"Cannot start workspace in '{workspace['status']}' state",
             )
 
-        # Start by getting session (triggers restart)
+        if lazy:
+            # Schedule the restart and return 202 immediately. The chat path's
+            # own get_session_for_workspace call will dedupe against this via
+            # the existing _observed_lock and _pending_lazy_sync primitives.
+            task = asyncio.create_task(
+                manager.get_session_for_workspace(workspace_id, user_id=x_user_id),
+                name=f"warm-workspace-{workspace_id}",
+            )
+            _warm_tasks.add(task)
+            task.add_done_callback(_warm_tasks.discard)
+            task.add_done_callback(
+                lambda t, wid=workspace_id: _log_warm_task_exception(wid, t)
+            )
+            logger.info(f"Scheduled warm restart for workspace {workspace_id}")
+            payload = WorkspaceActionResponse(
+                workspace_id=workspace_id,
+                status="starting",
+                message="Workspace warm initiated",
+            )
+            return Response(
+                status_code=202,
+                content=payload.model_dump_json(),
+                media_type="application/json",
+            )
+
+        # Existing blocking path
         await manager.get_session_for_workspace(workspace_id, user_id=x_user_id)
 
         logger.info(f"Started workspace {workspace_id}")

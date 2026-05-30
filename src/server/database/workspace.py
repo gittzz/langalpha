@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from psycopg.rows import dict_row
 
 from src.server.database.conversation import get_db_connection
+from src.server.services.workspace_status_pubsub import publish_status_change
 
 logger = logging.getLogger(__name__)
 
@@ -437,11 +438,65 @@ async def update_workspace_status(
 
         if result:
             logger.debug(f"Updated workspace {workspace_id} status to: {status}")
+            # Best-effort cross-worker notification — wakes any
+            # _wait_for_start_completion loop and any /events SSE
+            # subscribers in milliseconds. Swallows on failure.
+            await publish_status_change(workspace_id, status)
             return dict(result)
         return None
 
     except Exception as e:
         logger.error(f"Error updating workspace {workspace_id} status: {e}")
+        raise
+
+
+async def try_claim_workspace_for_start(
+    workspace_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim a stopped workspace for a start transition.
+
+    Cross-worker mutex for the stopped → starting transition. Only the worker
+    whose UPDATE returns a row should proceed to restart the sandbox; losers
+    must wait for the winner to flip status to 'running' (or 'error').
+
+    Owns its own connection so the UPDATE is committed before the publish
+    fires — a caller-supplied transaction would let publish_status_change
+    wake SSE subscribers that then read the still-'stopped' row.
+
+    Returns:
+        The updated workspace row (status='starting') if claimed; None if
+        the workspace was not in 'stopped' state (already starting, running,
+        creating, error, deleted, or stopping).
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        query = """
+            UPDATE workspaces
+            SET status = 'starting', updated_at = %s
+            WHERE workspace_id = %s AND status = 'stopped'
+            RETURNING workspace_id, user_id, name, description, sandbox_id,
+                      status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
+                      is_pinned, sort_order
+        """
+        params = (now, workspace_id)
+
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(query, params)
+                result = await cur.fetchone()
+
+        if result:
+            logger.debug(f"Claimed workspace {workspace_id} for start (was stopped)")
+            # Notify so cross-worker /events subscribers learn about the
+            # stopped → starting flip without polling. The wait loop in
+            # WorkspaceManager doesn't need this (the loser path triggers
+            # only after the claim returns None), but the FE does.
+            await publish_status_change(workspace_id, "starting")
+            return dict(result)
+        return None
+
+    except Exception as e:
+        logger.error(f"Error claiming workspace {workspace_id} for start: {e}")
         raise
 
 

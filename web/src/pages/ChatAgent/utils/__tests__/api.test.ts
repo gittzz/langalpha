@@ -32,6 +32,7 @@ import {
   getThread,
   deleteThread,
   sendHitlResponse,
+  streamWorkspaceEvents,
 } from '../api';
 
 const mockGet = api.get as Mock;
@@ -262,6 +263,125 @@ describe('ChatAgent API utilities', () => {
         onRunIdResolved,
       );
       expect(onRunIdResolved).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('streamWorkspaceEvents', () => {
+    let originalFetch: typeof global.fetch;
+
+    beforeEach(() => {
+      originalFetch = global.fetch;
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
+    /** Build a fetch mock whose body streams the given SSE text chunks. */
+    function mockSSEResponse(chunks: string[], { ok = true } = {}) {
+      const encoder = new TextEncoder();
+      const queue = [...chunks];
+      const reader = {
+        read: vi.fn(async () => {
+          if (queue.length === 0) return { done: true, value: undefined };
+          return { done: false, value: encoder.encode(queue.shift()!) };
+        }),
+        cancel: vi.fn(async () => {}),
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok,
+        status: ok ? 200 : 503,
+        body: ok ? { getReader: () => reader } : null,
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+      return { fetchMock, reader };
+    }
+
+    const ctrl = () => new AbortController().signal;
+
+    it('parses a status event and passes status + sandbox_state', async () => {
+      mockSSEResponse([
+        'event: status\ndata: {"workspace_id":"ws-1","status":"starting","sandbox_state":"archived"}\n\n',
+      ]);
+      const onStatus = vi.fn();
+      await streamWorkspaceEvents('ws-1', onStatus, ctrl());
+      expect(onStatus).toHaveBeenCalledWith('starting', 'archived');
+    });
+
+    it('omits sandbox_state when the payload has none', async () => {
+      mockSSEResponse([
+        'event: status\ndata: {"workspace_id":"ws-1","status":"running"}\n\n',
+      ]);
+      const onStatus = vi.fn();
+      await streamWorkspaceEvents('ws-1', onStatus, ctrl());
+      expect(onStatus).toHaveBeenCalledWith('running', undefined);
+    });
+
+    it('handles an event split across read() chunks', async () => {
+      // The "data:" line arrives in a separate read than "event:".
+      mockSSEResponse([
+        'event: status\n',
+        'data: {"status":"starting"}\n\n',
+      ]);
+      const onStatus = vi.fn();
+      await streamWorkspaceEvents('ws-1', onStatus, ctrl());
+      expect(onStatus).toHaveBeenCalledWith('starting', undefined);
+    });
+
+    it('stops on a timeout event without emitting further statuses', async () => {
+      mockSSEResponse([
+        'event: status\ndata: {"status":"starting"}\n\n',
+        'event: timeout\ndata: {}\n\n',
+        'event: status\ndata: {"status":"running"}\n\n',
+      ]);
+      const onStatus = vi.fn();
+      await streamWorkspaceEvents('ws-1', onStatus, ctrl());
+      expect(onStatus).toHaveBeenCalledTimes(1);
+      expect(onStatus).toHaveBeenCalledWith('starting', undefined);
+    });
+
+    it('skips a malformed payload but keeps consuming the stream', async () => {
+      mockSSEResponse([
+        'event: status\ndata: {not json}\n\n',
+        'event: status\ndata: {"status":"running"}\n\n',
+      ]);
+      const onStatus = vi.fn();
+      await streamWorkspaceEvents('ws-1', onStatus, ctrl());
+      expect(onStatus).toHaveBeenCalledTimes(1);
+      expect(onStatus).toHaveBeenCalledWith('running', undefined);
+    });
+
+    it('returns without emitting when the response is not ok', async () => {
+      mockSSEResponse(['event: status\ndata: {"status":"running"}\n\n'], { ok: false });
+      const onStatus = vi.fn();
+      await streamWorkspaceEvents('ws-1', onStatus, ctrl());
+      expect(onStatus).not.toHaveBeenCalled();
+    });
+
+    it('no-ops with an empty workspace id and never fetches', async () => {
+      const fetchMock = vi.fn();
+      global.fetch = fetchMock as unknown as typeof fetch;
+      const onStatus = vi.fn();
+      await streamWorkspaceEvents('', onStatus, ctrl());
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(onStatus).not.toHaveBeenCalled();
+    });
+
+    it('swallows a network error and resolves (best-effort)', async () => {
+      global.fetch = vi.fn().mockRejectedValue(new Error('network down')) as unknown as typeof fetch;
+      const onStatus = vi.fn();
+      await expect(
+        streamWorkspaceEvents('ws-1', onStatus, ctrl()),
+      ).resolves.toBeUndefined();
+      expect(onStatus).not.toHaveBeenCalled();
+    });
+
+    it('cancels the reader on close to release the stream', async () => {
+      const { reader } = mockSSEResponse([
+        'event: status\ndata: {"status":"running"}\n\n',
+      ]);
+      await streamWorkspaceEvents('ws-1', vi.fn(), ctrl());
+      expect(reader.cancel).toHaveBeenCalled();
     });
   });
 });

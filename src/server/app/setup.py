@@ -426,6 +426,23 @@ async def lifespan(app: FastAPI):
     # 3. Shutdown Workspace Manager (stop cleanup task, clear cache)
     if workspace_manager is not None:
         try:
+            # Drain in-flight warm tasks first so a task cancelled mid-Phase-2
+            # reverts its 'starting' row to 'stopped' (CancelledError revert)
+            # instead of being torn down abruptly and left wedged.
+            from src.server.app.workspaces import drain_warm_tasks
+
+            await drain_warm_tasks()
+        except Exception as e:
+            logger.warning(f"Error draining warm tasks: {e}")
+        try:
+            from src.server.services.workspace_status_pubsub import (
+                close_status_pubsub_pool,
+            )
+
+            await close_status_pubsub_pool()
+        except Exception as e:
+            logger.warning(f"Error closing status pubsub pool: {e}")
+        try:
             logger.info("Shutting down Workspace Manager...")
             await workspace_manager.shutdown()
             logger.info("Workspace Manager shutdown complete")

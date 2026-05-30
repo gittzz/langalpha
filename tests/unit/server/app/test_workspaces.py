@@ -5,9 +5,10 @@ Covers CRUD operations, start/stop/archive/delete lifecycle actions,
 flash workspace, reorder, and ownership guards.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -478,6 +479,365 @@ async def test_start_workspace_forbidden(client):
             f"/api/v1/workspaces/{ws['workspace_id']}/start"
         )
 
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_start_workspace_lazy_returns_202_and_schedules(client):
+    """lazy=true returns 202 with status='starting' and schedules a background task."""
+    ws = _ws(status="stopped")
+
+    # Use a long-running coroutine so we can verify the endpoint did NOT await it.
+    started_event = asyncio.Event()
+    finish_event = asyncio.Event()
+
+    async def slow_get_session(*args, **kwargs):
+        started_event.set()
+        await finish_event.wait()
+
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        mock_manager = AsyncMock()
+        mock_manager.get_session_for_workspace = AsyncMock(side_effect=slow_get_session)
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/start?lazy=true"
+        )
+
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["status"] == "starting"
+        assert body["workspace_id"] == ws["workspace_id"]
+
+        # The background task should have started but not finished. Wait on the
+        # event directly rather than a single scheduler tick (asyncio.sleep(0)),
+        # which can flake under load if the task needs more than one tick to
+        # reach started_event.set().
+        await asyncio.wait_for(started_event.wait(), timeout=0.5)
+
+        # Let the task complete so it doesn't leak into other tests.
+        finish_event.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_start_workspace_lazy_already_running_short_circuits(client):
+    """lazy=true on a running workspace returns 200 without scheduling."""
+    ws = _ws(status="running")
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        mock_manager = AsyncMock()
+        mock_manager.get_session_for_workspace = AsyncMock()
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/start?lazy=true"
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "running"
+    mock_manager.get_session_for_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_workspace_lazy_already_starting_short_circuits(client):
+    """lazy=true on a starting workspace returns 200 without scheduling."""
+    ws = _ws(status="starting")
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        mock_manager = AsyncMock()
+        mock_manager.get_session_for_workspace = AsyncMock()
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/start?lazy=true"
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "starting"
+    mock_manager.get_session_for_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_workspace_lazy_invalid_state_rejects(client):
+    """lazy=true on a non-startable status returns 400."""
+    ws = _ws(status="creating")
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        MockWM.get_instance.return_value = AsyncMock()
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/start?lazy=true"
+        )
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_drain_warm_tasks_cancels_in_flight():
+    """drain_warm_tasks cancels and awaits every tracked warm task so a task
+    cancelled mid-Phase-2 can revert its row instead of being torn down."""
+    from src.server.app import workspaces as ws_mod
+
+    started = asyncio.Event()
+
+    async def never_finishes():
+        started.set()
+        await asyncio.Event().wait()  # blocks forever until cancelled
+
+    task = asyncio.create_task(never_finishes())
+    ws_mod._warm_tasks.add(task)
+    task.add_done_callback(ws_mod._warm_tasks.discard)
+    await started.wait()
+
+    await ws_mod.drain_warm_tasks()
+
+    assert task.cancelled()
+    assert not ws_mod._warm_tasks
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/workspaces/{workspace_id}/events — SSE status stream
+# ---------------------------------------------------------------------------
+
+
+def _parse_sse(buffer: str):
+    """Yield (event_name, data) tuples from an SSE wire buffer."""
+    for chunk in buffer.split("\n\n"):
+        if not chunk.strip():
+            continue
+        event_name = ""
+        data = ""
+        for line in chunk.split("\n"):
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                data += line[5:].strip()
+        yield event_name, data
+
+
+async def _collect_sse_events(client, url, *, want_events: int, timeout: float = 2.0):
+    """Open an SSE stream and collect up to `want_events` events, then close."""
+    import json as _json
+
+    events: list[tuple[str, dict]] = []
+    async with client.stream("GET", url) as resp:
+        assert resp.status_code == 200
+        buffer = ""
+
+        async def _read_loop():
+            nonlocal buffer
+            async for chunk in resp.aiter_text():
+                buffer += chunk
+                while "\n\n" in buffer:
+                    raw, _, buffer = buffer.partition("\n\n")
+                    for name, data in _parse_sse(raw + "\n\n"):
+                        if name == "status" and data:
+                            try:
+                                events.append((name, _json.loads(data)))
+                            except Exception as exc:
+                                # Fail fast — a malformed payload is a real
+                                # serialization regression, not something to mask.
+                                raise AssertionError(
+                                    f"Invalid SSE JSON payload for 'status': {data!r}"
+                                ) from exc
+                        elif name == "timeout":
+                            events.append((name, {}))
+                    if len(events) >= want_events:
+                        return
+
+        try:
+            await asyncio.wait_for(_read_loop(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+    return events
+
+
+@pytest.mark.asyncio
+async def test_workspace_events_emits_initial_status_then_pubsub_transition(client):
+    """SSE endpoint sends current status immediately, then each pub/sub transition."""
+    from contextlib import asynccontextmanager
+
+    ws = _ws(status="starting")
+    ws_running = {**ws, "status": "running"}
+    # 1st DB read (initial event), 2nd DB read (post-subscribe), 3rd DB read after notify
+    db_seq = iter([ws, ws, ws_running])
+
+    async def fake_db(workspace_id, conn=None):
+        try:
+            return next(db_seq)
+        except StopIteration:
+            return ws_running
+
+    @asynccontextmanager
+    async def fake_subscribe(workspace_id):
+        sent = False
+
+        async def wait(timeout):
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"workspace_id": workspace_id, "status": "running"}
+            return None
+
+        yield wait
+
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new=AsyncMock(side_effect=fake_db),
+        ),
+        patch(
+            "src.server.app.workspaces.subscribe_to_status",
+            new=fake_subscribe,
+        ),
+    ):
+        events = await _collect_sse_events(
+            client,
+            f"/api/v1/workspaces/{ws['workspace_id']}/events",
+            want_events=2,
+            timeout=2.0,
+        )
+
+    statuses = [e[1].get("status") for e in events if e[0] == "status"]
+    assert "starting" in statuses
+    assert "running" in statuses
+    # Running is terminal — stream closes immediately after, no further events.
+
+
+@pytest.mark.asyncio
+async def test_workspace_events_forwards_archived_sandbox_state(client):
+    """A pub/sub hint carrying sandbox_state='archived' during the 'starting'
+    phase is forwarded as a refinement event (no DB re-read, stream stays open)
+    so the FE can escalate to the slow-restore spinner even when a background
+    warm — not this client — owns the start."""
+    from contextlib import asynccontextmanager
+
+    ws = _ws(status="starting")
+    ws_running = {**ws, "status": "running"}
+    # initial read, post-subscribe read; the archived refinement does NOT
+    # re-read; the running transition re-reads.
+    db_seq = iter([ws, ws, ws_running])
+
+    async def fake_db(workspace_id, conn=None):
+        try:
+            return next(db_seq)
+        except StopIteration:
+            return ws_running
+
+    @asynccontextmanager
+    async def fake_subscribe(workspace_id):
+        msgs = iter(
+            [
+                {"workspace_id": workspace_id, "status": "starting",
+                 "sandbox_state": "archived"},
+                {"workspace_id": workspace_id, "status": "running"},
+            ]
+        )
+
+        async def wait(timeout):
+            return next(msgs, None)
+
+        yield wait
+
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new=AsyncMock(side_effect=fake_db),
+        ),
+        patch(
+            "src.server.app.workspaces.subscribe_to_status",
+            new=fake_subscribe,
+        ),
+    ):
+        events = await _collect_sse_events(
+            client,
+            f"/api/v1/workspaces/{ws['workspace_id']}/events",
+            want_events=3,
+            timeout=2.0,
+        )
+
+    status_events = [e[1] for e in events if e[0] == "status"]
+    # The archived refinement carries status 'starting' + sandbox_state.
+    assert any(
+        e.get("status") == "starting" and e.get("sandbox_state") == "archived"
+        for e in status_events
+    )
+    assert any(e.get("status") == "running" for e in status_events)
+
+
+@pytest.mark.asyncio
+async def test_workspace_events_terminates_on_initial_running(client):
+    """If the workspace is already running, the stream emits one event then closes."""
+    from contextlib import asynccontextmanager
+
+    ws = _ws(status="running")
+
+    @asynccontextmanager
+    async def fake_subscribe(workspace_id):
+        async def wait(timeout):
+            return None
+
+        yield wait
+
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new=AsyncMock(return_value=ws),
+        ),
+        patch(
+            "src.server.app.workspaces.subscribe_to_status",
+            new=fake_subscribe,
+        ),
+    ):
+        events = await _collect_sse_events(
+            client,
+            f"/api/v1/workspaces/{ws['workspace_id']}/events",
+            want_events=1,
+            timeout=1.0,
+        )
+
+    assert events[0][0] == "status"
+    assert events[0][1].get("status") == "running"
+
+
+@pytest.mark.asyncio
+async def test_workspace_events_forbidden(client):
+    """SSE endpoint enforces ownership."""
+    ws = _ws(user_id="other-user", status="stopped")
+    with patch(
+        "src.server.app.workspaces.db_get_workspace",
+        new_callable=AsyncMock,
+        return_value=ws,
+    ):
+        resp = await client.get(
+            f"/api/v1/workspaces/{ws['workspace_id']}/events"
+        )
     assert resp.status_code == 403
 
 

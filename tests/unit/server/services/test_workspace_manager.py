@@ -398,6 +398,136 @@ class TestCleanupIdle:
         mock_stop.assert_not_awaited()
 
 
+class TestReapStuckStarting:
+    """reap_stuck_starting_workspaces reverts rows wedged in 'starting' past the
+    reap_stuck_after window, but never reaps a start THIS worker is still running
+    (it holds _pending_lazy_sync membership) and leaves fresh rows alone."""
+
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+
+    def teardown_method(self):
+        WorkspaceManager.reset_instance()
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.update_workspace_status",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "src.server.services.workspace_manager.get_workspaces_by_status",
+        new_callable=AsyncMock,
+    )
+    async def test_reaps_stale_starting_row(self, mock_get_by_status, mock_status):
+        """A row wedged past the threshold with NO local membership is the
+        cross-process case (a crashed/recycled worker left it 'starting'): no
+        in-process owner will ever recover it, so the reaper reverts it."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        ws_id = str(uuid.uuid4())
+        stale = _make_workspace(
+            workspace_id=ws_id,
+            status="starting",
+            updated_at=datetime.now(timezone.utc)
+            - timedelta(seconds=manager.reap_stuck_after + 1),
+        )
+        mock_get_by_status.return_value = [stale]
+        # No _pending_lazy_sync membership — no owner on this worker.
+
+        reverted = await manager.reap_stuck_starting_workspaces()
+
+        assert reverted == 1
+        mock_status.assert_awaited_once_with(workspace_id=ws_id, status="stopped")
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.update_workspace_status",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "src.server.services.workspace_manager.get_workspaces_by_status",
+        new_callable=AsyncMock,
+    )
+    async def test_leaves_in_flight_lazy_owner_past_threshold(
+        self, mock_get_by_status, mock_status
+    ):
+        """Even PAST the threshold, a row this worker is still starting (it holds
+        _pending_lazy_sync) must NOT be reaped — the owner will promote on success
+        or revert on failure. Reaping would discard the membership and no-op the
+        owner's promotion, stranding a ready session behind a 'stopped' row. This
+        guards the slow-archived-restore race independently of the threshold."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        ws_id = str(uuid.uuid4())
+        owned = _make_workspace(
+            workspace_id=ws_id,
+            status="starting",
+            updated_at=datetime.now(timezone.utc)
+            - timedelta(seconds=manager.reap_stuck_after + 1),
+        )
+        mock_get_by_status.return_value = [owned]
+        manager._pending_lazy_sync.add(ws_id)
+
+        reverted = await manager.reap_stuck_starting_workspaces()
+
+        assert reverted == 0
+        mock_status.assert_not_awaited()
+        # Membership preserved so the owner's later promotion still fires.
+        assert ws_id in manager._pending_lazy_sync
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.update_workspace_status",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "src.server.services.workspace_manager.get_workspaces_by_status",
+        new_callable=AsyncMock,
+    )
+    async def test_leaves_fresh_starting_row(self, mock_get_by_status, mock_status):
+        """A start still within the wait window must NOT be reaped — that would
+        yank a legitimately in-flight cold restore out from under its owner."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        fresh = _make_workspace(
+            status="starting",
+            updated_at=datetime.now(timezone.utc) - timedelta(seconds=10),
+        )
+        mock_get_by_status.return_value = [fresh]
+
+        reverted = await manager.reap_stuck_starting_workspaces()
+
+        assert reverted == 0
+        mock_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.update_workspace_status",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "src.server.services.workspace_manager.get_workspaces_by_status",
+        new_callable=AsyncMock,
+    )
+    async def test_leaves_slow_but_legit_restore(self, mock_get_by_status, mock_status):
+        """A row older than start_wait_timeout but younger than reap_stuck_after
+        is below the reap threshold and must NOT be reaped — even with no local
+        membership (e.g. a cross-process start that is slow but not yet wedged).
+        This isolates the threshold boundary from the in-process owner guard."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        ws_id = str(uuid.uuid4())
+        # Halfway between the two thresholds (e.g. ~450s with defaults).
+        age = (manager.start_wait_timeout + manager.reap_stuck_after) / 2
+        slow = _make_workspace(
+            workspace_id=ws_id,
+            status="starting",
+            updated_at=datetime.now(timezone.utc) - timedelta(seconds=age),
+        )
+        mock_get_by_status.return_value = [slow]
+
+        reverted = await manager.reap_stuck_starting_workspaces()
+
+        assert reverted == 0
+        mock_status.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # shutdown
 # ---------------------------------------------------------------------------
@@ -867,8 +997,9 @@ class TestSandboxRecovery:
     @patch("src.server.services.workspace_manager.SessionManager")
     @patch("src.server.services.workspace_manager.update_workspace_status")
     @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
     async def test_stopped_workspace_lazy_init_sandbox_gone_recovers(
-        self, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
     ):
         """REGRESSION: First request to a stopped workspace whose sandbox is deleted.
 
@@ -882,6 +1013,8 @@ class TestSandboxRecovery:
         ws_id = str(uuid.uuid4())
         workspace = _make_workspace(workspace_id=ws_id, status="stopped")
         mock_get_ws.return_value = workspace
+        # Cross-worker claim succeeds — this worker wins the start mutex.
+        mock_claim.return_value = workspace
 
         # _restart_workspace returns a session whose sandbox will fail in Phase 2
         lazy_session = _make_mock_session()
@@ -1023,8 +1156,9 @@ class TestOnStateObservedForwarding:
     @patch("src.server.services.workspace_manager.SessionManager")
     @patch("src.server.services.workspace_manager.update_workspace_activity")
     @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
     async def test_stopped_path_forwards_callback_to_initialize_lazy(
-        self, mock_status, mock_activity, mock_session_mgr, mock_get_ws
+        self, mock_claim, mock_status, mock_activity, mock_session_mgr, mock_get_ws
     ):
         """status=stopped + matching config hash → _restart_workspace keeps
         lazy_init=True → session.initialize_lazy(..., on_state_observed=sentinel)."""
@@ -1038,24 +1172,30 @@ class TestOnStateObservedForwarding:
             config={"sandbox_config_hash": "matching-hash"},
         )
         mock_get_ws.return_value = workspace
+        mock_claim.return_value = workspace
         session = _make_mock_session(initialized=False)
         # Simulate lazy init leaving sandbox ready so Phase 2 doesn't retry.
         session.sandbox.is_ready = MagicMock(return_value=True)
         session.sandbox.has_failed = MagicMock(return_value=False)
         mock_session_mgr.get_session.return_value = session
 
-        def sentinel(_s: str) -> None:
-            return None
+        observed: list[str] = []
+
+        def sentinel(s: str) -> None:
+            observed.append(s)
 
         await manager.get_session_for_workspace(
             ws_id, user_id="user-1", on_state_observed=sentinel
         )
 
         session.initialize_lazy.assert_awaited_once()
-        assert (
-            session.initialize_lazy.await_args.kwargs.get("on_state_observed")
-            is sentinel
-        )
+        forwarded = session.initialize_lazy.await_args.kwargs.get("on_state_observed")
+        # The stopped (claim-owner) path wraps the caller's callback so it can
+        # also broadcast the archived hint cross-worker — the wrapper must still
+        # invoke the original observer.
+        assert forwarded is not None
+        forwarded("stopped")
+        assert observed == ["stopped"]
         # Lazy path must not have touched the eager initialize.
         session.initialize.assert_not_awaited()
 
@@ -1064,8 +1204,9 @@ class TestOnStateObservedForwarding:
     @patch("src.server.services.workspace_manager.SessionManager")
     @patch("src.server.services.workspace_manager.update_workspace_activity")
     @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
     async def test_restart_forced_non_lazy_forwards_callback_to_initialize(
-        self, mock_status, mock_activity, mock_session_mgr, mock_get_ws
+        self, mock_claim, mock_status, mock_activity, mock_session_mgr, mock_get_ws
     ):
         """Config hash mismatch inside _restart_workspace forces lazy_init=False
         → session.initialize(..., on_state_observed=sentinel) instead of initialize_lazy."""
@@ -1078,20 +1219,28 @@ class TestOnStateObservedForwarding:
             config={"sandbox_config_hash": "old-hash"},
         )
         mock_get_ws.return_value = workspace
+        mock_claim.return_value = workspace
         session = _make_mock_session(initialized=False)
         session.sandbox.is_ready = MagicMock(return_value=True)
         session.sandbox.has_failed = MagicMock(return_value=False)
         mock_session_mgr.get_session.return_value = session
 
-        def sentinel(_s: str) -> None:
-            return None
+        observed: list[str] = []
+
+        def sentinel(s: str) -> None:
+            observed.append(s)
 
         await manager.get_session_for_workspace(
             ws_id, user_id="user-1", on_state_observed=sentinel
         )
 
         session.initialize.assert_awaited_once()
-        assert session.initialize.await_args.kwargs.get("on_state_observed") is sentinel
+        forwarded = session.initialize.await_args.kwargs.get("on_state_observed")
+        # Claim-owner path wraps the caller's callback; the wrapper must still
+        # invoke the original observer even on the forced non-lazy branch.
+        assert forwarded is not None
+        forwarded("stopped")
+        assert observed == ["stopped"]
         session.initialize_lazy.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1131,9 +1280,11 @@ from ptc_agent.core.sandbox.runtime import SandboxTransientError  # noqa: E402
 
 
 class TestPhase2ErrorNarrowing:
-    """Phase 2 now distinguishes a failed lazy init (has_failed() == True,
-    clear + re-raise) from a post-init transient (has_failed() == False,
-    swallow + retry next request). Generic Exception keeps the legacy
+    """Phase 2 distinguishes a failed lazy init (has_failed() == True,
+    clear + re-raise) from a post-init transient (has_failed() == False).
+    For an UNPROMOTED lazy start, a post-init transient reverts the row to
+    'stopped' and re-raises so the caller can't return a sandbox behind a
+    'stopped' row (split-brain). Generic Exception keeps the legacy
     best-effort-retry behavior — regression-guarded here."""
 
     def setup_method(self):
@@ -1181,12 +1332,15 @@ class TestPhase2ErrorNarrowing:
     @patch("src.server.services.workspace_manager.SessionManager")
     @patch("src.server.services.workspace_manager.update_workspace_status")
     @patch("src.server.services.workspace_manager.update_workspace_activity")
-    async def test_phase2_transient_post_init_swallowed(
+    async def test_phase2_transient_post_init_lazy_reverts_and_raises(
         self, mock_activity, mock_status, mock_session_mgr, mock_get_ws
     ):
-        """SandboxTransientError after sandbox is ready (e.g., asset sync)
-        leaves the healthy session in cache and is best-effort retried next
-        request. has_failed() == False is the discriminator."""
+        """A post-init transient (e.g. asset sync) on an UNPROMOTED lazy start
+        reverts the row to 'stopped' and re-raises. has_failed() == False, so
+        the sandbox is healthy — but returning the session here would hand back
+        a sandbox the DB says is 'stopped', letting another worker spawn a
+        second one (split-brain). The discriminator is _pending_lazy_sync
+        membership; the deferred-sync asset step is reached only on that path."""
         manager = self._make_manager()
         ws_id = str(uuid.uuid4())
         mock_get_ws.return_value = _make_workspace(
@@ -1202,16 +1356,21 @@ class TestPhase2ErrorNarrowing:
             side_effect=SandboxTransientError("sync blip")
         )
         manager._maybe_restore_files = AsyncMock()
-        manager._pending_lazy_sync.add(ws_id)  # force deferred-sync branch
+        manager._pending_lazy_sync.add(ws_id)  # unpromoted lazy start
         manager._sessions[ws_id] = session
         manager._last_sync_at = {}
         mock_session_mgr.cleanup_session = AsyncMock()
 
-        result = await manager.get_session_for_workspace(ws_id, user_id="user-1")
+        with pytest.raises(SandboxTransientError):
+            await manager.get_session_for_workspace(ws_id, user_id="user-1")
 
-        assert result is session  # still cached, no clear
+        # Row reverted so cross-worker losers re-claim immediately instead of
+        # the caller returning a sandbox behind a 'stopped' row.
+        mock_status.assert_any_await(workspace_id=ws_id, status="stopped")
+        assert ws_id not in manager._pending_lazy_sync
+        # has_failed() was False — the healthy session is left cached (not
+        # cleared); the next request re-claims against the reverted row.
         mock_session_mgr.cleanup_session.assert_not_awaited()
-        assert ws_id in manager._sessions
 
     @pytest.mark.asyncio
     @patch("src.server.services.workspace_manager.db_get_workspace")
@@ -1369,15 +1528,18 @@ class TestIntermediateStartingStatus:
     @patch("src.server.services.workspace_manager.SessionManager")
     @patch("src.server.services.workspace_manager.update_workspace_status")
     @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
     async def test_phase2_success_promotes_starting_to_running_and_stamps(
-        self, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
     ):
         """When Phase 2 finishes the deferred sync, DB is promoted to
         running AND activity is stamped in that order (mirrors PR #152's
         invariant for the lazy path)."""
         manager = self._make_manager()
         ws_id = str(uuid.uuid4())
-        mock_get_ws.return_value = self._lazy_workspace(ws_id, status="stopped")
+        workspace = self._lazy_workspace(ws_id, status="stopped")
+        mock_get_ws.return_value = workspace
+        mock_claim.return_value = workspace
 
         lazy_session = _make_mock_session()
         lazy_session.sandbox.ensure_sandbox_ready = AsyncMock()
@@ -1410,14 +1572,19 @@ class TestIntermediateStartingStatus:
     @patch("src.server.services.workspace_manager.SessionManager")
     @patch("src.server.services.workspace_manager.update_workspace_status")
     @patch("src.server.services.workspace_manager.update_workspace_activity")
-    async def test_phase2_failure_leaves_status_at_starting(
-        self, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
+    async def test_phase2_failure_reverts_status_to_stopped(
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
     ):
-        """Phase 2 exhausts retries → status stays "starting" (never flipped
-        to running), next request re-enters the stopped/starting branch."""
+        """Claim winner fails in Phase 2 → row is reverted "starting" → "stopped"
+        (never promoted to running), so cross-worker losers can re-claim
+        immediately instead of waiting out the full start_wait_timeout. The
+        original exception still propagates."""
         manager = self._make_manager()
         ws_id = str(uuid.uuid4())
-        mock_get_ws.return_value = self._lazy_workspace(ws_id, status="stopped")
+        workspace = self._lazy_workspace(ws_id, status="stopped")
+        mock_get_ws.return_value = workspace
+        mock_claim.return_value = workspace
 
         lazy_session = _make_mock_session()
         lazy_session.sandbox.ensure_sandbox_ready = AsyncMock(
@@ -1430,33 +1597,176 @@ class TestIntermediateStartingStatus:
         with pytest.raises(SandboxTransientError):
             await manager.get_session_for_workspace(ws_id, user_id="user-1")
 
-        status_calls = [
-            c.kwargs for c in mock_status.await_args_list
-        ]
-        assert {c["status"] for c in status_calls} == {"starting"}
+        status_calls = [c.kwargs for c in mock_status.await_args_list]
+        # 'starting' from the claim/restart, then 'stopped' from the Phase 2
+        # failure revert — and crucially never 'running'.
+        assert {c["status"] for c in status_calls} == {"starting", "stopped"}
+        assert status_calls[-1]["status"] == "stopped"
+        # Pending-sync marker cleared so the workspace isn't wedged.
+        assert ws_id not in manager._pending_lazy_sync
 
     @pytest.mark.asyncio
     @patch("src.server.services.workspace_manager.db_get_workspace")
     @patch("src.server.services.workspace_manager.SessionManager")
     @patch("src.server.services.workspace_manager.update_workspace_status")
     @patch("src.server.services.workspace_manager.update_workspace_activity")
-    async def test_status_starting_reenters_restart_flow(
-        self, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
+    async def test_phase2_generic_failure_reverts_status_to_stopped(
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
     ):
-        """If a prior lazy init left the row in "starting" (e.g. failed and
-        cleared), the next request with no cached session re-enters the
-        restart flow just like "stopped" would."""
+        """A generic Phase 2 failure on an unpromoted lazy start is the most
+        dangerous path: it must revert the row to 'stopped' so losers re-claim
+        immediately, AND re-raise rather than return the session — returning it
+        would hand the agent a sandbox that never finished asset/file sync while
+        the DB says 'stopped'."""
         manager = self._make_manager()
         ws_id = str(uuid.uuid4())
-        mock_get_ws.return_value = self._lazy_workspace(ws_id, status="starting")
+        workspace = self._lazy_workspace(ws_id, status="stopped")
+        mock_get_ws.return_value = workspace
+        mock_claim.return_value = workspace
 
         lazy_session = _make_mock_session()
-        lazy_session.sandbox.ensure_sandbox_ready = AsyncMock()
+        lazy_session.sandbox.ensure_sandbox_ready = AsyncMock(
+            side_effect=RuntimeError("daytona hiccup")
+        )
         mock_session_mgr.get_session.return_value = lazy_session
+
+        # Unpromoted lazy start: the failure is surfaced, not swallowed.
+        with pytest.raises(RuntimeError, match="daytona hiccup"):
+            await manager.get_session_for_workspace(ws_id, user_id="user-1")
+
+        status_calls = [c.kwargs for c in mock_status.await_args_list]
+        assert {c["status"] for c in status_calls} == {"starting", "stopped"}
+        assert status_calls[-1]["status"] == "stopped"
+        assert ws_id not in manager._pending_lazy_sync
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch(
+        "src.server.services.workspace_manager.try_claim_workspace_for_start",
+        new_callable=AsyncMock,
+    )
+    async def test_phase2_cancelled_reverts_status_to_stopped(
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    ):
+        """A client disconnect / shutdown cancels Phase 2. CancelledError is a
+        BaseException, so without an explicit handler it would bypass every
+        revert and wedge the row in 'starting' forever. It must revert to
+        'stopped' AND re-raise to preserve cancellation semantics."""
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        workspace = self._lazy_workspace(ws_id, status="stopped")
+        mock_get_ws.return_value = workspace
+        mock_claim.return_value = workspace
+
+        lazy_session = _make_mock_session()
+        lazy_session.sandbox.ensure_sandbox_ready = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+        mock_session_mgr.get_session.return_value = lazy_session
+
+        with pytest.raises(asyncio.CancelledError):
+            await manager.get_session_for_workspace(ws_id, user_id="user-1")
+
+        status_calls = [c.kwargs for c in mock_status.await_args_list]
+        assert status_calls[-1]["status"] == "stopped"
+        assert ws_id not in manager._pending_lazy_sync
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.publish_status_change",
+        new_callable=AsyncMock,
+    )
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch(
+        "src.server.services.workspace_manager.try_claim_workspace_for_start",
+        new_callable=AsyncMock,
+    )
+    async def test_claim_owner_broadcasts_archived_state(
+        self,
+        mock_claim,
+        mock_activity,
+        mock_status,
+        mock_session_mgr,
+        mock_get_ws,
+        mock_publish,
+    ):
+        """When the pre-start sandbox state is 'archived', the claim owner
+        publishes it on the status channel so cross-worker consumers (the
+        /events SSE, a losing worker's chat spinner) can show the slow-restore
+        copy regardless of who owns the start."""
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        workspace = self._lazy_workspace(ws_id, status="stopped")
+        mock_get_ws.return_value = workspace
+        mock_claim.return_value = workspace
+
+        session = _make_mock_session(initialized=False)
+        session.sandbox.is_ready = MagicMock(return_value=True)
+        session.sandbox.has_failed = MagicMock(return_value=False)
+
+        async def fake_init_lazy(*args, on_state_observed=None, **kwargs):
+            if on_state_observed is not None:
+                on_state_observed("archived")
+
+        session.initialize_lazy = AsyncMock(side_effect=fake_init_lazy)
+        mock_session_mgr.get_session.return_value = session
 
         await manager.get_session_for_workspace(ws_id, user_id="user-1")
 
-        lazy_session.initialize_lazy.assert_awaited_once()
+        archived = [
+            c
+            for c in mock_publish.call_args_list
+            if (c.kwargs.get("extra") or {}).get("sandbox_state") == "archived"
+        ]
+        assert archived, "claim owner did not broadcast archived sandbox_state"
+        assert archived[0].args[1] == "starting"
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    async def test_status_starting_waits_for_other_worker_to_finish(
+        self, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    ):
+        """Cross-worker safety: a request landing on a workspace already in
+        'starting' MUST NOT restart (would double-start the sandbox in another
+        worker). It waits for the in-flight start to flip status to 'running',
+        then attaches to that session via the running path.
+
+        Replaces the prior "re-enter restart flow" behavior, which was unsafe
+        under multi-worker deployments — see ``try_claim_workspace_for_start``
+        and ``_wait_for_start_completion``.
+        """
+        manager = self._make_manager()
+        # Tighten polling so the test does not depend on default 300s/0.5s.
+        manager.start_wait_timeout = 5.0
+        manager.start_wait_poll_interval = 0.01
+        ws_id = str(uuid.uuid4())
+        starting_ws = self._lazy_workspace(ws_id, status="starting")
+        running_ws = self._lazy_workspace(ws_id, status="running")
+        # First read sees 'starting'; first poll-iteration read inside
+        # _wait_for_start_completion sees 'running' (other worker finished).
+        mock_get_ws.side_effect = [starting_ws, running_ws]
+
+        session = _make_mock_session(initialized=True)
+        session.sandbox.is_ready = MagicMock(return_value=True)
+        session.sandbox.has_failed = MagicMock(return_value=False)
+        mock_session_mgr.get_session.return_value = session
+
+        result = await manager.get_session_for_workspace(ws_id, user_id="user-1")
+
+        # Did NOT call initialize_lazy — we did not restart.
+        session.initialize_lazy.assert_not_awaited()
+        # Returned a usable session attached via the running path.
+        assert result is session
 
 
 # ---------------------------------------------------------------------------
@@ -1489,3 +1799,236 @@ class TestStatusRoutesToDbFallback:
         source = inspect.getsource(public)
         assert f'"{status}"' in source
         assert '"stopped", "stopping", "starting"' in source
+
+
+# ---------------------------------------------------------------------------
+# Multi-worker start mutex — cross-process race protection
+# ---------------------------------------------------------------------------
+
+
+class TestMultiWorkerStartMutex:
+    """``try_claim_workspace_for_start`` atomically flips status='stopped' →
+    'starting'; only the winner restarts. Losers wait via
+    ``_wait_for_start_completion`` and attach via the running path. These
+    tests cover that contract."""
+
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+
+    def teardown_method(self):
+        WorkspaceManager.reset_instance()
+
+    def _make_manager(self):
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        manager.start_wait_timeout = 5.0
+        manager.start_wait_poll_interval = 0.01
+        manager._sync_sandbox_assets = AsyncMock()
+        manager._maybe_restore_files = AsyncMock()
+        manager._maybe_migrate_sandbox = AsyncMock(return_value=None)
+        return manager
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
+    async def test_winner_proceeds_with_restart(
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    ):
+        """Worker that wins the claim restarts the sandbox normally."""
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        # Provide a matching config hash so _restart_workspace keeps lazy_init=True.
+        manager._compute_sandbox_config_hash = MagicMock(return_value="match")
+        workspace = _make_workspace(
+            workspace_id=ws_id,
+            status="stopped",
+            config={"sandbox_config_hash": "match"},
+        )
+        mock_get_ws.return_value = workspace
+        # Claim succeeds — we own the start.
+        mock_claim.return_value = workspace
+
+        session = _make_mock_session()
+        session.sandbox.ensure_sandbox_ready = AsyncMock()
+        mock_session_mgr.get_session.return_value = session
+
+        await manager.get_session_for_workspace(ws_id, user_id="user-1")
+
+        mock_claim.assert_awaited_once_with(ws_id)
+        session.initialize_lazy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
+    async def test_loser_waits_then_attaches_via_running_path(
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    ):
+        """Worker that loses the claim does NOT restart — it waits for the
+        winner to finish, then attaches to the now-running session."""
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        stopped_ws = _make_workspace(workspace_id=ws_id, status="stopped")
+        running_ws = _make_workspace(workspace_id=ws_id, status="running")
+        # Phase 1 DB read sees 'stopped'; subsequent poll inside the wait
+        # sees 'running' (winner finished).
+        mock_get_ws.side_effect = [stopped_ws, running_ws]
+        # Claim returns None — another worker already claimed.
+        mock_claim.return_value = None
+
+        session = _make_mock_session(initialized=True)
+        session.sandbox.is_ready = MagicMock(return_value=True)
+        session.sandbox.has_failed = MagicMock(return_value=False)
+        mock_session_mgr.get_session.return_value = session
+
+        result = await manager.get_session_for_workspace(ws_id, user_id="user-1")
+
+        mock_claim.assert_awaited_once_with(ws_id)
+        # Critical: did not restart — no double-start across workers.
+        session.initialize_lazy.assert_not_awaited()
+        assert result is session
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch("src.server.services.workspace_manager.try_claim_workspace_for_start", new_callable=AsyncMock)
+    async def test_loser_raises_when_winner_errors(
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    ):
+        """If the winning worker's start fails (status → 'error'), waiting
+        losers surface a RuntimeError rather than hanging or silent success."""
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        stopped_ws = _make_workspace(workspace_id=ws_id, status="stopped")
+        error_ws = _make_workspace(workspace_id=ws_id, status="error")
+        mock_get_ws.side_effect = [stopped_ws, error_ws]
+        mock_claim.return_value = None
+
+        with pytest.raises(RuntimeError, match="failed to start"):
+            await manager.get_session_for_workspace(ws_id, user_id="user-1")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_wait_helper_times_out_when_stuck(self, mock_get_ws):
+        """If status sits in 'starting' past the timeout (winner died mid-
+        start), the wait helper raises rather than waiting forever."""
+        manager = self._make_manager()
+        manager.start_wait_timeout = 0.1
+        manager.start_wait_poll_interval = 0.02
+        ws_id = str(uuid.uuid4())
+        starting_ws = _make_workspace(workspace_id=ws_id, status="starting")
+        mock_get_ws.return_value = starting_ws
+
+        with pytest.raises(RuntimeError, match="stuck in 'starting'"):
+            await manager._wait_for_start_completion(ws_id)
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_wait_helper_raises_on_deletion(self, mock_get_ws):
+        """Workspace deleted while waiting → ValueError (caller must not
+        keep polling a row that no longer exists)."""
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            await manager._wait_for_start_completion(ws_id)
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch(
+        "src.server.services.workspace_manager.try_claim_workspace_for_start",
+        new_callable=AsyncMock,
+    )
+    async def test_start_wait_does_not_hold_workspace_lock(
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    ):
+        """Regression: the cross-worker start wait must run OUTSIDE the per-
+        workspace lock. Otherwise a 60-300s archived cold-start head-of-line
+        blocks every other op on that workspace (stop/delete/another get)
+        behind the 60s lock-acquire ceiling."""
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        starting_ws = _make_workspace(workspace_id=ws_id, status="starting")
+        running_ws = _make_workspace(workspace_id=ws_id, status="running")
+        mock_get_ws.side_effect = [starting_ws, running_ws]
+        mock_claim.return_value = None  # 'starting' arrival skips the claim
+
+        session = _make_mock_session(initialized=True)
+        session.sandbox.is_ready = MagicMock(return_value=True)
+        session.sandbox.has_failed = MagicMock(return_value=False)
+        mock_session_mgr.get_session.return_value = session
+
+        # Gate the wait so we can probe the lock while the caller is parked in it.
+        release = asyncio.Event()
+
+        async def _blocking_wait(workspace_id, *a, **k):
+            await release.wait()
+            return running_ws
+
+        manager._wait_for_start_completion = AsyncMock(side_effect=_blocking_wait)
+
+        waiter = asyncio.create_task(
+            manager.get_session_for_workspace(ws_id, user_id="user-1")
+        )
+        await asyncio.sleep(0.05)  # let the waiter reach the gated wait
+        assert not waiter.done()
+
+        # The per-workspace lock MUST be free while the waiter waits. Short
+        # timeout so a regression (wait-inside-lock) fails fast instead of
+        # hanging the full 60s lock-acquire ceiling.
+        async def _probe():
+            async with manager._observed_lock(ws_id, "probe"):
+                return True
+
+        assert await asyncio.wait_for(_probe(), timeout=2.0) is True
+
+        release.set()
+        result = await waiter
+        assert result is session
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch(
+        "src.server.services.workspace_manager.try_claim_workspace_for_start",
+        new_callable=AsyncMock,
+    )
+    async def test_loser_retries_once_when_owner_reverts_to_stopped(
+        self, mock_claim, mock_activity, mock_status, mock_session_mgr, mock_get_ws
+    ):
+        """If the winner fails and reverts 'starting'→'stopped', the waiting
+        loser retries the start once and becomes the owner (restart runs)."""
+        manager = self._make_manager()
+        manager._compute_sandbox_config_hash = MagicMock(return_value="match")
+        ws_id = str(uuid.uuid4())
+        stopped_ws = _make_workspace(
+            workspace_id=ws_id,
+            status="stopped",
+            config={"sandbox_config_hash": "match"},
+        )
+        mock_get_ws.return_value = stopped_ws  # both Phase 1 reads see 'stopped'
+        # First claim loses; the post-revert retry wins.
+        mock_claim.side_effect = [None, stopped_ws]
+        # Owner failed and reverted the row back to 'stopped'.
+        manager._wait_for_start_completion = AsyncMock(return_value=stopped_ws)
+
+        session = _make_mock_session()
+        session.sandbox.ensure_sandbox_ready = AsyncMock()
+        mock_session_mgr.get_session.return_value = session
+
+        await manager.get_session_for_workspace(ws_id, user_id="user-1")
+
+        assert mock_claim.await_count == 2
+        session.initialize_lazy.assert_awaited_once()
