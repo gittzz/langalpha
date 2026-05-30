@@ -575,6 +575,12 @@ export function useChatMessages(
   // Track all LLM models used in this thread (ordered, deduplicated)
   const [threadModels, setThreadModels] = useState<string[]>([]);
 
+  // Track the model used by the most recent query in this thread (overwritten,
+  // not deduplicated) so re-opening a history thread defaults to the last-used
+  // model rather than the first. Distinct from threadModels because dedup there
+  // makes its tail unreliable when a thread switches models back and forth.
+  const [lastThreadModel, setLastThreadModel] = useState<string | null>(null);
+
   // Track if streaming is in progress to prevent history loading during streaming
   const isStreamingRef = useRef(false);
 
@@ -683,6 +689,7 @@ export function useChatMessages(
       if (isThreadSwitch) {
         setMessages([]);
         setThreadModels([]);
+        setLastThreadModel(null);
         // Reset refs
         contentOrderCounterRef.current = 0;
         currentReasoningIdRef.current = null;
@@ -881,6 +888,8 @@ export function useChatMessages(
           if (event.metadata?.llm_model) {
             const llmModel = event.metadata.llm_model as string;
             setThreadModels(prev => prev.includes(llmModel) ? prev : [...prev, llmModel]);
+            // History replays chronologically, so the last write wins = most recent query's model.
+            setLastThreadModel(llmModel);
           }
           // Resolve pending plan_approval interrupt from content (empty = approved, non-empty = rejected).
           {
@@ -3915,6 +3924,7 @@ export function useChatMessages(
     // Track model used in this send
     if (model) {
       setThreadModels(prev => prev.includes(model) ? prev : [...prev, model]);
+      setLastThreadModel(model);
     }
 
     // Add user message after history messages
@@ -4688,6 +4698,7 @@ export function useChatMessages(
     messages,
     threadId,
     threadModels,
+    lastThreadModel,
     isLoading,
     hasActiveSubagents,
     workspaceStarting,

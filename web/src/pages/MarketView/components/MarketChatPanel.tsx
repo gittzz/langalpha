@@ -259,6 +259,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     messageError,
     threadId,
     threadModels,
+    lastThreadModel,
     handleSendMessage,
     getSubagentHistory,
   } = chat;
@@ -367,7 +368,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     setDialogPayload({ type: 'toolcall', toolCallProcess: proc as ToolCallProcessRecord });
   }, []);
 
-  const initialModel = useMemo(() => threadModels[threadModels.length - 1] ?? null, [threadModels]);
+  const initialModel = lastThreadModel ?? null;
 
   const showQuickQueries = messages.length === 0 && !isLoading && !isLoadingHistory;
 
