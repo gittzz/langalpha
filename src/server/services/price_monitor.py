@@ -31,6 +31,11 @@ _REFERENCE_REFRESH_INTERVAL = 300  # seconds — refresh reference prices
 _ONE_SHOT_DEDUP_TTL = 300  # seconds — must exceed _REFRESH_INTERVAL to avoid re-trigger races
 _MIN_TRADING_DAY_TTL = 300  # 5 min floor for trading-day TTL
 
+# Service-account identity for background service-to-service data calls.
+# Matches the principal the live-data WS stream already sends so both
+# transports authenticate the same way.
+_SERVICE_USER_ID = "langalpha-service"
+
 _ET = ZoneInfo("America/New_York")
 _MARKET_OPEN_HOUR = 9
 _MARKET_OPEN_MINUTE = 30
@@ -165,7 +170,9 @@ class ConditionEvaluator:
 
             # Fetch stock snapshots
             if stock_syms:
-                snaps = await provider.get_snapshots(stock_syms, asset_type="stocks")
+                snaps = await provider.get_snapshots(
+                    stock_syms, asset_type="stocks", user_id=_SERVICE_USER_ID
+                )
                 for snap in snaps:
                     sym = snap.get("symbol", "").upper()
                     if sym:
@@ -177,7 +184,9 @@ class ConditionEvaluator:
 
             # Fetch index snapshots (response uses display symbols)
             if index_syms:
-                snaps = await provider.get_snapshots(index_syms, asset_type="indices")
+                snaps = await provider.get_snapshots(
+                    index_syms, asset_type="indices", user_id=_SERVICE_USER_ID
+                )
                 for snap in snaps:
                     raw_sym = snap.get("symbol", "").upper()
                     bare = _from_display_symbol(raw_sym)
@@ -594,7 +603,9 @@ class PriceMonitorService:
         # Fetch stock snapshots
         if stock_syms:
             try:
-                snaps = await provider.get_snapshots(stock_syms, asset_type="stocks")
+                snaps = await provider.get_snapshots(
+                    stock_syms, asset_type="stocks", user_id=_SERVICE_USER_ID
+                )
                 for snap in snaps:
                     sym = snap.get("symbol", "").upper()
                     if sym:
@@ -605,7 +616,9 @@ class PriceMonitorService:
         # Fetch index snapshots (normalize display → bare)
         if index_syms:
             try:
-                snaps = await provider.get_snapshots(index_syms, asset_type="indices")
+                snaps = await provider.get_snapshots(
+                    index_syms, asset_type="indices", user_id=_SERVICE_USER_ID
+                )
                 for snap in snaps:
                     raw_sym = snap.get("symbol", "").upper()
                     bare = _from_display_symbol(raw_sym)

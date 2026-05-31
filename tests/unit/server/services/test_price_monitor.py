@@ -10,7 +10,9 @@ import pytest
 
 from src.server.models.automation import MarketType, PriceConditionType, PriceTriggerConfig, RetriggerMode
 from src.server.services.price_monitor import (
+    ConditionEvaluator,
     PriceMonitorService,
+    _SERVICE_USER_ID,
     _from_display_symbol,
     _from_ws_symbol,
     _seconds_until_next_market_open,
@@ -504,7 +506,9 @@ class TestPollSnapshots:
         ):
             await svc._poll_snapshots(poll_stock=True, poll_index=False)
 
-        mock_provider.get_snapshots.assert_called_once_with(["AAPL"], asset_type="stocks")
+        mock_provider.get_snapshots.assert_called_once_with(
+            ["AAPL"], asset_type="stocks", user_id="langalpha-service"
+        )
         mock_eval.assert_called_once_with(auto, 149.0)
 
     @pytest.mark.asyncio
@@ -526,7 +530,9 @@ class TestPollSnapshots:
         ):
             await svc._poll_snapshots(poll_stock=False, poll_index=True)
 
-        mock_provider.get_snapshots.assert_called_once_with(["SPX"], asset_type="indices")
+        mock_provider.get_snapshots.assert_called_once_with(
+            ["SPX"], asset_type="indices", user_id="langalpha-service"
+        )
         mock_eval.assert_called_once_with(auto, 5100.0)
 
     @pytest.mark.asyncio
@@ -549,6 +555,63 @@ class TestPollSnapshots:
             await svc._poll_snapshots(poll_stock=True, poll_index=False)
 
         mock_eval.assert_not_called()
+
+
+class TestSnapshotAuthAttribution:
+    """Regression: background REST snapshot calls must carry the service-account
+    X-User-Id. ginlix-data rejects service-token calls without a non-empty user_id
+    (401), which silently breaks reference prices and the poll fallback. See
+    shared_ws_manager.py for the matching WS-path principal.
+    """
+
+    def setup_method(self):
+        PriceMonitorService._instance = None
+        SharedWSConnectionManager._instances.clear()
+
+    def test_service_user_id_matches_ws_path(self):
+        """The REST principal must equal the WS principal so both attribute alike."""
+        assert _SERVICE_USER_ID == "langalpha-service"
+
+    @pytest.mark.asyncio
+    async def test_refresh_references_passes_service_user_id(self):
+        """ConditionEvaluator.refresh_references attributes both markets to the service account."""
+        evaluator = ConditionEvaluator()
+        mock_provider = AsyncMock()
+        mock_provider.get_snapshots = AsyncMock(return_value=[])
+
+        with patch("src.data_client.get_market_data_provider", AsyncMock(return_value=mock_provider)):
+            await evaluator.refresh_references(
+                ["AAPL", "SPX"],
+                symbol_markets={"AAPL": MarketType.STOCK, "SPX": MarketType.INDEX},
+            )
+
+        for call in mock_provider.get_snapshots.call_args_list:
+            assert call.kwargs["user_id"] == _SERVICE_USER_ID
+        asset_types = {c.kwargs["asset_type"] for c in mock_provider.get_snapshots.call_args_list}
+        assert asset_types == {"stocks", "indices"}
+
+    @pytest.mark.asyncio
+    async def test_poll_snapshots_passes_service_user_id(self):
+        """_poll_snapshots attributes both markets to the service account."""
+        svc = PriceMonitorService()
+        svc._symbol_automations = {
+            "AAPL": [_make_automation(symbol="AAPL", market="stock")],
+            "SPX": [_make_automation(symbol="SPX", market="index")],
+        }
+        svc._symbol_markets = {"AAPL": MarketType.STOCK, "SPX": MarketType.INDEX}
+
+        mock_provider = AsyncMock()
+        mock_provider.get_snapshots = AsyncMock(return_value=[])
+
+        with (
+            patch("src.data_client.get_market_data_provider", AsyncMock(return_value=mock_provider)),
+            patch.object(svc, "_evaluate_and_trigger", new_callable=AsyncMock),
+        ):
+            await svc._poll_snapshots(poll_stock=True, poll_index=True)
+
+        assert mock_provider.get_snapshots.call_count == 2
+        for call in mock_provider.get_snapshots.call_args_list:
+            assert call.kwargs["user_id"] == _SERVICE_USER_ID
 
 
 class TestSecondsUntilNextMarketOpen:
