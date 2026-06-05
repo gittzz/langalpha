@@ -43,10 +43,32 @@ Row 3: As of [Period] | All figures in [USD Millions/Billions] except per-share 
 
 **Why this matters:** Establishes context immediately. Anyone opening this file knows what they're looking at, when it was created, and how to interpret the numbers.
 
+**CRITICAL layout rule:** Write each header row **once in column A** and `merge_cells` across the full table width. **Never** loop over columns to copy the title into B, C, D, … — that produces the repeated-header bug visible in broken deliverables.
+
+```python
+from skills.xlsx.scripts.workbook_helpers import write_title_block, write_section_header
+
+TABLE_WIDTH = 12  # number of data columns (Company + metrics); adjust to your layout
+next_row = write_title_block(
+    ws,
+    title="AI SEMICONDUCTOR — COMPARABLES",
+    subtitle="NVIDIA (NVDA) · AMD · Broadcom · Marvell · QUALCOMM",
+    disclaimer="As of Q4 2025 | All figures in USD Millions except per-share and ratios",
+    merge_to_col=TABLE_WIDTH,
+)
+write_section_header(ws, text="SECTION A: OPERATING METRICS", row=next_row, merge_to_col=TABLE_WIDTH)
+# Column labels (Company | Revenue | …) go on the next row — one label per column, not repeated titles
+```
+
 ### Visual Convention Standards
 
 > For all Excel formatting, number formats, and color standards, follow the guidelines in `skills/xlsx/SKILL.md`.
-> After generating Excel, run recalculation: `python skills/xlsx/scripts/recalc.py model.xlsx 30`
+> **Mandatory post-build pipeline** (do not skip — skipping causes `[object Object]` in ratio/statistics cells):
+> ```bash
+> python skills/xlsx/scripts/recalc.py model.xlsx 30
+> python skills/xlsx/scripts/validate_workbook.py model.xlsx
+> ```
+> Fix any reported issues and rerun until both succeed.
 
 User-provided templates and explicit formatting preferences always override defaults.
 
@@ -370,7 +392,12 @@ This helps answer: "Is our target company trading rich or cheap vs. peers?"
 ### Excel Formatting Checklist
 
 > For all Excel formatting, number formats, and color standards, follow the guidelines in `skills/xlsx/SKILL.md`.
-> After generating Excel, run recalculation: `python skills/xlsx/scripts/recalc.py model.xlsx 30`
+> **Mandatory post-build pipeline** (do not skip — skipping causes `[object Object]` in ratio/statistics cells):
+> ```bash
+> python skills/xlsx/scripts/recalc.py model.xlsx 30
+> python skills/xlsx/scripts/validate_workbook.py model.xlsx
+> ```
+> Fix any reported issues and rerun until both succeed.
 
 - [ ] **One blank row for separation between company data and statistics rows**
 - [ ] **No separate "SECTOR STATISTICS" or "VALUATION STATISTICS" header rows**

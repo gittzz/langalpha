@@ -135,14 +135,19 @@ This applies to ALL calculations - totals, percentages, ratios, differences, etc
 
 1. **Choose tool**: pandas for data, openpyxl for formulas/formatting
 2. **Create/Load**: Create new workbook or load existing file
-3. **Modify**: Add/edit data, formulas, and formatting
+3. **Modify**: Add/edit data, formulas, and formatting — use `scripts/workbook_helpers.py` for titles and scalar coercion
 4. **Save**: Write to file
 5. **Recalculate formulas (MANDATORY IF USING FORMULAS)**: Use the scripts/recalc.py script
    ```bash
-   python scripts/recalc.py output.xlsx
+   python skills/xlsx/scripts/recalc.py output.xlsx 30
    ```
-6. **Verify and fix any errors**: 
-   - The script returns JSON with error details
+6. **Validate layout (MANDATORY before delivery)**:
+   ```bash
+   python skills/xlsx/scripts/validate_workbook.py output.xlsx
+   ```
+   Fix any `repeated_row_text` or `uncached_formulas` issues and rerun steps 4–6.
+7. **Verify formula errors**:
+   - `recalc.py` returns JSON with error details
    - If `status` is `errors_found`, check `error_summary` for specific error types and locations
    - Fix the identified errors and recalculate again
    - Common errors to fix:
@@ -150,6 +155,70 @@ This applies to ALL calculations - totals, percentages, ratios, differences, etc
      - `#DIV/0!`: Division by zero
      - `#VALUE!`: Wrong data type in formula
      - `#NAME?`: Unrecognized formula name
+
+## Common Agent Mistakes (READ BEFORE BUILDING)
+
+These two bugs appear frequently in agent-generated workbooks. Avoid them explicitly.
+
+### ❌ Mistake 1: Repeating title rows across every column
+
+**Symptom:** Row 1–3 (title, company list, disclaimer) show the same text in columns A, B, C, D, …
+
+**Cause:** Writing headers inside a column loop:
+```python
+# WRONG — duplicates title in every column
+for col in range(1, num_cols + 1):
+    ws.cell(row=1, column=col, value=title)
+```
+
+**Fix:** Write once in column A and merge across the table width:
+```python
+from skills.xlsx.scripts.workbook_helpers import write_title_block, write_section_header
+
+next_row = write_title_block(
+    ws,
+    title="AI SEMICONDUCTOR — COMPARABLES",
+    subtitle="NVIDIA · AMD · Broadcom · Marvell",
+    disclaimer="As of Q4 2025 | All figures in USD Millions",
+    merge_to_col=10,  # match your data table width
+)
+write_section_header(ws, text="SECTION A: OPERATING METRICS", row=next_row, merge_to_col=10)
+```
+
+**Rule:** Title blocks and section headers are **row-level** content. Never loop them over columns. Only loop when writing **per-company data down rows**.
+
+### ❌ Mistake 2: `[object Object]` in margin / ratio / statistics cells
+
+**Symptom:** Raw inputs (Revenue, EBITDA) look fine, but Gross Margin, EV/EBITDA, MEDIAN rows show `[object Object]`.
+
+**Causes (often combined):**
+1. **Formulas written but `recalc.py` not run** — openpyxl saves formula strings without cached results; the web viewer cannot render uncached formula cells.
+2. **Nested JSON written directly to cells** — MCP responses like `{"value": 0.35}` assigned without extracting the scalar.
+
+**Fix for formulas:** Always run recalc after save:
+```bash
+python skills/xlsx/scripts/recalc.py output.xlsx 30
+python skills/xlsx/scripts/validate_workbook.py output.xlsx
+```
+
+**Fix for MCP/JSON data:**
+```python
+from skills.xlsx.scripts.workbook_helpers import coerce_scalar
+
+margin = coerce_scalar(ratios["grossMargin"])  # not ratios["grossMargin"] directly
+ws.cell(row=r, column=c, value=margin)
+```
+
+**Rule:** Every cell value must be a **scalar** (`str`, `int`, `float`, `bool`) or an **Excel formula string** starting with `=`. Never write Python `dict`/`list` objects to cells.
+
+### Helper module: `scripts/workbook_helpers.py`
+
+| Function | Purpose |
+|----------|---------|
+| `write_title_block()` | Title + subtitle + disclaimer with `merge_cells` |
+| `write_section_header()` | Section label (e.g. "SECTION A: …") merged once |
+| `coerce_scalar()` | Safely extract numbers from nested MCP JSON |
+| `last_data_column()` | Find table width for merge range |
 
 ### Creating new Excel files
 

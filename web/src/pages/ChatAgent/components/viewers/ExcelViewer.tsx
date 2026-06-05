@@ -108,6 +108,9 @@ function getCellDisplayValue(cell: ExcelJS.Cell | undefined | null): string {
     if (v instanceof Date) return v.toLocaleDateString();
     if (obj.hyperlink) return String(obj.text || obj.hyperlink);
     if (obj.error) return String(obj.error);
+    // Formula cells without cached results (common when openpyxl saves without recalc)
+    if (typeof obj.formula === 'string') return obj.formula;
+    if (typeof obj.sharedFormula === 'string') return obj.sharedFormula;
   }
   return String(v);
 }
