@@ -1,6 +1,12 @@
-"""Shared constants for sandbox providers and PTCSandbox."""
+"""Shared constants for sandbox providers and PTCSandbox.
+
+NOTE: `Dockerfile.sandbox` (the Docker provider's image) hand-mirrors
+`DEFAULT_DEPENDENCIES` and `SANDBOX_NODE_VERSION` below — it cannot import this
+module at build time. Keep both in sync when editing either.
+"""
 
 SNAPSHOT_PYTHON_VERSION = "3.12"  # Intentionally pinned for stability/compatibility.
+SANDBOX_NODE_VERSION = "24.14.1"  # Pinned; mirrored in Dockerfile.sandbox.
 
 DEFAULT_DEPENDENCIES = [
     # Core
@@ -41,7 +47,8 @@ DEFAULT_DEPENDENCIES = [
     "markitdown[pptx]",
     # Web scraping
     "scrapling[all]",
-    "html2text",
+    "html-to-markdown",
+    "trafilatura",
     "youtube-transcript-api",
     # Browser automation
     "playwright",

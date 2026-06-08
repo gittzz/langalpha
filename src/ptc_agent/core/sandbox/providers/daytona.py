@@ -17,7 +17,11 @@ from daytona_sdk.common.process import CodeRunParams, SessionExecuteRequest
 from daytona_sdk.common.snapshot import CreateSnapshotParams
 
 from ptc_agent.config.core import DaytonaConfig
-from ptc_agent.core.sandbox._defaults import DEFAULT_DEPENDENCIES, SNAPSHOT_PYTHON_VERSION
+from ptc_agent.core.sandbox._defaults import (
+    DEFAULT_DEPENDENCIES,
+    SANDBOX_NODE_VERSION,
+    SNAPSHOT_PYTHON_VERSION,
+)
 from ptc_agent.core.sandbox.runtime import (
     Artifact,
     CodeRunResult,
@@ -428,6 +432,12 @@ class DaytonaProvider(SandboxProvider):
             "working_dir": self._working_dir,
             "python_version": self.SNAPSHOT_PYTHON_VERSION,
             "dependencies": self.DEFAULT_DEPENDENCIES,
+            # The apt-list strings below (e.g. "nodejs", "playwright") are static
+            # labels — they stay identical when the pinned Node version or the baked
+            # Playwright browser layout changes, so hash those explicitly to force a
+            # rebuild of existing snapshots when either changes.
+            "playwright_browsers_path": "/usr/local/ms-playwright",
+            "node_version": SANDBOX_NODE_VERSION,
             "mcp_packages": sorted(mcp_packages or []),
             "apt_packages": [
                 "curl",
@@ -480,8 +490,15 @@ class DaytonaProvider(SandboxProvider):
                 " fonts-noto-cjk",
                 "curl -LsSf https://astral.sh/uv/install.sh | sh",
                 "mv /root/.local/bin/uv /usr/local/bin/uv",
-                "curl -fsSL https://deb.nodesource.com/setup_24.x | bash -",
-                "apt-get install -y nodejs",
+                # Node.js: pinned direct binary (matches Dockerfile.sandbox;
+                # avoids apt-mirror flakiness and unpinned-version drift).
+                "NODE_ARCH=$([ \"$(dpkg --print-architecture)\" = \"arm64\" ]"
+                " && echo arm64 || echo x64)"
+                f" && curl -fsSL https://nodejs.org/dist/v{SANDBOX_NODE_VERSION}/"
+                f"node-v{SANDBOX_NODE_VERSION}-linux-${{NODE_ARCH}}.tar.xz"
+                " -o /tmp/node.tar.xz"
+                " && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1"
+                " && rm /tmp/node.tar.xz",
                 *[f"npm install -g {pkg}" for pkg in pkgs],
                 "npm install -g docx pptxgenjs",
                 'GH_ARCH=$(dpkg --print-architecture)'
@@ -516,6 +533,15 @@ class DaytonaProvider(SandboxProvider):
                 "apt-get clean",
                 "rm -rf /var/lib/apt/lists/*",
             )
+            .env(
+                # Persist a single Playwright browser dir shared by both the
+                # npm-side `playwright` (npx, installed above) and the Python
+                # `playwright` that Scrapling drives at runtime. With this set,
+                # `scrapling install` below and the live sandbox resolve
+                # Chromium at the same path npx populated, instead of the
+                # default ~/.cache — the missing-executable split behind #149.
+                {"PLAYWRIGHT_BROWSERS_PATH": "/usr/local/ms-playwright"}
+            )
             .run_commands(
                 # yfinance pins curl_cffi<0.14 but scrapling[all] requires >=0.14.
                 # Override resolves the conflict (tested, yfinance works with 0.14+).
@@ -523,7 +549,8 @@ class DaytonaProvider(SandboxProvider):
                 "uv pip install --system --override /tmp/overrides.txt "
                 + " ".join(dependencies),
                 "rm /tmp/overrides.txt",
-                # Scrapling browser setup (Camoufox for StealthyFetcher)
+                # Scrapling browser setup (Camoufox for StealthyFetcher).
+                # Chromium lands in the shared PLAYWRIGHT_BROWSERS_PATH set above.
                 "scrapling install || true",
             )
             .run_commands(
