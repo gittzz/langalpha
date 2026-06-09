@@ -168,7 +168,7 @@ async def get_workspace(
                 """
                 SELECT workspace_id, user_id, name, description, sandbox_id,
                        status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                       is_pinned, sort_order
+                       is_pinned, sort_order, mcp_config_version
                 FROM workspaces
                 WHERE workspace_id = %s AND status != 'deleted'
                 """,

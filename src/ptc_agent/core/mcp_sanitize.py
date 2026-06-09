@@ -1,0 +1,127 @@
+"""Sanitization helpers for untrusted (user-configured) MCP server schemas.
+
+User MCP servers (``source == "workspace"``) report arbitrary tool names,
+parameter names, and descriptions. That text reaches generated Python code
+(docstrings, wrapper modules) and the system prompt, so it is hostile input.
+These helpers bound identifiers and text before either boundary.
+
+The ``${vault:NAME}`` reference regex is defined here ONCE
+(``VAULT_REF_RE``) and imported by every lane that resolves or validates
+vault references — the generated client, the API validator, and the resolver
+must agree on the exact syntax.
+"""
+
+from __future__ import annotations
+
+import keyword
+import re
+from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# Vault reference syntax — the single source of truth.
+# ---------------------------------------------------------------------------
+# A vault reference looks like ``${vault:SECRET_NAME}``. Only this exact form
+# resolves for workspace servers; a bare ``${VAR}`` is intentionally NOT a
+# vault reference, so a user cannot name ``${INTERNAL_SERVICE_TOKEN}`` and have
+# it resolve from anything. Secret names follow the same identifier shape the
+# vault API enforces.
+VAULT_REF_RE = re.compile(r"\$\{vault:([A-Za-z_][A-Za-z0-9_]{0,127})\}")
+
+# Default bounds for untrusted tool text entering docstrings / docs / prompt.
+DEFAULT_TOOL_TEXT_MAX_LEN = 2048
+
+
+@dataclass(frozen=True)
+class SanitizedToolSet:
+    """Result of sanitizing one server's tool list.
+
+    ``kept`` preserves input order; ``skipped`` records ``(original_name,
+    reason)`` so callers can surface "N tools skipped: reasons".
+    """
+
+    kept: list = field(default_factory=list)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+def vault_refs(value: str) -> list[str]:
+    """Return the vault secret names referenced in ``value`` (may be empty)."""
+    return VAULT_REF_RE.findall(value or "")
+
+
+def sanitize_tool_name(name: str) -> str | None:
+    """Coerce a tool name into a legal, non-keyword Python identifier.
+
+    Returns the sanitized identifier, or ``None`` when the name cannot be
+    salvaged (empty, or all characters illegal). The transformation matches the
+    historical ``foo-bar``/``foo.bar`` -> ``foo_bar`` rewrite but is applied to
+    every illegal character, so two distinct inputs CAN collapse to the same
+    identifier — callers must run collision detection (see
+    :func:`sanitize_tool_set`).
+    """
+    if not name:
+        return None
+    # Replace every character that is not a valid identifier char with "_".
+    candidate = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    # A leading digit is illegal; prefix to make it valid.
+    if candidate and candidate[0].isdigit():
+        candidate = f"_{candidate}"
+    if not candidate or candidate == "_" * len(candidate):
+        return None
+    if not candidate.isidentifier():
+        return None
+    if keyword.iskeyword(candidate) or keyword.issoftkeyword(candidate):
+        candidate = f"{candidate}_"
+    return candidate
+
+
+def sanitize_tool_text(text: str | None, max_len: int = DEFAULT_TOOL_TEXT_MAX_LEN) -> str:
+    """Make untrusted text safe to embed inside a triple-quoted docstring.
+
+    Neutralizes triple-quote breakouts, escapes trailing backslashes that would
+    eat the closing quotes, strips control characters, and length-caps. The
+    result is plain data — it cannot terminate the docstring early or smuggle
+    code past the wrapper.
+    """
+    if not text:
+        return ""
+    # Strip control chars except tab/newline (which docstrings tolerate).
+    cleaned = "".join(
+        ch for ch in text if ch in ("\t", "\n") or (ord(ch) >= 32 and ord(ch) != 127)
+    )
+    # Neutralize any triple-quote sequence so it can't close the docstring.
+    cleaned = cleaned.replace('"""', '\\"\\"\\"').replace("'''", "\\'\\'\\'")
+    # Collapse lone backslashes that could escape the closing quote / form
+    # invalid escape sequences when the string is embedded verbatim.
+    cleaned = cleaned.replace("\\", "\\\\")
+    # The replace above double-escaped the quote-escapes we just inserted; undo
+    # that one level so the quote neutralization stays a single backslash.
+    cleaned = cleaned.replace('\\\\"', '\\"').replace("\\\\'", "\\'")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len] + "…(truncated)"
+    return cleaned
+
+
+def sanitize_tool_set(tools: list) -> SanitizedToolSet:
+    """Validate + de-collide a server's tool names.
+
+    Each tool is expected to expose a ``.name`` attribute (``MCPToolInfo``).
+    Tools whose name cannot be made a legal identifier are skipped with a
+    reason; tools whose sanitized name collides with an already-kept tool are
+    skipped (the first occurrence wins, deterministically).
+    """
+    result = SanitizedToolSet()
+    seen: set[str] = set()
+    for tool in tools:
+        original = getattr(tool, "name", "") or ""
+        sanitized = sanitize_tool_name(original)
+        if sanitized is None:
+            result.skipped.append((original, "name is not a valid Python identifier"))
+            continue
+        if sanitized in seen:
+            result.skipped.append(
+                (original, f"sanitized name {sanitized!r} collides with another tool")
+            )
+            continue
+        seen.add(sanitized)
+        result.kept.append(tool)
+    return result

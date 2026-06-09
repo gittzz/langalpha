@@ -122,8 +122,12 @@ class MCPServerConfig(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     url: str | None = None  # For SSE/HTTP transports
+    headers: dict[str, str] = Field(default_factory=dict)  # For SSE/HTTP transports
     tool_exposure_mode: Literal["summary", "detailed"] | None = None  # Per-server override
     vault_blueprints: list[VaultBlueprint] = Field(default_factory=list)
+    # 'builtin' = from agent_config.yaml; 'workspace' = user-configured per-workspace.
+    # Workspace servers are untrusted: vault-only secret resolution, neutral prompt framing.
+    source: Literal["builtin", "workspace"] = "builtin"
 
 
 class MCPConfig(BaseModel):

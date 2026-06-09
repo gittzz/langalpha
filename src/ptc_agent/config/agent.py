@@ -541,7 +541,11 @@ class AgentConfig(BaseModel):
         core_config = CoreConfig(
             sandbox=self.sandbox,
             security=self.security,
-            mcp=self.mcp,
+            # Deep-copy the MCP config so each CoreConfig (hence each workspace
+            # sandbox) owns its MCPConfig. Sharing it by reference made every
+            # workspace's effective server set the same object — Phase 2 swaps
+            # in per-workspace servers, which must not bleed across workspaces.
+            mcp=self.mcp.model_copy(deep=True),
             logging=self.logging,
             filesystem=self.filesystem,
         )

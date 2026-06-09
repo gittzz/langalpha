@@ -220,9 +220,20 @@ class TestAgentConfigToCoreConfig:
         config = _minimal_config()
         core = config.to_core_config()
         assert core.security is config.security
-        assert core.mcp is config.mcp
         assert core.logging is config.logging
         assert core.filesystem is config.filesystem
+
+    def test_mcp_is_a_deep_copy_not_shared(self):
+        """Each CoreConfig owns its MCPConfig so per-workspace edits can't bleed."""
+        config = _minimal_config()
+        core = config.to_core_config()
+        assert core.mcp is not config.mcp
+        assert core.mcp == config.mcp
+        # Mutating the per-workspace copy leaves the source AgentConfig untouched.
+        core.mcp.servers.append(
+            MCPServerConfig(name="injected", source="workspace")
+        )
+        assert [s.name for s in config.mcp.servers] != ["injected"]
 
 
 # ---------------------------------------------------------------------------

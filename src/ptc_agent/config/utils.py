@@ -213,7 +213,14 @@ def create_mcp_config(data: dict[str, Any]) -> MCPConfig:
     from ptc_agent.config.core import MCPConfig, MCPServerConfig
 
     validate_section_fields(data, MCP_REQUIRED_FIELDS, "mcp")
-    mcp_servers = [MCPServerConfig(**server) for server in data["servers"]]
+    # Built-ins from agent_config.yaml are always source="builtin"; an explicit
+    # ``source`` key in YAML is ignored so a config file can't mark a server as
+    # an (untrusted) workspace server. ``headers`` passes through as a model
+    # field (built-ins may declare http/sse headers too).
+    mcp_servers = [
+        MCPServerConfig(**{k: v for k, v in server.items() if k != "source"})
+        for server in data["servers"]
+    ]
     return MCPConfig(
         servers=mcp_servers,
         tool_discovery_enabled=data["tool_discovery_enabled"],
