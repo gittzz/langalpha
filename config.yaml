@@ -165,6 +165,22 @@ news_data:
     - name: fmp
     - name: yfinance
 
+# News refresh poller — keeps the GLOBAL feeds (curated "Top" + Market general)
+# warm by fetching the latest page every interval and delta-merging new articles
+# (by id) into a rolling buffer stored in the same Redis key the /news endpoint
+# reads. Per-ticker feeds are unbounded and stay on the on-demand cache. One
+# worker polls per tick (Redis-lock leader election); the buffer self-heals via
+# the cache TTL if the poller stops.
+news_poll:
+  enabled: true
+  interval_seconds: 60     # How often to fetch the latest page
+  max_items: 100           # Rolling-buffer cap per feed
+  feeds:
+    - provider: tickertick # Curated "Top" feed (news:tickertick:general:<limit>)
+      limit: 50
+    - provider: null       # Provider-chain general feed / Market tab (news:general:<limit>)
+      limit: 50
+
 
 # =============================================================================
 # MARKET INSIGHT CONFIGURATION

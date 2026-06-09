@@ -171,6 +171,11 @@ def is_redis_cache_enabled() -> bool:
     return get_infrastructure_config().redis.cache_enabled
 
 
+def get_news_poll_config():
+    """News refresh poller config (enabled / interval / max_items / feeds)."""
+    return get_infrastructure_config().news_poll
+
+
 def get_redis_max_connections() -> int:
     """Get Redis connection pool max connections.
 

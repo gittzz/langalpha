@@ -375,10 +375,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start MarketInsightService: {e}")
 
+    # Start NewsRefreshService (delta-poll global news feeds keep-warm)
+    try:
+        from src.server.services.news_refresh_service import NewsRefreshService
+
+        news_refresh = NewsRefreshService.get_instance()
+        await news_refresh.start()
+    except Exception as e:
+        logger.warning(f"Failed to start NewsRefreshService: {e}")
+
     yield  # Server is running
 
     # Shutdown
     logger.info("Application shutdown started...")
+
+    # 0. Shutdown NewsRefreshService
+    try:
+        from src.server.services.news_refresh_service import NewsRefreshService
+
+        await NewsRefreshService.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error shutting down NewsRefreshService: {e}")
 
     # 0. Shutdown MarketInsightService
     try:

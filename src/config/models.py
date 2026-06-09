@@ -175,6 +175,27 @@ class NewsDataConfig(BaseModel):
     providers: List[MarketDataProviderConfig] = Field(default_factory=list)
 
 
+class NewsPollFeedConfig(BaseModel):
+    """One global feed kept warm by the news refresh poller.
+
+    ``provider`` None targets the provider chain (Market general feed); a name
+    (e.g. ``tickertick``) targets that source directly. Always polled with no
+    tickers, so it maps to a global ``news:[provider]:general:<limit>`` key.
+    """
+
+    provider: str | None = Field(default=None)
+    limit: int = Field(default=50, ge=1, le=100)
+
+
+class NewsPollConfig(BaseModel):
+    """News refresh poller — delta-merges the latest page into a rolling buffer."""
+
+    enabled: bool = Field(default=True)
+    interval_seconds: int = Field(default=60, ge=10)
+    max_items: int = Field(default=100, ge=1, le=500)
+    feeds: List[NewsPollFeedConfig] = Field(default_factory=list)
+
+
 class InfrastructureConfig(BaseModel):
     """Root model for infrastructure configuration (config.yaml)."""
 
@@ -228,3 +249,4 @@ class InfrastructureConfig(BaseModel):
     # Market Data
     market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     news_data: NewsDataConfig = Field(default_factory=NewsDataConfig)
+    news_poll: NewsPollConfig = Field(default_factory=NewsPollConfig)
