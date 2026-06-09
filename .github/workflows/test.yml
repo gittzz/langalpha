@@ -25,7 +25,13 @@ jobs:
   backend-integration:
     runs-on: ubuntu-latest
     needs: backend-unit
-    if: github.event_name == 'push' || github.event.pull_request.base.ref == 'main'
+    # Same-repo PRs + pushes only. Fork PRs can't read secrets on the
+    # `pull_request` event, so they run through fork-integration.yml
+    # (pull_request_target, gated by the fork-ci environment reviewers) instead.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.base.ref == 'main' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     environment: integration
     services:
       postgres:
