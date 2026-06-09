@@ -25,6 +25,11 @@ def _cache_key(tickers: list[str] | None, limit: int, provider: str | None = Non
     return f"{prefix}:general:{limit}"
 
 
+# Public alias — the news router and refresh poller derive lock / single-flight
+# keys from this, so it's part of the module's intentional surface, not private.
+news_cache_key = _cache_key
+
+
 class NewsCacheService:
     _instance: NewsCacheService | None = None
 
@@ -50,10 +55,16 @@ class NewsCacheService:
         return None
 
     async def get_article_by_id(self, article_id: str) -> dict[str, Any] | None:
-        """Scan all cached news lists for an article matching the given ID."""
+        """Scan all cached news lists for an article matching the given ID.
+
+        Uses a non-blocking SCAN over the ``news:*`` keyspace (short-lived,
+        bounded by provider × ticker-combo × limit), reading each list and
+        returning the first article whose id matches. A miss falls through to
+        the provider in the caller, so this is a best-effort fast path.
+        """
         try:
             cache = get_cache_client()
-            keys = await cache.keys("news:*")
+            keys = await cache.scan_keys("news:*")
             for key in keys:
                 raw = await cache.get(key)
                 if raw:
@@ -64,6 +75,14 @@ class NewsCacheService:
         except Exception:
             logger.debug("news_cache.get_article_by_id.failed", exc_info=True)
         return None
+
+    async def acquire_lock(self, key: str, token: str, ttl_ms: int) -> bool | None:
+        """Distributed refresh lock (see RedisCacheClient.acquire_lock)."""
+        return await get_cache_client().acquire_lock(key, token, ttl_ms)
+
+    async def release_lock(self, key: str, token: str) -> None:
+        """Release a refresh lock held under ``key`` with ``token``."""
+        await get_cache_client().release_lock(key, token)
 
     async def set(
         self,

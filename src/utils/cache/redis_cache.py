@@ -38,6 +38,16 @@ class DateTimeEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+# Compare-and-delete: only release a lock we still own, so a request whose lock
+# already expired can't delete the lock a later holder acquired.
+_RELEASE_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
 class RedisCacheClient:
     """
     Async Redis cache client with connection pooling.
@@ -319,6 +329,54 @@ class RedisCacheClient:
             logger.error(f"Cache delete pattern error for {pattern}: {e}")
             self.stats["errors"] += 1
             return 0
+
+    async def scan_keys(self, pattern: str) -> list[str]:
+        """Return all keys matching *pattern* using non-blocking SCAN.
+
+        Uses SCAN (via ``scan_iter``) rather than KEYS so a large keyspace can't
+        block the Redis event loop on a shared instance.
+        """
+        if not self.enabled or not self.client:
+            return []
+
+        try:
+            keys: list[str] = []
+            async for key in self.client.scan_iter(match=pattern, count=100):
+                keys.append(key.decode("utf-8") if isinstance(key, bytes) else key)
+            return keys
+        except Exception as e:
+            self._log_error(f"Cache scan error for {pattern}", e)
+            self.stats["errors"] += 1
+            return []
+
+    async def acquire_lock(self, key: str, token: str, ttl_ms: int) -> bool | None:
+        """Try to acquire a short-lived distributed lock via ``SET key NX PX``.
+
+        Returns True if acquired (caller is the leader), False if another holder
+        owns it, or None if Redis is unavailable — in which case the caller
+        should proceed without coordination rather than block.
+        """
+        if not self.enabled or not self.client:
+            return None
+
+        try:
+            ok = await self.client.set(key, token, nx=True, px=ttl_ms)
+            return bool(ok)
+        except Exception as e:
+            self._log_error(f"Lock acquire error for {key}", e)
+            self.stats["errors"] += 1
+            return None
+
+    async def release_lock(self, key: str, token: str) -> None:
+        """Release a lock only if this caller still owns it (compare-and-delete)."""
+        if not self.enabled or not self.client:
+            return
+
+        try:
+            await self.client.eval(_RELEASE_LOCK_LUA, 1, key, token)
+        except Exception as e:
+            self._log_error(f"Lock release error for {key}", e)
+            self.stats["errors"] += 1
 
     async def exists(self, key: str) -> bool:
         """
