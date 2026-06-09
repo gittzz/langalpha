@@ -128,6 +128,15 @@ class TestResolveMergePrecedence:
 
         assert [s.name for s in resolved.servers] == ["alpha"]
         assert resolved.builtin_names == frozenset({"alpha"})
+        # Exposed so the API can keep a re-enable toggle visible in the UI.
+        assert resolved.disabled_builtin_names == frozenset({"beta"})
+
+    async def test_disabled_builtin_names_empty_when_no_rows(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+
+        resolved = await _resolve(base, rows=[])
+
+        assert resolved.disabled_builtin_names == frozenset()
 
     async def test_user_server_appended_after_builtins(self):
         base = _base_config(MCPServerConfig(name="alpha"))

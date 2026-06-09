@@ -34,13 +34,17 @@ class ResolvedMCP:
 
     ``servers`` is deterministic (built-ins in config order, then user servers
     alphabetical). ``builtin_names`` / ``user_names`` partition the effective
-    set by origin. ``version`` is ``workspaces.mcp_config_version``.
+    set by origin. ``disabled_builtin_names`` lists built-ins removed by a
+    disable-marker row (excluded from ``servers``, but the API needs them so
+    the UI keeps a re-enable toggle). ``version`` is
+    ``workspaces.mcp_config_version``.
     """
 
     servers: list[MCPServerConfig]
     builtin_names: frozenset[str]
     user_names: frozenset[str]
     version: int
+    disabled_builtin_names: frozenset[str] = frozenset()
 
 
 def workspace_row_to_server_config(row: dict) -> MCPServerConfig:
@@ -138,6 +142,7 @@ async def resolve_mcp_config(
         builtin_names=frozenset(s.name for s in effective_builtins),
         user_names=frozenset(s.name for s in user_servers),
         version=version,
+        disabled_builtin_names=frozenset(disabled_builtins & builtin_name_set),
     )
 
 

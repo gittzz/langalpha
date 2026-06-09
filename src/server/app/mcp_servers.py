@@ -205,6 +205,36 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
             )
         )
 
+    # Disabled built-ins are filtered out of the resolver's effective set, but
+    # the UI still needs a row (with its toggle) to re-enable them.
+    for srv in base_config.mcp.servers:
+        if srv.name not in resolved.disabled_builtin_names:
+            continue
+        servers.append(
+            EffectiveServer(
+                name=srv.name,
+                origin="builtin",
+                transport=srv.transport,
+                enabled=False,
+                editable=False,
+                deletable=False,
+                status="disabled",
+                error="",
+                tool_count=0,
+                tools=[],
+                missing_secrets=[],
+                env_refs=[],
+                header_refs=[],
+                description=srv.description or "",
+                instruction=srv.instruction or "",
+                tool_exposure_mode=srv.tool_exposure_mode,
+                command=srv.command,
+                args=list(srv.args or []),
+                url=srv.url,
+                config_version=resolved.version,
+            )
+        )
+
     return EffectiveServerList(
         servers=servers,
         sandbox_running=_sandbox_running(workspace),

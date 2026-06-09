@@ -164,6 +164,38 @@ async def test_list_effective_servers_masks_and_decorates(client):
 
 
 @pytest.mark.asyncio
+async def test_list_keeps_disabled_builtin_visible(client):
+    ws = _ws()
+    disabled = _builtin("builtin_disabled")
+    base = _agent_config([_builtin(), disabled])
+    resolved = ResolvedMCP(
+        servers=[_builtin()],
+        builtin_names=frozenset({"builtin_search"}),
+        user_names=frozenset(),
+        version=4,
+        disabled_builtin_names=frozenset({"builtin_disabled"}),
+    )
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.resolve_mcp_config", new=AsyncMock(return_value=resolved)),
+        patch("src.server.app.mcp_servers.get_workspace_secret_names", new=AsyncMock(return_value=set())),
+        patch("src.server.app.mcp_servers.get_tool_schemas", new=AsyncMock(return_value=[])),
+    ):
+        resp = await client.get(f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers")
+
+    assert resp.status_code == 200
+    by_name = {s["name"]: s for s in resp.json()["servers"]}
+    # The disabled builtin stays visible so the UI keeps its re-enable toggle.
+    row = by_name["builtin_disabled"]
+    assert row["origin"] == "builtin"
+    assert row["enabled"] is False
+    assert row["status"] == "disabled"
+    assert row["editable"] is False and row["deletable"] is False
+    assert row["tool_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_list_needs_secret_surfaces_missing(client):
     ws = _ws()
     base = _agent_config([])
