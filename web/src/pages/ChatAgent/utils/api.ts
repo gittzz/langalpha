@@ -1210,3 +1210,180 @@ export async function triggerUserMemoDownload(
   document.body.removeChild(a);
   URL.revokeObjectURL(blobUrl);
 }
+
+// --- MCP servers (per-workspace + user catalog) ---
+//
+// Per-workspace effective list mixes built-in servers with workspace-added
+// ones; the catalog holds reusable user templates that get copied into a
+// workspace via `from_template`. Env/header literal values are never echoed by
+// the backend — only `${vault:NAME}` reference names surface (as `*_refs`).
+
+/** A full MCP server definition payload (matches backend `McpServerInput`). */
+export interface McpServerInput {
+  name: string;
+  transport: 'stdio' | 'sse' | 'http';
+  command?: string | null;
+  args?: string[];
+  url?: string | null;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  description?: string;
+  instruction?: string;
+  tool_exposure_mode?: 'summary' | 'detailed';
+}
+
+/** One discovered tool (sanitized snapshot from the discovery cache). */
+export interface McpToolSummary {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+}
+
+export type McpStatus =
+  | 'connected'
+  | 'error'
+  | 'needs_secret'
+  | 'disabled'
+  | 'pending'
+  | 'unknown';
+
+/** One row in the effective per-workspace MCP list. */
+export interface EffectiveServer {
+  name: string;
+  origin: 'builtin' | 'workspace';
+  transport: string;
+  enabled: boolean;
+  editable: boolean;
+  deletable: boolean;
+  status: McpStatus;
+  error: string;
+  tool_count: number;
+  tools: McpToolSummary[];
+  missing_secrets: string[];
+  env_refs: string[];
+  header_refs: string[];
+  description: string;
+  instruction: string;
+  tool_exposure_mode: string | null;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  config_version: number;
+}
+
+export interface EffectiveServerList {
+  servers: EffectiveServer[];
+  sandbox_running: boolean;
+  max_servers: number;
+  config_version: number;
+}
+
+/** A user catalog template row (masked — only vault refs surfaced). */
+export interface CatalogServer {
+  name: string;
+  transport: string;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  env_refs: string[];
+  header_refs: string[];
+  description: string;
+  instruction: string;
+  tool_exposure_mode: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** Result of a discovery probe (POST /discover). */
+export interface McpDiscoveryResult {
+  server_name?: string;
+  status: McpStatus | 'ok';
+  tools: McpToolSummary[];
+  error: string;
+  config_version?: number;
+  discovered_at?: string | null;
+}
+
+// --- Per-workspace MCP ---
+
+export async function getWorkspaceMcpServers(workspaceId: string): Promise<EffectiveServerList> {
+  const { data } = await api.get<EffectiveServerList>(
+    `/api/v1/workspaces/${workspaceId}/mcp/servers`,
+  );
+  return data;
+}
+
+/** Add a server to a workspace — either a full def or `{ from_template }`. */
+export async function addWorkspaceMcpServer(
+  workspaceId: string,
+  body: McpServerInput | { from_template: string },
+) {
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/mcp/servers`, body);
+  return data as { name: string; source: string; enabled: boolean };
+}
+
+export async function updateWorkspaceMcpServer(
+  workspaceId: string,
+  name: string,
+  body: McpServerInput,
+) {
+  const { data } = await api.put(
+    `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}`,
+    body,
+  );
+  return data as { name: string; source: string; enabled: boolean };
+}
+
+export async function setWorkspaceMcpServerEnabled(
+  workspaceId: string,
+  name: string,
+  enabled: boolean,
+) {
+  const { data } = await api.patch(
+    `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}/enabled`,
+    { enabled },
+  );
+  return data as { name: string; enabled: boolean };
+}
+
+export async function deleteWorkspaceMcpServer(workspaceId: string, name: string) {
+  const { data } = await api.delete(
+    `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}`,
+  );
+  return data as { ok: boolean };
+}
+
+export async function discoverWorkspaceMcpServer(
+  workspaceId: string,
+  name: string,
+): Promise<McpDiscoveryResult> {
+  const { data } = await api.post<{ server: McpDiscoveryResult }>(
+    `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}/discover`,
+  );
+  return data.server;
+}
+
+// --- User catalog (templates) ---
+
+export async function getMcpCatalog(): Promise<CatalogServer[]> {
+  const { data } = await api.get<{ servers: CatalogServer[] }>('/api/v1/mcp/servers');
+  return data.servers;
+}
+
+export async function createMcpCatalogServer(body: McpServerInput): Promise<CatalogServer> {
+  const { data } = await api.post<CatalogServer>('/api/v1/mcp/servers', body);
+  return data;
+}
+
+export async function updateMcpCatalogServer(
+  name: string,
+  body: McpServerInput,
+): Promise<CatalogServer> {
+  const { data } = await api.put<CatalogServer>(`/api/v1/mcp/servers/${name}`, body);
+  return data;
+}
+
+export async function deleteMcpCatalogServer(name: string) {
+  const { data } = await api.delete(`/api/v1/mcp/servers/${name}`);
+  return data as { ok: boolean };
+}

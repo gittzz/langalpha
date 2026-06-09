@@ -1,0 +1,506 @@
+import React, { useCallback, useMemo, useState } from 'react';
+import { X, Plus, Trash2, Loader2, Zap } from 'lucide-react';
+import { VaultSecretPicker } from './VaultSecretPicker';
+import { McpDiscoverResult } from './McpDiscoverResult';
+import {
+  ALLOWED_COMMANDS,
+  EXPOSURE_MODES,
+  TRANSPORTS,
+  validateMcpServer,
+} from './mcpSchemas';
+import type { McpServerInput, McpDiscoveryResult, EffectiveServer } from '../../utils/api';
+
+/**
+ * Create/edit modal for a workspace (or catalog) MCP server.
+ *
+ * Transport selector drives conditional fields:
+ *   - stdio → command (allowlist), args, env key/value editor
+ *   - sse/http → url, headers key/value editor
+ *
+ * env/header values use `VaultSecretPicker` (emits `${vault:NAME}`).
+ * `description` + `instruction` carry helper text marking them as untrusted,
+ * user-provided context shown to the agent. An exposure-mode toggle picks
+ * summary/detailed. "Test connection" runs the discovery probe.
+ */
+
+type Transport = (typeof TRANSPORTS)[number];
+type Exposure = (typeof EXPOSURE_MODES)[number];
+
+interface KV {
+  key: string;
+  value: string;
+}
+
+function kvsToMap(kvs: KV[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const { key, value } of kvs) {
+    if (key.trim()) out[key.trim()] = value;
+  }
+  return out;
+}
+
+export interface McpServerModalProps {
+  workspaceId: string;
+  /** Existing vault secret names for the picker. */
+  secretNames: string[];
+  /** When editing, the server being edited (its name field is locked). */
+  initial?: EffectiveServer | null;
+  /** Hide the "Test connection" button (e.g. in the catalog where there's no sandbox). */
+  allowDiscover?: boolean;
+  onClose: () => void;
+  onSubmit: (body: McpServerInput) => Promise<void>;
+  onDiscover?: (body: McpServerInput) => Promise<McpDiscoveryResult>;
+  onSecretCreated?: (name: string) => void;
+  saving?: boolean;
+  submitError?: string | null;
+}
+
+export function McpServerModal({
+  workspaceId,
+  secretNames,
+  initial,
+  allowDiscover = true,
+  onClose,
+  onSubmit,
+  onDiscover,
+  onSecretCreated,
+  saving = false,
+  submitError = null,
+}: McpServerModalProps) {
+  const isEdit = !!initial;
+  const [name, setName] = useState(initial?.name ?? '');
+  const [transport, setTransport] = useState<Transport>(
+    (initial?.transport as Transport) ?? 'stdio',
+  );
+  const [command, setCommand] = useState(initial?.command ?? 'npx');
+  const [args, setArgs] = useState<string[]>(initial?.args ?? []);
+  const [url, setUrl] = useState(initial?.url ?? '');
+  // env/header values are masked on the wire (only refs returned), so on edit we
+  // pre-fill keys with their `${vault:NAME}` refs and leave literal values blank.
+  const [env, setEnv] = useState<KV[]>(
+    initial ? refsToKVs(initial.env_refs) : [],
+  );
+  const [headers, setHeaders] = useState<KV[]>(
+    initial ? refsToKVs(initial.header_refs) : [],
+  );
+  const [description, setDescription] = useState(initial?.description ?? '');
+  const [instruction, setInstruction] = useState(initial?.instruction ?? '');
+  const [exposure, setExposure] = useState<Exposure>(
+    (initial?.tool_exposure_mode as Exposure) ?? 'summary',
+  );
+
+  const [errors, setErrors] = useState<Array<{ path: string; message: string }>>([]);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<McpDiscoveryResult | null>(null);
+
+  const buildPayload = useCallback((): McpServerInput => {
+    const base: McpServerInput = {
+      name: name.trim(),
+      transport,
+      description,
+      instruction,
+      tool_exposure_mode: exposure,
+    };
+    if (transport === 'stdio') {
+      return { ...base, command, args, env: kvsToMap(env) };
+    }
+    return { ...base, url: url.trim(), headers: kvsToMap(headers) };
+  }, [name, transport, command, args, url, env, headers, description, instruction, exposure]);
+
+  const validation = useMemo(() => validateMcpServer(buildPayload()), [buildPayload]);
+
+  async function handleSubmit() {
+    const result = validateMcpServer(buildPayload());
+    if (!result.ok) {
+      setErrors(result.errors);
+      return;
+    }
+    setErrors([]);
+    await onSubmit(buildPayload());
+  }
+
+  async function handleTest() {
+    if (!onDiscover) return;
+    const result = validateMcpServer(buildPayload());
+    if (!result.ok) {
+      setErrors(result.errors);
+      return;
+    }
+    setErrors([]);
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await onDiscover(buildPayload());
+      setTestResult(res);
+    } catch (err) {
+      const e = err as { response?: { data?: { detail?: string } }; message?: string };
+      setTestResult({
+        status: 'error',
+        tools: [],
+        error: e?.response?.data?.detail || e?.message || 'Discovery failed',
+      });
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  const errorFor = (path: string) => errors.find((e) => e.path === path || e.path.startsWith(`${path}.`));
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center p-4"
+      style={{ backgroundColor: 'var(--color-bg-overlay-strong)' }}
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-lg rounded-lg p-5"
+        style={{
+          backgroundColor: 'var(--color-bg-elevated)',
+          border: '1px solid var(--color-border-muted)',
+          maxHeight: '85vh',
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={onClose}
+          className="absolute top-3 right-3 p-1 rounded-full transition-colors hover:bg-foreground/10"
+          style={{ color: 'var(--color-text-primary)' }}
+          aria-label="Close"
+        >
+          <X className="h-4 w-4" />
+        </button>
+
+        <h3 className="text-lg font-semibold mb-4" style={{ color: 'var(--color-text-primary)' }}>
+          {isEdit ? 'Edit MCP server' : 'Add MCP server'}
+        </h3>
+
+        <div className="flex flex-col gap-4 overflow-y-auto" style={{ flex: 1, minHeight: 0 }}>
+          {/* Name */}
+          <Field label="Name">
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={isEdit}
+              placeholder="my_server"
+              className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none font-mono disabled:opacity-60"
+              style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
+              maxLength={64}
+            />
+            <FieldError error={errorFor('name')} />
+          </Field>
+
+          {/* Transport */}
+          <Field label="Transport">
+            <div className="flex gap-1">
+              {TRANSPORTS.map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setTransport(t)}
+                  className="px-3 py-1.5 text-xs rounded-md uppercase"
+                  style={{
+                    color: transport === t ? 'var(--color-text-on-accent)' : 'var(--color-text-tertiary)',
+                    backgroundColor: transport === t ? 'var(--color-accent-primary)' : 'var(--color-bg-card)',
+                  }}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </Field>
+
+          {/* stdio fields */}
+          {transport === 'stdio' ? (
+            <>
+              <Field label="Command">
+                <select
+                  value={command ?? ''}
+                  onChange={(e) => setCommand(e.target.value)}
+                  className="w-full px-3 py-2 text-sm rounded-md outline-none"
+                  style={{
+                    color: 'var(--color-text-primary)',
+                    backgroundColor: 'var(--color-bg-card)',
+                    border: '1px solid var(--color-border-muted)',
+                  }}
+                >
+                  {ALLOWED_COMMANDS.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+                <FieldError error={errorFor('command')} />
+              </Field>
+
+              <Field label="Arguments">
+                <ArgsEditor args={args} onChange={setArgs} />
+              </Field>
+
+              <Field label="Environment variables" hint="Use a vault secret for credentials.">
+                <KeyValueEditor
+                  kvs={env}
+                  onChange={setEnv}
+                  workspaceId={workspaceId}
+                  secretNames={secretNames}
+                  onSecretCreated={onSecretCreated}
+                  keyPlaceholder="ENV_VAR"
+                />
+                <FieldError error={errorFor('env')} />
+              </Field>
+            </>
+          ) : (
+            <>
+              <Field label="URL" hint="https only. No localhost or private IPs. Put credentials in headers.">
+                <input
+                  type="text"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="https://example.com/mcp"
+                  className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none"
+                  style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
+                />
+                <FieldError error={errorFor('url')} />
+              </Field>
+
+              <Field label="Headers" hint="Use a vault secret for auth tokens.">
+                <KeyValueEditor
+                  kvs={headers}
+                  onChange={setHeaders}
+                  workspaceId={workspaceId}
+                  secretNames={secretNames}
+                  onSecretCreated={onSecretCreated}
+                  keyPlaceholder="Authorization"
+                />
+                <FieldError error={errorFor('headers')} />
+              </Field>
+            </>
+          )}
+
+          {/* Description + instruction */}
+          <Field
+            label="Description"
+            hint="Shown to the agent as untrusted, user-provided context."
+          >
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="What this server does"
+              rows={2}
+              className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none resize-none"
+              style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
+              maxLength={512}
+            />
+            <FieldError error={errorFor('description')} />
+          </Field>
+
+          <Field
+            label="Instruction"
+            hint="Shown to the agent as untrusted, user-provided context."
+          >
+            <textarea
+              value={instruction}
+              onChange={(e) => setInstruction(e.target.value)}
+              placeholder="How the agent should use this server"
+              rows={2}
+              className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none resize-none"
+              style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
+              maxLength={1024}
+            />
+            <FieldError error={errorFor('instruction')} />
+          </Field>
+
+          {/* Exposure mode */}
+          <Field label="Tool exposure" hint="Detailed lists full tool schemas in the prompt (bounded by caps).">
+            <div className="flex gap-1">
+              {EXPOSURE_MODES.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setExposure(m)}
+                  className="px-3 py-1.5 text-xs rounded-md capitalize"
+                  style={{
+                    color: exposure === m ? 'var(--color-text-on-accent)' : 'var(--color-text-tertiary)',
+                    backgroundColor: exposure === m ? 'var(--color-accent-primary)' : 'var(--color-bg-card)',
+                  }}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          </Field>
+
+          {/* Test connection result */}
+          {testResult && <McpDiscoverResult result={testResult} />}
+
+          {submitError && (
+            <div className="text-xs p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-loss)' }}>
+              {submitError}
+            </div>
+          )}
+        </div>
+
+        {/* Footer actions */}
+        <div className="flex items-center justify-between gap-2 pt-4 mt-2 border-t" style={{ borderColor: 'var(--color-border-muted)' }}>
+          {allowDiscover && onDiscover ? (
+            <button
+              type="button"
+              onClick={handleTest}
+              disabled={testing || !validation.ok}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
+              style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
+            >
+              {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+              Test connection
+            </button>
+          ) : <span />}
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-3 py-1.5 text-xs rounded-md transition-colors hover:bg-foreground/10"
+              style={{ color: 'var(--color-text-tertiary)' }}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={saving || !validation.ok}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
+              style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+            >
+              {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              {isEdit ? 'Save' : 'Add'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** On edit the wire returns only masked vault names, so pre-fill keys with refs. */
+function refsToKVs(refs: string[]): KV[] {
+  // We can recover the ref form `${vault:NAME}` but not the original key name,
+  // so seed each ref under a blank key the user re-labels. Most servers use a
+  // single secret, so this is acceptable for v1.
+  return (refs ?? []).map((name) => ({ key: '', value: `\${vault:${name}}` }));
+}
+
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>{label}</label>
+      {children}
+      {hint && <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>{hint}</p>}
+    </div>
+  );
+}
+
+function FieldError({ error }: { error?: { message: string } }) {
+  if (!error) return null;
+  return <p className="text-[11px]" style={{ color: 'var(--color-loss)' }}>{error.message}</p>;
+}
+
+function ArgsEditor({ args, onChange }: { args: string[]; onChange: (a: string[]) => void }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      {args.map((a, i) => (
+        <div key={i} className="flex gap-1.5">
+          <input
+            type="text"
+            value={a}
+            onChange={(e) => onChange(args.map((x, j) => (j === i ? e.target.value : x)))}
+            placeholder="argument"
+            className="flex-1 px-2 py-1 text-xs rounded bg-transparent outline-none font-mono"
+            style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
+          />
+          <button
+            type="button"
+            onClick={() => onChange(args.filter((_, j) => j !== i))}
+            className="p-1.5 rounded hover:bg-foreground/10"
+            style={{ color: 'var(--color-text-tertiary)' }}
+            aria-label="Remove argument"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() => onChange([...args, ''])}
+        className="inline-flex items-center gap-1 text-[11px] self-start"
+        style={{ color: 'var(--color-accent-primary)' }}
+      >
+        <Plus className="h-3 w-3" />
+        Add argument
+      </button>
+    </div>
+  );
+}
+
+interface KeyValueEditorProps {
+  kvs: KV[];
+  onChange: (kvs: KV[]) => void;
+  workspaceId: string;
+  secretNames: string[];
+  onSecretCreated?: (name: string) => void;
+  keyPlaceholder: string;
+}
+
+function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreated, keyPlaceholder }: KeyValueEditorProps) {
+  return (
+    <div className="flex flex-col gap-2">
+      {kvs.map((kv, i) => (
+        <div
+          key={i}
+          className="flex flex-col gap-1.5 p-2 rounded"
+          style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}
+        >
+          <div className="flex gap-1.5">
+            <input
+              type="text"
+              value={kv.key}
+              onChange={(e) => onChange(kvs.map((x, j) => (j === i ? { ...x, key: e.target.value } : x)))}
+              placeholder={keyPlaceholder}
+              className="flex-1 px-2 py-1 text-xs rounded bg-transparent outline-none font-mono"
+              style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
+            />
+            <button
+              type="button"
+              onClick={() => onChange(kvs.filter((_, j) => j !== i))}
+              className="p-1.5 rounded hover:bg-foreground/10"
+              style={{ color: 'var(--color-text-tertiary)' }}
+              aria-label="Remove entry"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <VaultSecretPicker
+            workspaceId={workspaceId}
+            value={kv.value}
+            onChange={(value) => onChange(kvs.map((x, j) => (j === i ? { ...x, value } : x)))}
+            secretNames={secretNames}
+            onSecretCreated={onSecretCreated}
+          />
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() => onChange([...kvs, { key: '', value: '' }])}
+        className="inline-flex items-center gap-1 text-[11px] self-start"
+        style={{ color: 'var(--color-accent-primary)' }}
+      >
+        <Plus className="h-3 w-3" />
+        Add entry
+      </button>
+    </div>
+  );
+}

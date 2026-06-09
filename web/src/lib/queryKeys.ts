@@ -55,4 +55,11 @@ export const queryKeys = {
     list: () => [...queryKeys.memo.all, 'list'],
     read: (key: string) => [...queryKeys.memo.all, 'read', key],
   },
+  mcp: {
+    all:       ['mcp'],
+    // User-level catalog of MCP templates (not workspace-scoped).
+    catalog:   () => [...queryKeys.mcp.all, 'catalog'],
+    // Effective per-workspace server list (builtins + workspace servers).
+    workspace: (wsId: string) => [...queryKeys.mcp.all, 'workspace', wsId],
+  },
 };

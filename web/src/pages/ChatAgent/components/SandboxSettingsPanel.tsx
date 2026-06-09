@@ -11,6 +11,7 @@ import {
   getVaultBlueprints, type VaultBlueprint,
 } from '../utils/api';
 import { api } from '@/api/client';
+import { McpTab } from './mcp/McpTab';
 
 interface SandboxSettingsPanelProps {
   onClose: () => void;
@@ -100,6 +101,10 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
   // Start/stop
   const [actionLoading, setActionLoading] = useState(false);
 
+  // Vault deep-link: an MCP "Set up NAME" affordance switches to the Vault tab
+  // and prefills the add form with that secret name.
+  const [vaultPrefillSecret, setVaultPrefillSecret] = useState<string | null>(null);
+
   useEffect(() => {
     if (!workspaceId) return;
     loadStats();
@@ -186,10 +191,16 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
   const tabs = [
     { key: 'overview', label: 'Overview' },
     { key: 'vault', label: 'Vault' },
+    { key: 'mcp', label: 'MCP' },
     { key: 'storage', label: 'Storage' },
     { key: 'packages', label: 'Packages' },
     { key: 'tools', label: 'Tools & Skills' },
   ];
+
+  function openVaultTab(prefillSecretName?: string) {
+    setVaultPrefillSecret(prefillSecretName ?? null);
+    setActiveTab('vault');
+  }
 
   const isRunning = stats?.state === 'started';
 
@@ -230,7 +241,14 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
             />
           )}
           {activeTab === 'vault' && (
-            <SecretsTab workspaceId={workspaceId} />
+            <SecretsTab
+              workspaceId={workspaceId}
+              prefillSecretName={vaultPrefillSecret}
+              onPrefillConsumed={() => setVaultPrefillSecret(null)}
+            />
+          )}
+          {activeTab === 'mcp' && (
+            <McpTab workspaceId={workspaceId} onOpenVaultTab={openVaultTab} />
           )}
           {activeTab === 'storage' && (
             isRunning ? (
@@ -835,7 +853,14 @@ interface VaultSecret {
   updated_at: string;
 }
 
-function SecretsTab({ workspaceId }: { workspaceId: string }) {
+interface SecretsTabProps {
+  workspaceId: string;
+  /** When set (e.g. via an MCP "Set up NAME" deep-link), opens the add form prefilled. */
+  prefillSecretName?: string | null;
+  onPrefillConsumed?: () => void;
+}
+
+function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: SecretsTabProps) {
   const [secrets, setSecrets] = useState<VaultSecret[]>([]);
   const [blueprints, setBlueprints] = useState<VaultBlueprint[]>([]);
   const [remainingSlots, setRemainingSlots] = useState<number>(MAX_SECRETS);
@@ -909,6 +934,21 @@ function SecretsTab({ workspaceId }: { workspaceId: string }) {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId]);
+
+  // A deep-link from the MCP tab ("Set up NAME") opens the add form prefilled
+  // with the requested secret name, so the user lands ready to paste a value.
+  useEffect(() => {
+    if (!prefillSecretName) return;
+    setError(null);
+    setPresetBlueprint(null);
+    setNewName(prefillSecretName);
+    setNewValue('');
+    setNewDesc('');
+    setShowNewValue(false);
+    setShowAdd(true);
+    onPrefillConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefillSecretName]);
 
   // Safe regex compile for the active preset blueprint. Invalid patterns from a
   // misconfigured agent_config.yaml must not crash the UI — on failure we just
