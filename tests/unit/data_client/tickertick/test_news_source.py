@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
-from src.data_client.tickertick.client import _convert_timestamps
+from src.data_client.tickertick.client import TickerTickClient, _convert_timestamps
 from src.data_client.tickertick.news_source import (
     TickerTickNewsSource,
     _build_query,
@@ -34,6 +35,13 @@ class TestBuildQuery:
 
     def test_multi_ticker_is_or(self):
         assert _build_query(["AAPL", "MSFT"]) == "(or tt:aapl tt:msft)"
+
+    def test_injection_tokens_are_dropped(self):
+        # Tokens carrying DSL operators are ignored, not interpolated into the query.
+        assert _build_query(["AAPL) (or s:cnn"]) == "T:curated"
+        assert _build_query(["AAPL) x", "MSFT"]) == "tt:msft"
+        # Legitimate dotted/hyphenated tickers still pass through.
+        assert _build_query(["BRK.B", "BF-B"]) == "(or tt:brk.b tt:bf-b)"
 
 
 class TestNormalize:
@@ -146,3 +154,34 @@ class TestGetNews:
         )
         await TickerTickNewsSource().get_news(limit=5, cursor="abc-cursor")
         assert captured["last_id"] == "abc-cursor"
+
+
+class TestGetFeedErrors:
+    """The HTTP client wraps transport/status failures in a clear Exception."""
+
+    @pytest.mark.asyncio
+    async def test_http_status_error_wrapped(self, monkeypatch):
+        async def fake_get(self, url, params=None):
+            return httpx.Response(500, request=httpx.Request("GET", url))
+
+        monkeypatch.setattr("httpx.AsyncClient.get", fake_get)
+        async with TickerTickClient() as client:
+            with pytest.raises(Exception, match="TickerTick request failed"):
+                await client.get_feed("T:curated")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("exc", "match"),
+        [
+            (httpx.TimeoutException("slow"), "TickerTick request timed out"),
+            (httpx.ConnectError("down"), "TickerTick request failed"),
+        ],
+    )
+    async def test_transport_error_wrapped(self, monkeypatch, exc, match):
+        async def boom(self, url, params=None):
+            raise exc
+
+        monkeypatch.setattr("httpx.AsyncClient.get", boom)
+        async with TickerTickClient() as client:
+            with pytest.raises(Exception, match=match):
+                await client.get_feed("T:curated")
