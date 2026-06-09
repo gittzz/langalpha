@@ -16,6 +16,19 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 _TEST_URL = "https://example.com"
 _TEST_URL_HTTPBIN = "https://httpbin.org/html"
 
+# Some targets (e.g. httpbin.org) push the crawler past the HTTP-only Tier 1
+# into the patchright/Camoufox browser tiers. Those browsers are installed
+# inside sandboxes at runtime, not in CI — skip such tests when the binary is
+# absent rather than failing on an environment gap.
+_BROWSER_MISSING_MARKERS = ("executable doesn't exist", "playwright install")
+
+
+def _skip_if_no_browser(text: str | None) -> None:
+    if text and any(marker in text.lower() for marker in _BROWSER_MISSING_MARKERS):
+        pytest.skip(
+            "scrapling browser tier (patchright/Camoufox) not installed in this environment"
+        )
+
 
 # ---------------------------------------------------------------------------
 # ScraplingCrawler direct tests
@@ -53,7 +66,13 @@ class TestScraplingCrawlerLive:
         from src.tools.crawler.scrapling_crawler import ScraplingCrawler
 
         crawler = ScraplingCrawler()
-        output = await crawler.crawl_with_metadata(_TEST_URL_HTTPBIN)
+        try:
+            output = await crawler.crawl_with_metadata(_TEST_URL_HTTPBIN)
+        except Exception as e:
+            # httpbin.org commonly forces escalation into the browser tiers;
+            # skip if those browsers aren't installed instead of hard-failing.
+            _skip_if_no_browser(str(e))
+            raise
 
         assert output.markdown, "Should return non-empty markdown"
         assert "herman melville" in output.markdown.lower(), (
@@ -130,6 +149,9 @@ class TestSafeCrawlerWrapperLive:
         results = await asyncio.gather(*[wrapper.crawl(url) for url in urls])
 
         for result in results:
+            if not result.success:
+                # httpbin.org may escalate to a browser tier; skip if absent.
+                _skip_if_no_browser(result.error)
             assert result.success, f"Crawl failed: {result.error}"
             assert result.markdown
 
