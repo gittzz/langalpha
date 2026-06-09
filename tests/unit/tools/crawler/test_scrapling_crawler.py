@@ -16,6 +16,7 @@ from src.tools.crawler.scrapling_crawler import (
     _html_to_markdown,
     _needs_browser,
     _needs_stealth,
+    _promote_frontmatter_title,
 )
 
 
@@ -620,3 +621,32 @@ class TestExtractTitle:
         page = MagicMock()
         page.css.side_effect = AttributeError("no css")
         assert _extract_title(page) == ""
+
+
+class TestPromoteFrontmatterTitle:
+    """trafilatura strips the <h1>/title from the body; we promote it back."""
+
+    def test_title_promoted_to_heading(self):
+        # The shape that regressed: <h1> + <p>, title only in metadata.
+        text = "---\ntitle: Herman Melville - Moby-Dick\n---\nAvailing himself of the mild weather."
+        result = _promote_frontmatter_title(text)
+        assert result == "# Herman Melville - Moby-Dick\n\nAvailing himself of the mild weather."
+
+    def test_title_already_in_body_not_duplicated(self):
+        text = "---\ntitle: Q1 Earnings Beat\n---\n# Q1 Earnings Beat\n\nRevenue grew."
+        result = _promote_frontmatter_title(text)
+        assert result.lower().count("q1 earnings beat") == 1
+
+    def test_quoted_title_stripped(self):
+        text = '---\ntitle: "Fed holds rates: what it means"\n---\nThe Fed left rates unchanged.'
+        result = _promote_frontmatter_title(text)
+        assert result.startswith("# Fed holds rates: what it means\n\n")
+
+    def test_frontmatter_without_title_dropped(self):
+        text = "---\nauthor: Jane Doe\n---\nBody text with no title field."
+        result = _promote_frontmatter_title(text)
+        assert result == "Body text with no title field."
+
+    def test_plain_body_passthrough(self):
+        # No frontmatter (e.g. mocked extract returning a bare string) is untouched.
+        assert _promote_frontmatter_title("just markdown body") == "just markdown body"

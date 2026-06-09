@@ -138,8 +138,9 @@ def _financial_figures(text: str) -> set[str]:
 
 
 def _try_trafilatura(html: str) -> Optional[str]:
+    """Extract the main article as markdown, restoring the title trafilatura strips."""
     try:
-        return trafilatura.extract(
+        out = trafilatura.extract(
             html,
             favor_recall=True,
             output_format="markdown",
@@ -147,13 +148,40 @@ def _try_trafilatura(html: str) -> Optional[str]:
             include_images=True,
             include_formatting=True,
             include_tables=True,
+            with_metadata=True,
         )
     except Exception as e:
         logger.debug(f"trafilatura extraction failed: {e}")
         return None
+    return _promote_frontmatter_title(out) if out else out
+
+
+def _promote_frontmatter_title(text: str) -> str:
+    """Lift trafilatura's frontmatter title into a Markdown H1, dropping the rest.
+
+    With `with_metadata`, trafilatura pulls the article title/<h1> out of the body
+    into a YAML frontmatter block; without this a page that is just
+    `<h1>Title</h1><p>body</p>` would extract to body-only and lose the heading.
+    """
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return text
+    block = text[3:end]
+    body = text[end + len("\n---") :].lstrip("\n")
+    title = ""
+    for line in block.splitlines():
+        if line.strip().startswith("title:"):
+            title = line.split("title:", 1)[1].strip().strip('"').strip("'")
+            break
+    if title and title.lower() not in body[: len(title) + 16].lower():
+        return f"# {title}\n\n{body}" if body else f"# {title}"
+    return body
 
 
 def _try_full_page(html: str) -> Optional[str]:
+    """Convert the entire page to markdown via html-to-markdown's Rust core."""
     try:
         return html_to_markdown.convert(html).content
     except Exception as e:
