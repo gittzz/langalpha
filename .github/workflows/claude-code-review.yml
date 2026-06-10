@@ -1,21 +1,40 @@
 name: Claude Code Review
 
-# pull_request_target runs in the BASE-repo context, so the Claude OAuth token
-# is available even for fork PRs. We deliberately do NOT check out the PR head:
-# the review reads the diff via `gh`, and CLAUDE.md comes from the trusted base
-# branch. Fork PRs additionally get a minimal read + `gh pr comment` allowlist
-# (see ALLOWLIST_FORK) so a prompt-injected diff can't reach gh api / pr edit.
+# Split triggers by PR origin:
+#
+# - Same-repo PRs run on `pull_request`. The action's OIDC -> app-token
+#   exchange works there, so reviews post as claude[bot] (Anthropic's backend
+#   rejects OIDC tokens from pull_request_target events with "Invalid OIDC
+#   token" — see anthropics/claude-code-action#713).
+# - Fork PRs run on `pull_request_target`, which executes in the BASE-repo
+#   context so the Claude OAuth token is available. The broken OIDC exchange
+#   is bypassed by passing the run-scoped GITHUB_TOKEN, so fork reviews post
+#   as github-actions[bot]. We deliberately do NOT check out the PR head:
+#   the review reads the diff via `gh`, and CLAUDE.md comes from the trusted
+#   base branch. Fork PRs additionally get a minimal read + `gh pr comment`
+#   allowlist (see ALLOWLIST_FORK) so a prompt-injected diff can't reach
+#   gh api / pr edit.
 on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
   pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened]
 
+# The event name MUST be part of the group: a same-repo PR fires both events,
+# and with a shared group the no-op pull_request_target run would cancel the
+# real pull_request run.
 concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
+  group: claude-review-${{ github.event_name }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   claude-review:
-    if: github.event.pull_request.draft == false
+    # Each event handles exactly one PR origin: pull_request -> same-repo,
+    # pull_request_target -> forks. The mismatched run is skipped.
+    if: |
+      github.event.pull_request.draft == false &&
+      ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+       (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -43,6 +62,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Fork runs (pull_request_target) pass the run-scoped GITHUB_TOKEN so
+          # the action skips the OIDC exchange that Anthropic's backend rejects
+          # for this event (claude-code-action#713). Same-repo runs leave it
+          # empty so the OIDC path mints the claude[bot] app token.
+          github_token: ${{ github.event_name == 'pull_request_target' && secrets.GITHUB_TOKEN || '' }}
           allowed_bots: 'claude[bot]'
           prompt: |
             REPO: ${{ github.repository }}
