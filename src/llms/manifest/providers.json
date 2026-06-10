@@ -132,6 +132,7 @@
           "input": 10.0,
           "cached_input": 1.0,
           "cache_5m": 12.5,
+          "cache_1h": 20.0,
           "output": 50.0,
           "unit": "per_1m_tokens"
         }
@@ -148,6 +149,7 @@
           "input": 5.0,
           "cached_input": 0.5,
           "cache_5m": 6.25,
+          "cache_1h": 10.0,
           "output": 25.0,
           "unit": "per_1m_tokens"
         }
@@ -185,7 +187,7 @@
           ],
           "output_pricing_mode": "input_dependent",
           "cache_5m": 3.75,
-          "cache_1h": 7.5,
+          "cache_1h": 6.0,
           "unit": "per_1m_tokens"
         }
       },
