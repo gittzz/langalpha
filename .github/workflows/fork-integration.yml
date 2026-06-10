@@ -69,7 +69,7 @@ jobs:
       DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
       DAYTONA_BASE_URL: ${{ secrets.DAYTONA_BASE_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           # Pin to the exact head SHA from the event payload (UNTRUSTED fork
           # code — see the SECURITY note above). This is immutable and equals the
@@ -82,7 +82,7 @@ jobs:
           # Don't write the token into .git/config — fork code that runs during
           # `uv sync`/pytest could otherwise read it back and use it.
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: "latest"
       - run: uv sync --group dev --extra test
@@ -90,7 +90,7 @@ jobs:
       # Skip docker-provider sandbox tests; they need GHCR auth + buildx
       # and are owned by the sandbox-integration workflow's docker tier.
       - run: uv run pytest tests/integration/ -v --tb=short -m integration --ignore=tests/integration/sandbox/providers --junitxml=test-results/backend-integration.xml --sandbox-metrics --sandbox-metrics-file test-results/session_metrics.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: backend-integration-fork-results
