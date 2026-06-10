@@ -4,6 +4,9 @@
     "provider": "openai",
     "display_name": "GPT-5.5",
     "visible": true,
+    "speed": 2,
+    "intelligence": 5,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -21,6 +24,9 @@
     "provider": "openai",
     "display_name": "GPT-5.4",
     "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -38,6 +44,9 @@
     "provider": "openai",
     "display_name": "GPT-5.4 Mini",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -55,6 +64,9 @@
     "provider": "openai",
     "display_name": "GPT-5.4 Nano",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -71,6 +83,9 @@
     "model_id": "claude-opus-4-8",
     "provider": "anthropic",
     "visible": true,
+    "speed": 2,
+    "intelligence": 5,
+    "context": 200000,
     "input_modalities": [
       "text",
       "image",
@@ -91,6 +106,9 @@
     "model_id": "claude-sonnet-4-6",
     "provider": "anthropic",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 200000,
     "input_modalities": [
       "text",
       "image",
@@ -107,6 +125,9 @@
     "model_id": "claude-haiku-4-5-20251001",
     "provider": "anthropic",
     "visible": true,
+    "speed": 3,
+    "intelligence": 2,
+    "context": 200000,
     "input_modalities": [
       "text",
       "image",
@@ -123,6 +144,9 @@
     "model_id": "gemini-3.1-pro-preview",
     "provider": "gemini",
     "visible": true,
+    "speed": 4,
+    "intelligence": 5,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -138,6 +162,9 @@
     "model_id": "gemini-3-flash-preview",
     "provider": "gemini",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -153,6 +180,9 @@
     "model_id": "gemini-3.1-flash-lite-preview",
     "provider": "gemini",
     "visible": true,
+    "speed": 5,
+    "intelligence": 1,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -168,6 +198,9 @@
     "model_id": "gemini-3.1-flash-image-preview",
     "provider": "gemini",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 32000,
     "input_modalities": [
       "text",
       "image"
@@ -273,6 +306,9 @@
     "model_id": "doubao-seed-2-0-pro-260215",
     "provider": "volcengine",
     "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image",
@@ -291,6 +327,9 @@
     "model_id": "doubao-seed-2-0-lite-260215",
     "provider": "volcengine",
     "visible": true,
+    "speed": 4,
+    "intelligence": 3,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image",
@@ -309,6 +348,9 @@
     "model_id": "doubao-seed-2-0-mini-260215",
     "provider": "volcengine",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image",
@@ -327,6 +369,9 @@
     "model_id": "doubao-seed-2-0-code-preview-260215",
     "provider": "volcengine",
     "visible": true,
+    "speed": 4,
+    "intelligence": 4,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image",
@@ -345,6 +390,9 @@
     "model_id": "doubao-seed-2-0-pro-260215",
     "provider": "doubao-anthropic",
     "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image",
@@ -360,6 +408,9 @@
     "model_id": "doubao-seed-2-0-lite-260215",
     "provider": "doubao-anthropic",
     "visible": true,
+    "speed": 4,
+    "intelligence": 3,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image",
@@ -375,6 +426,9 @@
     "model_id": "doubao-seed-2-0-mini-260215",
     "provider": "doubao-anthropic",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image",
@@ -390,6 +444,9 @@
     "model_id": "doubao-seed-2-0-code-preview-260215",
     "provider": "doubao-anthropic",
     "visible": true,
+    "speed": 4,
+    "intelligence": 4,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image",
@@ -405,6 +462,9 @@
     "model_id": "deepseek-v4-pro",
     "provider": "deepseek",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 1000000,
     "input_modalities": [
       "text"
     ],
@@ -419,6 +479,9 @@
     "model_id": "deepseek-v4-flash",
     "provider": "deepseek",
     "visible": true,
+    "speed": 3,
+    "intelligence": 3,
+    "context": 1000000,
     "input_modalities": [
       "text"
     ],
@@ -433,6 +496,9 @@
     "model_id": "glm-5.1",
     "provider": "z-ai",
     "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 200000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -447,6 +513,9 @@
     "model_id": "glm-5v-turbo",
     "provider": "z-ai",
     "visible": true,
+    "speed": 2,
+    "intelligence": 3,
+    "context": 200000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -463,6 +532,9 @@
     "model_id": "glm-5-turbo",
     "provider": "z-ai",
     "visible": true,
+    "speed": 2,
+    "intelligence": 3,
+    "context": 200000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -477,6 +549,9 @@
     "model_id": "glm-5-turbo",
     "provider": "z-ai-cn",
     "visible": true,
+    "speed": 2,
+    "intelligence": 3,
+    "context": 200000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -491,6 +566,9 @@
     "model_id": "glm-5.1",
     "provider": "z-ai-cn",
     "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 200000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -505,6 +583,9 @@
     "model_id": "glm-5v-turbo",
     "provider": "z-ai-cn",
     "visible": true,
+    "speed": 2,
+    "intelligence": 3,
+    "context": 200000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -521,6 +602,9 @@
     "model_id": "MiniMax-M3",
     "provider": "minimax",
     "visible": true,
+    "speed": 1,
+    "intelligence": 4,
+    "context": 512000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -536,6 +620,9 @@
     "model_id": "MiniMax-M2.7",
     "provider": "minimax",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 200000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -550,6 +637,9 @@
     "model_id": "MiniMax-M2.7-highspeed",
     "provider": "minimax",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 200000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
@@ -564,6 +654,9 @@
     "model_id": "qwen3.7-max",
     "provider": "dashscope",
     "visible": true,
+    "speed": 4,
+    "intelligence": 5,
+    "context": 1000000,
     "input_modalities": [
       "text"
     ],
@@ -575,6 +668,9 @@
     "model_id": "qwen3.6-plus",
     "provider": "dashscope",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -589,6 +685,9 @@
     "model_id": "qwen3.5-plus",
     "provider": "dashscope",
     "visible": true,
+    "speed": 2,
+    "intelligence": 3,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -602,6 +701,9 @@
     "model_id": "qwen3.5-plus",
     "provider": "dashscope-coding",
     "visible": true,
+    "speed": 2,
+    "intelligence": 3,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -612,6 +714,9 @@
     "model_id": "qwen3.6-flash",
     "provider": "dashscope",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -625,6 +730,9 @@
     "model_id": "qwen3.7-max",
     "provider": "dashscope-intl",
     "visible": true,
+    "speed": 4,
+    "intelligence": 5,
+    "context": 1000000,
     "input_modalities": [
       "text"
     ],
@@ -636,6 +744,9 @@
     "model_id": "qwen3.6-plus",
     "provider": "dashscope-intl",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -650,6 +761,9 @@
     "model_id": "qwen3.5-plus",
     "provider": "dashscope-intl",
     "visible": true,
+    "speed": 2,
+    "intelligence": 3,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -663,6 +777,9 @@
     "model_id": "qwen3.6-flash",
     "provider": "dashscope-intl",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
@@ -724,6 +841,9 @@
     "model_id": "kimi-k2.6",
     "provider": "moonshot",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image"
@@ -738,6 +858,9 @@
     "model_id": "kimi-k2.6",
     "provider": "moonshot-coding",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image"
@@ -752,6 +875,9 @@
     "model_id": "kimi-k2.5",
     "provider": "moonshot",
     "visible": true,
+    "speed": 1,
+    "intelligence": 3,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image"
@@ -766,6 +892,9 @@
     "model_id": "kimi-for-coding",
     "provider": "moonshot-coding",
     "visible": true,
+    "speed": 1,
+    "intelligence": 3,
+    "context": 256000,
     "input_modalities": [
       "text",
       "image"
@@ -780,6 +909,9 @@
     "model_id": "gpt-5.3-codex",
     "provider": "codex-oauth",
     "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -800,6 +932,9 @@
     "model_id": "gpt-5.3-codex-spark",
     "provider": "codex-oauth",
     "visible": true,
+    "speed": 5,
+    "intelligence": 4,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -820,6 +955,9 @@
     "model_id": "gpt-5.5",
     "provider": "codex-oauth",
     "visible": true,
+    "speed": 2,
+    "intelligence": 5,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -840,6 +978,9 @@
     "model_id": "gpt-5.4",
     "provider": "codex-oauth",
     "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -860,6 +1001,9 @@
     "model_id": "gpt-5.4-mini",
     "provider": "codex-oauth",
     "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 400000,
     "input_modalities": [
       "text",
       "image",
@@ -880,6 +1024,9 @@
     "model_id": "claude-sonnet-4-6",
     "provider": "claude-oauth",
     "visible": true,
+    "speed": 2,
+    "intelligence": 4,
+    "context": 200000,
     "input_modalities": [
       "text",
       "image",
@@ -896,6 +1043,9 @@
     "model_id": "claude-opus-4-8",
     "provider": "claude-oauth",
     "visible": true,
+    "speed": 2,
+    "intelligence": 5,
+    "context": 200000,
     "input_modalities": [
       "text",
       "image",
@@ -916,6 +1066,9 @@
     "model_id": "claude-haiku-4-5-20251001",
     "provider": "claude-oauth",
     "visible": true,
+    "speed": 3,
+    "intelligence": 2,
+    "context": 200000,
     "input_modalities": [
       "text",
       "image",
@@ -954,6 +1107,9 @@
     "model_id": "claude-opus-4-8",
     "provider": "claude-oauth",
     "visible": true,
+    "speed": 2,
+    "intelligence": 5,
+    "context": 1000000,
     "input_modalities": [
       "text",
       "image",
