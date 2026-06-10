@@ -283,6 +283,47 @@ def find_model_pricing(model_name: str, provider: Optional[str] = None) -> Optio
     return None
 
 
+# Coarse cost tier (1-5) for the model-detail flyout, from blended $/1M tokens
+# (3:1 input:output). Credits are linear in USD (credit_conversion), so this tier
+# reads the same whether the user pays per-token (BYOK) or in credits.
+PRICE_TIER_BANDS = [(8.0, 5), (4.0, 4), (1.5, 3), (0.5, 2), (0.0, 1)]
+
+
+def _representative_rate(pricing: Dict[str, Any], flat_key: str, tier_key: str) -> Optional[float]:
+    """A single $/1M rate for tiering: the flat rate, else the base (first) tier.
+
+    Base tier is deliberate: it's the standard-context rate nearly all requests
+    pay; long-context surcharge tiers are excluded from the headline cost dot.
+    """
+    if pricing.get(flat_key) is not None:
+        return pricing[flat_key]
+    tiers = pricing.get(tier_key)
+    if tiers:
+        return tiers[0].get('rate')
+    return None
+
+
+def get_price_tier(model_name: str, provider: Optional[str] = None) -> Optional[int]:
+    """Map a model's canonical providers.json pricing to a 1-5 cost tier.
+
+    Resolves pricing through :func:`find_model_pricing` (provider→parent fallback,
+    aliases, tiered rates). Returns None when no price is known so the flyout omits
+    the row. Blends input/output 3:1 then buckets via ``PRICE_TIER_BANDS``.
+    """
+    pricing = find_model_pricing(model_name, provider)
+    if not pricing:
+        return None
+    pin = _representative_rate(pricing, 'input', 'input_tiers')
+    pout = _representative_rate(pricing, 'output', 'output_tiers')
+    if pin is None or pout is None:
+        return None
+    blended = pin * 0.75 + pout * 0.25
+    for lo, tier in PRICE_TIER_BANDS:
+        if blended >= lo:
+            return tier
+    return 1
+
+
 def calculate_tiered_cost(tokens: int, tiers: List[Dict[str, Any]]) -> float:
     """
     Calculate cost for tiered pricing based on cumulative token count.

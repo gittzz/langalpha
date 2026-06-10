@@ -151,7 +151,7 @@ class ModelConfig:
             return parent_info.get("display_name", parent.title())
         return provider.title()
 
-    def get_model_metadata(self) -> dict[str, dict[str, str | int]]:
+    def get_model_metadata(self) -> dict[str, dict[str, Any]]:
         """Return {model_key: {sdk, provider, access_type, ...}} for all visible models."""
         result = {}
         for model_name, model_info in self.llm_config.items():
@@ -161,10 +161,28 @@ class ModelConfig:
             provider_info = self.get_provider_info(provider)
             sdk = provider_info.get("sdk", "unknown")
             access_type = provider_info.get("access_type", "api_key")
-            entry: dict[str, str | int] = {"sdk": sdk, "provider": provider, "access_type": access_type}
+            entry: dict[str, Any] = {"sdk": sdk, "provider": provider, "access_type": access_type}
             # Only include tier when explicitly set — absence means "not platform-managed"
             if "tier" in model_info:
                 entry["tier"] = model_info["tier"]
+            # Optional editorial metadata for the model-detail flyout. Additive —
+            # only surfaced for models that authored it in models.json; the
+            # frontend renders only the rows that are present.
+            for key in (
+                "speed",
+                "intelligence",
+                "context",
+                "input_modalities",
+            ):
+                if key in model_info:
+                    entry[key] = model_info[key]
+            # Cost tier (1-5) derived live from canonical providers.json pricing —
+            # not stored in models.json, so it auto-syncs when prices change.
+            from .pricing_utils import get_price_tier
+
+            price_tier = get_price_tier(model_info.get("model_id", model_name), provider)
+            if price_tier is not None:
+                entry["price"] = price_tier
             # Mark variants that require their own API key (different env_key from parent).
             # e.g. z-ai-cn needs ZAI_CN_API_KEY, not ZAI_API_KEY.
             parent_provider = provider_info.get("parent_provider")
