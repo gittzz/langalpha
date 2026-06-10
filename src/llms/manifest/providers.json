@@ -731,6 +731,40 @@
         }
       },
       {
+        "id": "qwen3.7-plus",
+        "name": "Qwen3.7 Plus",
+        "is_reasoning": true,
+        "description": "Alibaba's Qwen3.7 Plus — cost-efficient multimodal model with upgraded vision-language and agentic coding, GUI operation, and 1M context",
+        "context_window": 1000000,
+        "max_output": 65536,
+        "pricing": {
+          "input_tiers": [
+            {
+              "max_tokens": 256000,
+              "rate": 0.286,
+              "cached_input": 0.057
+            },
+            {
+              "max_tokens": 1000000,
+              "rate": 0.857,
+              "cached_input": 0.171
+            }
+          ],
+          "output_tiers": [
+            {
+              "max_tokens": 256000,
+              "rate": 1.143
+            },
+            {
+              "max_tokens": 1000000,
+              "rate": 3.429
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
+          "unit": "per_1m_tokens"
+        }
+      },
+      {
         "id": "qwen3.6-plus",
         "name": "Qwen3.6 Plus",
         "is_reasoning": true,
@@ -983,6 +1017,40 @@
           "cached_input": 0.535,
           "cache_5m": 3.346,
           "output": 8.03,
+          "unit": "per_1m_tokens"
+        }
+      },
+      {
+        "id": "qwen3.7-plus",
+        "name": "Qwen3.7 Plus (SG)",
+        "is_reasoning": true,
+        "description": "Alibaba's Qwen3.7 Plus — Singapore international region",
+        "context_window": 1000000,
+        "max_output": 65536,
+        "pricing": {
+          "input_tiers": [
+            {
+              "max_tokens": 256000,
+              "rate": 0.428,
+              "cached_input": 0.086
+            },
+            {
+              "max_tokens": 1000000,
+              "rate": 1.285,
+              "cached_input": 0.257
+            }
+          ],
+          "output_tiers": [
+            {
+              "max_tokens": 256000,
+              "rate": 1.713
+            },
+            {
+              "max_tokens": 1000000,
+              "rate": 5.139
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
           "unit": "per_1m_tokens"
         }
       },
