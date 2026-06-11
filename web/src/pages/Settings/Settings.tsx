@@ -22,7 +22,18 @@ import { useAllModels } from '@/hooks/useAllModels';
 import type { CompactionProfileName } from '@/hooks/useAllModels';
 import { useDebouncedSave } from '@/hooks/useDebouncedSave';
 import { isSupported, setLocaleCookie } from '@/lib/locale';
+import { isPlatformMode } from '@/config/hostMode';
 import './Settings.css';
+
+// Keep in sync with the backend SEARCH_PROVIDER_MIN_TIER (src/config/env.py).
+// Enforcement happens server-side at resolve time; this only drives the UI state.
+const SEARCH_PROVIDER_MIN_TIER = 1;
+
+const SEARCH_PROVIDERS = [
+  { value: 'tavily', label: 'Tavily' },
+  { value: 'serper', label: 'Serper' },
+  { value: 'bocha', label: 'Bocha' },
+];
 
 interface CodexDeviceCode {
   user_code: string;
@@ -97,6 +108,7 @@ function Settings() {
   const [fetchModel, setFetchModel] = useState('');
   const [fallbackModels, setFallbackModels] = useState<string[]>([]);
   const [compactionProfile, setCompactionProfile] = useState<CompactionProfileName | ''>('');
+  const [searchProvider, setSearchProvider] = useState('');
 
   // Custom Models state
   const [customModels, setCustomModels] = useState<CustomModelEntry[]>([]);
@@ -262,6 +274,12 @@ function Settings() {
           ? rawProfile
           : '',
       );
+      const rawSearchProvider = otherPref?.search_provider;
+      setSearchProvider(
+        SEARCH_PROVIDERS.some(p => p.value === rawSearchProvider)
+          ? (rawSearchProvider as string)
+          : '',
+      );
       setCodexOAuthStatus(codexStatus || { connected: false });
       setClaudeOAuthStatus(claudeStatus || { connected: false });
     } catch {
@@ -269,16 +287,21 @@ function Settings() {
     }
   };
 
+  // Search provider is a paid-tier perk in platform mode; OSS is ungated.
+  // Server enforces this at resolve time — the disabled state is UX only.
+  const canCustomizeSearchProvider =
+    !isPlatformMode || (authUser?.access_tier ?? -1) >= SEARCH_PROVIDER_MIN_TIER;
+
   // Refs to hold latest model state for the debounced save callback
   const modelStateRef = useRef({
     preferredModel, preferredFlashModel, starredModels, customModels,
     compactionModel, fetchModel, fallbackModels, byokProviders,
-    compactionProfile,
+    compactionProfile, searchProvider, canCustomizeSearchProvider,
   });
   modelStateRef.current = {
     preferredModel, preferredFlashModel, starredModels, customModels,
     compactionModel, fetchModel, fallbackModels, byokProviders,
-    compactionProfile,
+    compactionProfile, searchProvider, canCustomizeSearchProvider,
   };
 
   const saveModelPrefs = useCallback(async () => {
@@ -311,12 +334,15 @@ function Settings() {
         fetch_model: s.fetchModel ? cleanModelRef(s.fetchModel) : null,
         fallback_models: cleanFallback,
         compaction_profile: s.compactionProfile || null,
+        // Omitted when gated: JSONB merge then leaves the stored key untouched,
+        // so unrelated saves don't re-persist a value the user can't edit and
+        // the pref survives for a later re-upgrade.
+        ...(s.canCustomizeSearchProvider ? { search_provider: s.searchProvider || null } : {}),
       },
     });
   }, [validModelNames, updatePrefsMutation]);
 
   const { trigger: triggerModelSave, status: modelSaveStatus } = useDebouncedSave(saveModelPrefs, 500);
-
 
   const handleCodexConnectClick = () => {
     setShowCodexDisclaimer(true);
@@ -1103,6 +1129,32 @@ function Settings() {
                     </div>
                   </div>
                 )}
+                </div>
+
+                {/* Web search provider */}
+                <div className="flex flex-col gap-1.5" style={{ marginTop: '16px' }}>
+                  <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                    {t('settings.searchProvider', 'Web Search Provider')}
+                  </label>
+                  <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('settings.searchProviderDesc', 'Search engine the agent uses for web searches.')}
+                  </p>
+                  <Select
+                    value={searchProvider}
+                    onChange={(e) => { setSearchProvider(e.target.value); triggerModelSave(); }}
+                    disabled={!canCustomizeSearchProvider}
+                    aria-label={t('settings.searchProvider', 'Web Search Provider')}
+                  >
+                    <option value="">{t('settings.searchProviderDefault', 'Default')}</option>
+                    {SEARCH_PROVIDERS.map(p => (
+                      <option key={p.value} value={p.value}>{p.label}</option>
+                    ))}
+                  </Select>
+                  {!canCustomizeSearchProvider && (
+                    <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                      {t('settings.searchProviderUpgradeHint', 'Choosing a search provider is available on paid plans.')}
+                    </p>
+                  )}
                 </div>
               </div>
 
