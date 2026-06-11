@@ -1532,34 +1532,7 @@
       "display_name": "Ollama"
     }
   },
-  "infrastructure_pricing": {
-    "TavilySearchTool": {
-      "credits_per_use": 16,
-      "search_type": "advanced"
-    },
-    "TavilySearchImages": {
-      "credits_per_use": 16,
-      "search_type": "advanced"
-    },
-    "BochaSearchTool": {
-      "credits_per_use": 8,
-      "search_type": "ai_search",
-      "pricing_note": "0.06 RMB per call"
-    },
-    "SerperSearchTool": {
-      "credits_per_use": 1,
-      "search_type": "web_search",
-      "pricing_note": "$0.001 per query ($50/50k credits)"
-    },
-    "TavilyResearchMini": {
-      "credits_per_use": 880,
-      "search_type": "research_mini"
-    },
-    "TavilyResearchPro": {
-      "credits_per_use": 2000,
-      "search_type": "research_pro"
-    }
-  },
+  "infrastructure_pricing": {},
   "credit_conversion": {
     "usd_to_credits_rate": 1000,
     "description": "Conversion rate from USD to credits (1 USD = 1000 credits)"

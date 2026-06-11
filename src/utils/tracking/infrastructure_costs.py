@@ -6,11 +6,12 @@ This module provides functions to:
 2. Calculate infrastructure costs based on usage
 3. Convert costs to credits for unified billing
 
-Pricing is loaded from providers.json at module initialization (single source of truth).
-Currently tracks external paid search services defined in manifest:
-- TavilySearchTool
-- TavilySearchImages
-- BochaSearchTool
+Pricing is merged from two manifests at module initialization:
+- src/tools/manifest/search_providers.json — web-search providers (per depth
+  level, keyed "TrackingName:depth" plus a bare "TrackingName" legacy key) and
+  auxiliary search tools (images, research).
+- src/llms/manifest/providers.json `infrastructure_pricing` — any remaining
+  non-search infrastructure entries. Search-manifest keys win on collision.
 
 Free tools (DuckDuckGo, Arxiv) and internal operations (cache, storage, filesystem)
 are not charged and will result in 0 credits.
@@ -28,15 +29,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def _load_pricing_from_manifest() -> Dict[str, Any]:
+def _load_legacy_pricing_from_manifest() -> Dict[str, Any]:
     """
-    Load infrastructure pricing from providers.json at module initialization.
+    Load non-search infrastructure pricing from providers.json.
 
-    Returns:
-        Pricing configuration dict with tool class names as keys
-
-    Raises:
-        RuntimeError: If manifest file not found or pricing section missing
+    An absent or empty `infrastructure_pricing` section is fine (search
+    pricing has moved to the search manifest); a missing or unparseable
+    file is still a loud startup failure.
     """
     import json
 
@@ -57,25 +56,45 @@ def _load_pricing_from_manifest() -> Dict[str, Any]:
             f"Failed to load infrastructure pricing from {manifest_path}: {e}"
         )
 
-    # Extract infrastructure_pricing section
-    infra_pricing = manifest.get("infrastructure_pricing")
+    return manifest.get("infrastructure_pricing") or {}
 
-    if not infra_pricing:
-        raise RuntimeError(
-            f"No 'infrastructure_pricing' section found in {manifest_path}. "
-            f"Pricing configuration is required."
-        )
+
+def _build_pricing_table() -> Dict[str, Any]:
+    """
+    Merge search-manifest pricing with any remaining legacy entries.
+
+    For each search provider, every depth level registers a qualified key
+    ("TavilySearchTool:deep") plus a bare key priced at the provider's
+    default depth (covers legacy/unqualified usage counts). The search
+    manifest wins over legacy providers.json entries on key collision.
+    """
+    from src.tools.search_manifest import get_auxiliary_search_pricing, get_search_providers
+
+    pricing: Dict[str, Any] = dict(_load_legacy_pricing_from_manifest())
+
+    for spec in get_search_providers().values():
+        for depth in spec.depths:
+            pricing[f"{spec.tracking_name}:{depth.name}"] = {
+                "credits_per_use": depth.credits_per_use,
+                "search_type": depth.name,
+            }
+        default = spec.default_depth_spec
+        pricing[spec.tracking_name] = {
+            "credits_per_use": default.credits_per_use,
+            "search_type": default.name,
+        }
+
+    pricing.update(get_auxiliary_search_pricing())
 
     logger.info(
-        f"Loaded infrastructure pricing from manifest: "
-        f"{len(infra_pricing)} services configured"
+        f"Loaded infrastructure pricing: {len(pricing)} entries "
+        f"(search manifest + legacy providers.json)"
     )
+    return pricing
 
-    return infra_pricing
 
-
-# Load pricing from manifest at module import (single source of truth)
-INFRASTRUCTURE_PRICING = _load_pricing_from_manifest()
+# Load pricing from manifests at module import (single source of truth)
+INFRASTRUCTURE_PRICING = _build_pricing_table()
 
 # Service name mapping (tool class names → user-friendly service names)
 TOOL_TO_SERVICE_MAPPING = {
@@ -154,18 +173,25 @@ def calculate_infrastructure_credits(
 
         total_credits += tool_credits
 
-        # Map tool name to service name
+        # Map tool name to service name. Depth-qualified keys share a service
+        # with the bare key, so accumulate instead of overwriting.
         service_name = _map_tool_to_service(tool_name)
+        prior = services.get(service_name, {})
 
         # Build service entry
         service_entry = {
-            "usage_count": count,
-            "total_credits": round(tool_credits, 6)
+            "usage_count": count + prior.get("usage_count", 0),
+            "total_credits": round(tool_credits + prior.get("total_credits", 0.0), 6)
         }
 
-        # Add pricing details for transparency
+        # Add pricing details for transparency. When depth-qualified keys with
+        # different rates land on one service, omit the per-use figure rather
+        # than report whichever key iterated last.
         if "credits_per_use" in pricing:
-            service_entry["credits_per_use"] = pricing["credits_per_use"]
+            if prior.get("usage_count", 0) == 0:
+                service_entry["credits_per_use"] = pricing["credits_per_use"]
+            elif prior.get("credits_per_use") == pricing["credits_per_use"]:
+                service_entry["credits_per_use"] = pricing["credits_per_use"]
         elif "credits_per_1k_ops" in pricing:
             service_entry["credits_per_1k_ops"] = pricing["credits_per_1k_ops"]
         elif "credits_per_op" in pricing:
@@ -183,13 +209,17 @@ def _map_tool_to_service(tool_name: str) -> str:
     """
     Map tool class names to user-friendly service names.
 
+    Depth-qualified tracking keys ("TavilySearchTool:deep") map to the same
+    service as their bare base key, preserving analytics continuity.
+
     Args:
         tool_name: Tool class name (e.g., "TavilySearchTool")
 
     Returns:
         Service name (e.g., "tavily_search")
     """
-    return TOOL_TO_SERVICE_MAPPING.get(tool_name, tool_name.lower())
+    base_name = tool_name.split(":", 1)[0]
+    return TOOL_TO_SERVICE_MAPPING.get(base_name, base_name.lower())
 
 
 
@@ -220,11 +250,17 @@ def format_infrastructure_usage(tool_usage: Dict[str, int]) -> Dict[str, Any]:
         service_name = _map_tool_to_service(tool_name)
         pricing = INFRASTRUCTURE_PRICING.get(tool_name, {})
 
-        service_entry = {"count": count}
+        prior = services.get(service_name, {})
+        service_entry = {"count": count + prior.get("count", 0)}
 
-        # Add metadata from pricing
-        if "search_type" in pricing:
+        # Add metadata from pricing (the depth name for search providers).
+        # On the rare multi-depth collision, the larger count's type wins.
+        if "type" in prior and prior.get("count", 0) >= count:
+            service_entry["type"] = prior["type"]
+        elif "search_type" in pricing:
             service_entry["type"] = pricing["search_type"]
+        elif "type" in prior:
+            service_entry["type"] = prior["type"]
 
         services[service_name] = service_entry
 

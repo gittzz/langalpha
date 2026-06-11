@@ -13,70 +13,6 @@ from src.tools.search_services.tavily.tavily_search_api_wrapper import (
 
 logger = logging.getLogger(__name__)
 
-# Module-level configuration
-_api_wrapper: Optional[TavilySearchWrapper] = None
-_max_results: int = 10
-_default_time_range: Optional[str] = None
-_verbose: bool = True
-_search_depth: str = "advanced"
-_include_domains: Optional[List[str]] = None
-_exclude_domains: Optional[List[str]] = None
-_include_answer: bool = False
-_include_favicon: bool = True
-_country: Optional[str] = None
-
-
-def _get_api_wrapper() -> TavilySearchWrapper:
-    """Get or create the API wrapper instance."""
-    global _api_wrapper
-    if _api_wrapper is None:
-        _api_wrapper = TavilySearchWrapper(country=_country)
-    return _api_wrapper
-
-
-def configure(
-    max_results: int = 10,
-    default_time_range: Optional[str] = None,
-    verbose: bool = True,
-    search_depth: str = "advanced",
-    include_domains: Optional[List[str]] = None,
-    exclude_domains: Optional[List[str]] = None,
-    include_answer: bool = False,
-    include_favicon: bool = True,
-    country: Optional[str] = None,
-) -> None:
-    """Configure the Tavily search tool settings.
-
-    Args:
-        max_results: Maximum number of search results to return.
-        default_time_range: Default time range filter (d/w/m/y or day/week/month/year).
-            Used as fallback if LLM doesn't specify time_range in query.
-        verbose: Control verbosity of search results.
-            True (default): Include images (raw_content always disabled).
-            False: Text-only results without images (lightweight for planning).
-        search_depth: Search depth - "basic" or "advanced" (default).
-        include_domains: List of domains to include in search.
-        exclude_domains: List of domains to exclude from search.
-        include_answer: Whether to include Tavily's answer in results.
-        include_favicon: Whether to include favicon URLs in artifact.
-        country: Country for localized results (lowercase, e.g., "united states").
-            Only valid for topic="general". Examples: "china", "japan", "germany".
-    """
-    global _api_wrapper, _max_results, _default_time_range, _verbose, _search_depth
-    global _include_domains, _exclude_domains, _include_answer, _include_favicon
-    global _country
-
-    _max_results = max_results
-    _default_time_range = default_time_range
-    _verbose = verbose
-    _search_depth = search_depth
-    _include_domains = include_domains or []
-    _exclude_domains = exclude_domains or []
-    _include_answer = include_answer
-    _include_favicon = include_favicon
-    _country = country
-    _api_wrapper = None  # Reset wrapper to pick up new country config
-
 
 def _validate_date_format(date_str: Optional[str]) -> Optional[str]:
     """Validate date format is YYYY-MM-DD."""
@@ -129,101 +65,142 @@ def _filter_artifact_for_frontend(raw_results: Dict) -> Dict:
     return filtered
 
 
-@tool(response_format="content_and_artifact")
-async def web_search(
-    query: str,
-    time_range: Optional[Literal["day", "week", "month", "year", "d", "w", "m", "y"]] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    topic: Optional[Literal["general", "news", "finance"]] = "general",
-) -> Tuple[Union[List[Dict[str, Any]], str], Dict[str, Any]]:
-    """Search the web for current information, news, and facts.
+def build_web_search_tool(
+    max_results: int = 10,
+    default_time_range: Optional[str] = None,
+    verbose: bool = True,
+    search_depth: str = "basic",
+    include_domains: Optional[List[str]] = None,
+    exclude_domains: Optional[List[str]] = None,
+    include_answer: bool = False,
+    include_favicon: bool = True,
+    country: Optional[str] = None,
+):
+    """Build a per-request Tavily web_search tool.
 
-    Use when you need to:
-    - Find recent news or current events
-    - Look up facts, statistics, or real-time data
-    - Research topics beyond your knowledge cutoff
-    - Verify or update information
+    Each call returns a fresh tool whose settings live in closure scope, so
+    concurrent requests with different settings (e.g. per-user search depth)
+    can't race. The API wrapper is created lazily inside the tool call so a
+    missing TAVILY_API_KEY surfaces as a per-call error, not a build crash.
 
     Args:
-        query: Search query to look up
-        time_range: Filter by recency - 'day'/'d' (24h), 'week'/'w' (7d),
-            'month'/'m' (30d), 'year'/'y' (365d).
-            Ignored if start_date or end_date is provided.
-        start_date: Start date for results (YYYY-MM-DD format).
-            Takes priority over time_range.
-        end_date: End date for results (YYYY-MM-DD format).
-            Takes priority over time_range.
-        topic: Search topic - 'general' (default), 'news', or 'finance'
+        max_results: Maximum number of search results to return.
+        default_time_range: Default time range filter (d/w/m/y or day/week/month/year).
+            Used as fallback if LLM doesn't specify time_range in query.
+        verbose: Control verbosity of search results.
+            True (default): Include images (raw_content always disabled).
+            False: Text-only results without images (lightweight for planning).
+        search_depth: Tavily search depth - "ultra-fast", "fast", "basic"
+            (default), or "advanced".
+        include_domains: List of domains to include in search.
+        exclude_domains: List of domains to exclude from search.
+        include_answer: Whether to include Tavily's answer in results.
+        include_favicon: Whether to include favicon URLs in artifact.
+        country: Country for localized results (lowercase, e.g., "united states").
+            Only valid for topic="general". Examples: "china", "japan", "germany".
     """
-    try:
-        # Validate date formats
-        _validate_date_format(start_date)
-        _validate_date_format(end_date)
+    include_domains = include_domains or []
+    exclude_domains = exclude_domains or []
+    state: Dict[str, Optional[TavilySearchWrapper]] = {"wrapper": None}
 
-        # Prioritization logic: dates > LLM time_range > default_time_range
-        effective_time_range = None
-        effective_start_date = None
-        effective_end_date = None
+    def _get_api_wrapper() -> TavilySearchWrapper:
+        if state["wrapper"] is None:
+            state["wrapper"] = TavilySearchWrapper(country=country)
+        return state["wrapper"]
 
-        if start_date or end_date:
-            # Use dates if provided (highest priority)
-            effective_start_date = start_date
-            effective_end_date = end_date
-            logger.debug(
-                f"Using date range: start_date={start_date}, end_date={end_date} "
-                f"(ignoring time_range={time_range}, default={_default_time_range})"
+    @tool(response_format="content_and_artifact")
+    async def web_search(
+        query: str,
+        time_range: Optional[Literal["day", "week", "month", "year", "d", "w", "m", "y"]] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        topic: Optional[Literal["general", "news", "finance"]] = "general",
+    ) -> Tuple[Union[List[Dict[str, Any]], str], Dict[str, Any]]:
+        """Search the web for current information, news, and facts.
+
+        Use when you need to:
+        - Find recent news or current events
+        - Look up facts, statistics, or real-time data
+        - Research topics beyond your knowledge cutoff
+        - Verify or update information
+
+        Args:
+            query: Search query to look up
+            time_range: Filter by recency - 'day'/'d' (24h), 'week'/'w' (7d),
+                'month'/'m' (30d), 'year'/'y' (365d).
+                Ignored if start_date or end_date is provided.
+            start_date: Start date for results (YYYY-MM-DD format).
+                Takes priority over time_range.
+            end_date: End date for results (YYYY-MM-DD format).
+                Takes priority over time_range.
+            topic: Search topic - 'general' (default), 'news', or 'finance'
+        """
+        try:
+            # Validate date formats
+            _validate_date_format(start_date)
+            _validate_date_format(end_date)
+
+            # Prioritization logic: dates > LLM time_range > default_time_range
+            effective_time_range = None
+            effective_start_date = None
+            effective_end_date = None
+
+            if start_date or end_date:
+                # Use dates if provided (highest priority)
+                effective_start_date = start_date
+                effective_end_date = end_date
+                logger.debug(
+                    f"Using date range: start_date={start_date}, end_date={end_date} "
+                    f"(ignoring time_range={time_range}, default={default_time_range})"
+                )
+            else:
+                # Use LLM-provided time_range, or fall back to default
+                effective_time_range = time_range or default_time_range
+                logger.debug(
+                    f"Using time_range: {effective_time_range} "
+                    f"(LLM: {time_range}, default: {default_time_range})"
+                )
+
+            # Verbosity control: determine what to include based on verbose
+            # Always disable raw_content to reduce response size
+            include_raw_content = False
+            if verbose:
+                include_images = True
+                include_image_descriptions = True
+                logger.debug("Verbose mode: including images (raw_content disabled)")
+            else:
+                include_images = False
+                include_image_descriptions = False
+                logger.debug("Lightweight mode: text-only results")
+
+            api = _get_api_wrapper()
+            raw_results = await api.raw_results(
+                query,
+                max_results,
+                search_depth,
+                include_domains,
+                exclude_domains,
+                include_answer,
+                include_raw_content,
+                include_images,
+                include_image_descriptions,
+                include_favicon=include_favicon,
+                time_range=effective_time_range,
+                start_date=effective_start_date,
+                end_date=effective_end_date,
+                topic=topic,
             )
-        else:
-            # Use LLM-provided time_range, or fall back to default
-            effective_time_range = time_range or _default_time_range
-            logger.debug(
-                f"Using time_range: {effective_time_range} "
-                f"(LLM: {time_range}, default: {_default_time_range})"
-            )
 
-        # Verbosity control: determine what to include based on _verbose (set at configure)
-        # Always disable raw_content to reduce response size
-        include_raw_content = False
-        if _verbose:
-            include_images = True
-            include_image_descriptions = True
-            logger.debug("Verbose mode: including images (raw_content disabled)")
-        else:
-            include_images = False
-            include_image_descriptions = False
-            logger.debug("Lightweight mode: text-only results")
+            cleaned_results = await api.clean_results_with_images(raw_results)
+            logger.debug(f"Tavily search completed: {len(cleaned_results)} results")
 
-        api = _get_api_wrapper()
-        raw_results = await api.raw_results(
-            query,
-            _max_results,
-            _search_depth,
-            _include_domains,
-            _exclude_domains,
-            _include_answer,
-            include_raw_content,
-            include_images,
-            include_image_descriptions,
-            include_favicon=_include_favicon,
-            time_range=effective_time_range,
-            start_date=effective_start_date,
-            end_date=effective_end_date,
-            topic=topic,
-        )
+            # Filter artifact to remove duplicated content fields
+            filtered_artifact = _filter_artifact_for_frontend(raw_results)
 
-        cleaned_results = await api.clean_results_with_images(raw_results)
-        logger.debug(f"Tavily search completed: {len(cleaned_results)} results")
+            return cleaned_results, filtered_artifact
 
-        # Filter artifact to remove duplicated content fields
-        filtered_artifact = _filter_artifact_for_frontend(raw_results)
+        except Exception as e:
+            logger.error(f"Tavily search failed: {e}", exc_info=True)
+            return repr(e), {"error": str(e), "query": query}
 
-        return cleaned_results, filtered_artifact
-
-    except Exception as e:
-        logger.error(f"Tavily search failed: {e}", exc_info=True)
-        return repr(e), {"error": str(e), "query": query}
-
-
-# Backwards compatibility alias
-TavilySearchTool = web_search
+    return web_search

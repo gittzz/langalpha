@@ -1,10 +1,38 @@
 import logging
 from typing import Optional
 
-from src.config import SearchEngine, SELECTED_SEARCH_ENGINE
+from src.config import SELECTED_SEARCH_ENGINE
 from src.tools.decorators import create_logged_tool
+from src.tools.search_manifest import get_search_provider_spec, get_search_providers
 
 logger = logging.getLogger(__name__)
+
+
+def _build_tavily(**kwargs):
+    from src.tools.search_services.tavily import build_web_search_tool
+
+    return build_web_search_tool(**kwargs)
+
+
+def _build_serper(**kwargs):
+    from src.tools.search_services.serper import build_web_search_tool
+
+    return build_web_search_tool(**kwargs)
+
+
+def _build_bocha(**kwargs):
+    from src.tools.search_services.bocha import build_web_search_tool
+
+    return build_web_search_tool(**kwargs)
+
+
+# Provider name -> tool builder. Adding a provider = one entry here, one
+# provider module with build_web_search_tool, one manifest entry.
+_PROVIDER_BUILDERS = {
+    "tavily": _build_tavily,
+    "serper": _build_serper,
+    "bocha": _build_bocha,
+}
 
 
 def get_web_search_tool(
@@ -12,6 +40,7 @@ def get_web_search_tool(
     time_range: Optional[str] = None,
     verbose: bool = True,
     provider: Optional[str] = None,
+    depth: Optional[str] = None,
 ):
     """Get web search tool with verbosity and time range control.
 
@@ -25,51 +54,45 @@ def get_web_search_tool(
             False: Exclude images (lightweight for planning).
         provider: Search engine override (per-user preference). Falls back to
             the deployment default (SELECTED_SEARCH_ENGINE) when unset or invalid.
+        depth: Depth level name from the provider's manifest entry. Falls back
+            to the provider's default_depth when unset or not offered.
     """
     engine = provider or SELECTED_SEARCH_ENGINE
-    if engine != SELECTED_SEARCH_ENGINE and engine not in {e.value for e in SearchEngine}:
+    if engine != SELECTED_SEARCH_ENGINE and engine not in get_search_providers():
         logger.warning(
             "Unknown search provider %r; falling back to default %r", engine, SELECTED_SEARCH_ENGINE
         )
         engine = SELECTED_SEARCH_ENGINE
 
-    if engine == SearchEngine.SERPER.value:
-        from src.tools.search_services.serper import configure as configure_serper
-        from src.tools.search_services.serper import web_search as serper_web_search
-
-        configure_serper(
-            max_results=max_search_results,
-            default_time_range=time_range,
-        )
-        return create_logged_tool(serper_web_search, name="WebSearch", tracking_name="SerperSearchTool")
-
-    elif engine == SearchEngine.TAVILY.value:
-        from src.tools.search_services.tavily import configure as configure_tavily
-        from src.tools.search_services.tavily import web_search as tavily_web_search
-
-        configure_tavily(
-            max_results=max_search_results,
-            default_time_range=time_range,
-            verbose=verbose,
-        )
-        return create_logged_tool(tavily_web_search, name="WebSearch", tracking_name="TavilySearchTool")
-
-    elif engine == SearchEngine.BOCHA.value:
-        from src.tools.search_services.bocha import configure as configure_bocha
-        from src.tools.search_services.bocha import web_search as bocha_web_search
-
-        configure_bocha(
-            max_results=max_search_results,
-            default_time_range=time_range,
-            verbose=verbose,
-        )
-        return create_logged_tool(bocha_web_search, name="WebSearch", tracking_name="BochaSearchTool")
-
-    else:
+    spec = get_search_provider_spec(engine)
+    if spec is None or engine not in _PROVIDER_BUILDERS:
         raise ValueError(
             f"Unsupported search engine: {engine}. "
-            f"Supported engines: {[e.value for e in SearchEngine]}"
+            f"Supported engines: {sorted(set(get_search_providers()) & set(_PROVIDER_BUILDERS))}"
         )
+
+    depth_spec = spec.depth(depth) or spec.default_depth_spec
+    if depth and depth_spec.name != depth:
+        logger.debug(
+            "Search depth %r not offered by provider %r; using default %r",
+            depth, engine, depth_spec.name,
+        )
+
+    tool_fn = _PROVIDER_BUILDERS[engine](
+        max_results=max_search_results,
+        default_time_range=time_range,
+        verbose=verbose,
+        **depth_spec.native_params,
+    )
+
+    # Depth-qualified billing key for multi-depth providers so each level
+    # bills at its own rate; single-depth providers keep the bare key.
+    tracking_name = (
+        f"{spec.tracking_name}:{depth_spec.name}"
+        if len(spec.depths) > 1
+        else spec.tracking_name
+    )
+    return create_logged_tool(tool_fn, name="WebSearch", tracking_name=tracking_name)
 
 
 def get_research_tool():

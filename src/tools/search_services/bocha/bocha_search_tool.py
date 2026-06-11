@@ -10,44 +10,9 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from langchain_core.tools import tool
 
-from src.tools.search_services.bocha import BochaAPI
+from src.tools.search_services.bocha.bocha import BochaAPI
 
 logger = logging.getLogger(__name__)
-
-# Module-level configuration
-_api_wrapper: Optional[BochaAPI] = None
-_max_results: int = 10
-_default_time_range: Optional[str] = None
-_verbose: bool = True
-
-
-def _get_api_wrapper() -> BochaAPI:
-    """Get or create the API wrapper instance."""
-    global _api_wrapper
-    if _api_wrapper is None:
-        _api_wrapper = BochaAPI()
-    return _api_wrapper
-
-
-def configure(
-    max_results: int = 10,
-    default_time_range: Optional[str] = None,
-    verbose: bool = True,
-) -> None:
-    """Configure the Bocha search tool settings.
-
-    Args:
-        max_results: Maximum number of search results to return.
-        default_time_range: Default time range filter (d/w/m/y or day/week/month/year).
-            Used as fallback if LLM doesn't specify time_range in query.
-        verbose: Control verbosity of search results.
-            True (default): Include images in results.
-            False: Exclude images, return webpage results only (lightweight for planning).
-    """
-    global _max_results, _default_time_range, _verbose
-    _max_results = max_results
-    _default_time_range = default_time_range
-    _verbose = verbose
 
 
 def _translate_time_to_freshness(
@@ -185,130 +150,155 @@ def _filter_artifact_for_frontend(raw_data: Dict[str, Any], verbose: bool) -> Di
     return filtered
 
 
-@tool(response_format="content_and_artifact")
-async def web_search(
-    query: str,
-    time_range: Optional[Literal["day", "week", "month", "year", "d", "w", "m", "y"]] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-) -> Tuple[Union[List[Dict[str, Any]], str], Dict[str, Any]]:
-    """Search the web for current information, news, and facts.
+def build_web_search_tool(
+    max_results: int = 10,
+    default_time_range: Optional[str] = None,
+    verbose: bool = True,
+):
+    """Build a per-request Bocha web_search tool.
 
-    Use when you need to:
-    - Find recent news or current events
-    - Look up facts, statistics, or real-time data
-    - Research topics beyond your knowledge cutoff
-    - Verify or update information
+    Each call returns a fresh tool whose settings live in closure scope, so
+    concurrent requests with different settings can't race. The API wrapper is
+    created lazily inside the tool call so a missing BOCHA_API_KEY surfaces as
+    a per-call error, not a build crash.
 
     Args:
-        query: Search query to look up (supports Chinese and English)
-        time_range: Filter results by relative time from now.
-            'day'/'d' = past 24 hours, 'week'/'w' = past week,
-            'month'/'m' = past month, 'year'/'y' = past year.
-            Ignored if start_date or end_date is provided.
-        start_date: Start date for filtering results (YYYY-MM-DD format).
-            Returns results from this date onwards.
-        end_date: End date for filtering results (YYYY-MM-DD format).
-            Returns results up to this date.
+        max_results: Maximum number of search results to return.
+        default_time_range: Default time range filter (d/w/m/y or day/week/month/year).
+            Used as fallback if LLM doesn't specify time_range in query.
+        verbose: Control verbosity of search results.
+            True (default): Include images in results.
+            False: Exclude images, return webpage results only (lightweight for planning).
     """
-    try:
-        # Validate date formats
-        _validate_date_format(start_date)
-        _validate_date_format(end_date)
+    state: Dict[str, Optional[BochaAPI]] = {"wrapper": None}
 
-        # Apply default time_range if LLM didn't specify one
-        effective_time_range = time_range or _default_time_range
-        if effective_time_range != time_range:
-            logger.debug(
-                f"Using default time_range: {effective_time_range} "
-                f"(LLM: {time_range}, default: {_default_time_range})"
+    def _get_api_wrapper() -> BochaAPI:
+        if state["wrapper"] is None:
+            state["wrapper"] = BochaAPI()
+        return state["wrapper"]
+
+    @tool(response_format="content_and_artifact")
+    async def web_search(
+        query: str,
+        time_range: Optional[Literal["day", "week", "month", "year", "d", "w", "m", "y"]] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Tuple[Union[List[Dict[str, Any]], str], Dict[str, Any]]:
+        """Search the web for current information, news, and facts.
+
+        Use when you need to:
+        - Find recent news or current events
+        - Look up facts, statistics, or real-time data
+        - Research topics beyond your knowledge cutoff
+        - Verify or update information
+
+        Args:
+            query: Search query to look up (supports Chinese and English)
+            time_range: Filter results by relative time from now.
+                'day'/'d' = past 24 hours, 'week'/'w' = past week,
+                'month'/'m' = past month, 'year'/'y' = past year.
+                Ignored if start_date or end_date is provided.
+            start_date: Start date for filtering results (YYYY-MM-DD format).
+                Returns results from this date onwards.
+            end_date: End date for filtering results (YYYY-MM-DD format).
+                Returns results up to this date.
+        """
+        try:
+            # Validate date formats
+            _validate_date_format(start_date)
+            _validate_date_format(end_date)
+
+            # Apply default time_range if LLM didn't specify one
+            effective_time_range = time_range or default_time_range
+            if effective_time_range != time_range:
+                logger.debug(
+                    f"Using default time_range: {effective_time_range} "
+                    f"(LLM: {time_range}, default: {default_time_range})"
+                )
+
+            # Translate time parameters to Bocha's freshness format
+            freshness = _translate_time_to_freshness(effective_time_range, start_date, end_date)
+
+            # Execute search via BochaAPI
+            api = _get_api_wrapper()
+            api_results, metadata = await api.web_search(
+                query=query,
+                count=max_results,
+                freshness=freshness,
+                answer=False  # Don't request LLM answer
             )
 
-        # Translate time parameters to Bocha's freshness format
-        freshness = _translate_time_to_freshness(effective_time_range, start_date, end_date)
+            # Build content for LLM (focused, no UI metadata)
+            content: List[Dict[str, Any]] = []
 
-        # Execute search via BochaAPI
-        api = _get_api_wrapper()
-        api_results, metadata = await api.web_search(
-            query=query,
-            count=_max_results,
-            freshness=freshness,
-            answer=False  # Don't request LLM answer
-        )
+            for item in api_results:
+                if item.get("type") == "webpage":
+                    content.append({
+                        "type": "page",
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "content": item.get("summary", ""),  # Primary content for LLM
+                        "publish_time": item.get("publish_time", ""),
+                        "site_name": item.get("site_name", "")  # Source credibility
+                    })
+                elif item.get("type") == "image" and verbose:
+                    # Only include images when verbose=True
+                    content.append({
+                        "type": "image",
+                        "image_url": item.get("content_url", ""),
+                        "image_description": ""  # Bocha doesn't provide descriptions
+                    })
 
-        # Build content for LLM (focused, no UI metadata)
-        content: List[Dict[str, Any]] = []
+            # Build raw data structure with all fields (for artifact filtering)
+            raw_data = {
+                "query": metadata.get("query", query),
+                "response_time": metadata.get("response_time", 0),
+                "total_results": metadata.get("total_results", 0),
+                "results": []
+            }
 
-        for item in api_results:
-            if item.get("type") == "webpage":
-                content.append({
-                    "type": "page",
-                    "title": item.get("title", ""),
-                    "url": item.get("url", ""),
-                    "content": item.get("summary", ""),  # Primary content for LLM
-                    "publish_time": item.get("publish_time", ""),
-                    "site_name": item.get("site_name", "")  # Source credibility
-                })
-            elif item.get("type") == "image" and _verbose:
-                # Only include images when verbose=True
-                content.append({
-                    "type": "image",
-                    "image_url": item.get("content_url", ""),
-                    "image_description": ""  # Bocha doesn't provide descriptions
-                })
+            # Add all fields to raw data
+            for item in api_results:
+                if item.get("type") == "webpage":
+                    raw_data["results"].append({
+                        "type": "webpage",
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "favicon": item.get("site_icon", ""),  # Map site_icon to favicon
+                        "publish_time": item.get("publish_time", ""),
+                        "id": item.get("id", ""),
+                        "snippet": item.get("snippet", ""),
+                        # Include content fields for filtering (will be removed)
+                        "content": item.get("summary", ""),
+                        "summary": item.get("summary", ""),
+                        "site_name": item.get("site_name", "")
+                    })
+                elif item.get("type") == "image":
+                    raw_data["results"].append({
+                        "type": "image",
+                        "image_url": item.get("content_url", ""),
+                        "thumbnail_url": item.get("thumbnail_url", ""),
+                        "source_url": item.get("host_page_url", "")
+                    })
 
-        # Build raw data structure with all fields (for artifact filtering)
-        raw_data = {
-            "query": metadata.get("query", query),
-            "response_time": metadata.get("response_time", 0),
-            "total_results": metadata.get("total_results", 0),
-            "results": []
-        }
+            # Add conversation metadata
+            if "conversation_id" in metadata:
+                raw_data["conversation_id"] = metadata["conversation_id"]
+            if "log_id" in metadata:
+                raw_data["log_id"] = metadata["log_id"]
 
-        # Add all fields to raw data
-        for item in api_results:
-            if item.get("type") == "webpage":
-                raw_data["results"].append({
-                    "type": "webpage",
-                    "title": item.get("title", ""),
-                    "url": item.get("url", ""),
-                    "favicon": item.get("site_icon", ""),  # Map site_icon to favicon
-                    "publish_time": item.get("publish_time", ""),
-                    "id": item.get("id", ""),
-                    "snippet": item.get("snippet", ""),
-                    # Include content fields for filtering (will be removed)
-                    "content": item.get("summary", ""),
-                    "summary": item.get("summary", ""),
-                    "site_name": item.get("site_name", "")
-                })
-            elif item.get("type") == "image":
-                raw_data["results"].append({
-                    "type": "image",
-                    "image_url": item.get("content_url", ""),
-                    "thumbnail_url": item.get("thumbnail_url", ""),
-                    "source_url": item.get("host_page_url", "")
-                })
+            # Filter artifact to remove content duplication
+            artifact = _filter_artifact_for_frontend(raw_data, verbose)
 
-        # Add conversation metadata
-        if "conversation_id" in metadata:
-            raw_data["conversation_id"] = metadata["conversation_id"]
-        if "log_id" in metadata:
-            raw_data["log_id"] = metadata["log_id"]
+            logger.info(f"Bocha AI search completed: {len(content)} items for query '{query[:50]}...'")
+            logger.debug(f"Content structure: {len([c for c in content if c.get('type')=='page'])} pages, "
+                        f"{len([c for c in content if c.get('type')=='image'])} images")
 
-        # Filter artifact to remove content duplication
-        artifact = _filter_artifact_for_frontend(raw_data, _verbose)
+            return content, artifact
 
-        logger.info(f"Bocha AI search completed: {len(content)} items for query '{query[:50]}...'")
-        logger.debug(f"Content structure: {len([c for c in content if c.get('type')=='page'])} pages, "
-                    f"{len([c for c in content if c.get('type')=='image'])} images")
+        except Exception as e:
+            logger.error(f"Bocha AI search failed: {e}", exc_info=True)
+            error_msg = f"Bocha search error: {str(e)}"
+            return error_msg, {"error": str(e), "query": query}
 
-        return content, artifact
-
-    except Exception as e:
-        logger.error(f"Bocha AI search failed: {e}", exc_info=True)
-        error_msg = f"Bocha search error: {str(e)}"
-        return error_msg, {"error": str(e), "query": query}
-
-
-# Backwards compatibility alias
-BochaSearchTool = web_search
+    return web_search

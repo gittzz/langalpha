@@ -1,11 +1,9 @@
 """Serper search service integration."""
 
 from .serper import SerperAPI
-from .serper_search_tool import SerperSearchTool, configure, web_search
+from .serper_search_tool import build_web_search_tool
 
 __all__ = [
     "SerperAPI",
-    "SerperSearchTool",
-    "configure",
-    "web_search",
+    "build_web_search_tool",
 ]
