@@ -80,16 +80,20 @@ class TestManifestRegression:
         # Stable across calls (deterministic).
         assert h == sandbox._compute_user_mcp_config_hash()
 
-    def test_user_mcp_config_hash_ignores_literal_secret_values(self):
-        """Hash never embeds literal values — rotating a literal (non-vault)
-        value under the same key does not churn the manifest."""
+    def test_user_mcp_config_hash_changes_on_literal_value(self):
+        """Rotating a literal (non-vault) value under the same key MUST churn the
+        manifest — the regenerated client embeds that literal, so a stale value
+        would otherwise never re-upload. Stored values are vault-ref strings or
+        non-secret literals (e.g. ``MODE=prod`` -> ``staging``), never a resolved
+        secret, so hashing them leaks nothing (regression: literal edits were
+        silently ignored)."""
         c1 = _make_config(
             servers=[
                 _user(
                     "notes",
                     transport="http",
                     url="https://example.test/mcp",
-                    headers={"Authorization": "literal-old"},
+                    headers={"X-Mode": "prod"},
                 )
             ]
         )
@@ -99,13 +103,13 @@ class TestManifestRegression:
                     "notes",
                     transport="http",
                     url="https://example.test/mcp",
-                    headers={"Authorization": "literal-new"},
+                    headers={"X-Mode": "staging"},
                 )
             ]
         )
         assert (
             _make_sandbox(c1)._compute_user_mcp_config_hash()
-            == _make_sandbox(c2)._compute_user_mcp_config_hash()
+            != _make_sandbox(c2)._compute_user_mcp_config_hash()
         )
 
     def test_user_mcp_config_hash_changes_on_vault_ref_retarget(self):

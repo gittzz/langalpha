@@ -54,7 +54,10 @@ class TestBuiltinByteStability:
         assert "_load_vault" not in code
         assert "_VAULT_SECRETS_FILE" not in code
         assert "_build_proc_env" not in code
+        assert "_resolve_cmd_args" not in code
         assert "def discover(" not in code
+        # The stdio cmd stays the byte-identical raw-args form.
+        assert 'cmd = [config["command"]] + config["args"]' in code
 
     def test_builtin_stdio_uses_os_environ(self):
         gen = ToolFunctionGenerator()
@@ -118,6 +121,55 @@ class TestVaultOnlyResolution:
         with pytest.raises(RuntimeError) as exc:
             ns["_build_proc_env"](ns["_SERVER_CONFIGS"]["user_srv"], "user_srv")
         assert "NEEDED_NAME" in str(exc.value)
+
+    def test_args_vault_ref_resolved_at_spawn(self, tmp_path):
+        # A ${vault:NAME} ref in args (e.g. from an imported `--api-key=...`)
+        # resolves vault-only at spawn — never left as a literal placeholder.
+        workdir = _write_vault(tmp_path, {"API_KEY": "resolved-secret"})
+        gen = ToolFunctionGenerator()
+        server = MCPServerConfig(
+            name="user_srv",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@scope/pkg", "--api-key=${vault:API_KEY}"],
+            source="workspace",
+        )
+        ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
+        resolved = ns["_resolve_cmd_args"](ns["_SERVER_CONFIGS"]["user_srv"], "user_srv")
+        assert resolved == ["-y", "@scope/pkg", "--api-key=resolved-secret"]
+
+    def test_args_missing_secret_raises_naming_secret_not_value(self, tmp_path):
+        workdir = _write_vault(tmp_path, {})  # empty vault
+        gen = ToolFunctionGenerator()
+        server = MCPServerConfig(
+            name="user_srv",
+            transport="stdio",
+            command="npx",
+            args=["--token=${vault:NEEDED_ARG_SECRET}"],
+            source="workspace",
+        )
+        ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
+        with pytest.raises(RuntimeError) as exc:
+            ns["_resolve_cmd_args"](ns["_SERVER_CONFIGS"]["user_srv"], "user_srv")
+        assert "NEEDED_ARG_SECRET" in str(exc.value)
+
+    def test_args_discovery_secretless_does_not_raise(self, tmp_path):
+        # Secret-less discovery (default) must tolerate an unresolved arg ref —
+        # it becomes an inert placeholder, never an exception on the probe path.
+        workdir = _write_vault(tmp_path, {})
+        gen = ToolFunctionGenerator()
+        server = MCPServerConfig(
+            name="user_srv",
+            transport="stdio",
+            command="npx",
+            args=["--api-key=${vault:API_KEY}"],
+            source="workspace",
+        )
+        ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
+        out = ns["_resolve_cmd_args"](
+            ns["_SERVER_CONFIGS"]["user_srv"], "user_srv", discovery=True
+        )
+        assert isinstance(out, list) and len(out) == 1
 
 
 class TestPerServerScoping:

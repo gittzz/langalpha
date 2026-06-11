@@ -69,6 +69,11 @@ describe('mcpSchemas — URL policy', () => {
     ['private 172.16', 'https://172.16.0.1/mcp'],
     ['link-local metadata', 'https://169.254.169.254/latest/meta-data'],
     ['unspecified', 'https://0.0.0.0/mcp'],
+    ['decimal-int loopback', 'https://2130706433/mcp'],
+    ['hex loopback', 'https://0x7f000001/mcp'],
+    ['octal-octet loopback', 'https://0177.0.0.1/mcp'],
+    ['short-dotted loopback', 'https://127.1/mcp'],
+    ['decimal-int metadata', 'https://2852039166/mcp'],
     ['ipv6 loopback', 'https://[::1]/mcp'],
     ['vault smuggle', 'https://example.com/${vault:TOKEN}'],
   ])('rejects %s', (_label, url) => {

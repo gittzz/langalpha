@@ -374,6 +374,21 @@ class TestDiscoveryFingerprint:
             self._srv(args=["b"])
         )
 
+    def test_changes_when_literal_env_value_changes(self):
+        # A literal (non-vault) env value affects the spawned server's behavior
+        # AND the generated client, so editing it MUST re-verify + re-upload
+        # (regression: literal MODE=prod -> staging was silently ignored).
+        a = self._srv(env={"MODE": "prod"})
+        b = self._srv(env={"MODE": "staging"})
+        assert mcp_discovery_fingerprint(a) != mcp_discovery_fingerprint(b)
+
+    def test_changes_when_literal_header_value_changes(self):
+        a = self._srv(transport="http", command=None,
+                      url="https://api.example.com/mcp", headers={"X-Mode": "prod"})
+        b = self._srv(transport="http", command=None,
+                      url="https://api.example.com/mcp", headers={"X-Mode": "staging"})
+        assert mcp_discovery_fingerprint(a) != mcp_discovery_fingerprint(b)
+
     def test_changes_on_vault_ref_retarget_same_key(self):
         # Pointing a header at a different vault secret changes what discovery
         # may send — must re-verify. Names only; literal values never hashed.

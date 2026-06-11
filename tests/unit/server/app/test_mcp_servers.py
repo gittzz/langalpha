@@ -640,6 +640,54 @@ async def test_import_creates_and_extracts_secret(client):
 
 
 @pytest.mark.asyncio
+async def test_import_extracts_secret_in_args(client):
+    """A credential in stdio args (``--api-key=TOKEN``) is vaulted on import and
+    the arg rewritten to a ${vault:NAME} ref — never stored/echoed in plaintext
+    (the generated client resolves the ref vault-only at spawn)."""
+    ws = _ws()
+    base = _agent_config([_builtin("builtin_search")])
+    insert = AsyncMock(
+        side_effect=lambda w, name, config=None: {
+            "name": name, "source": "workspace", "enabled": True,
+        }
+    )
+    create_secret = AsyncMock()
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.get_workspace_servers_and_version", new=AsyncMock(return_value=([], 8))),
+        patch("src.server.app.mcp_servers.get_workspace_secret_names", new=AsyncMock(return_value=set())),
+        patch("src.server.app.mcp_servers.create_secret_db", new=create_secret),
+        patch("src.server.app.mcp_servers.insert_workspace_server", new=insert),
+        patch("src.server.app.mcp_servers._push_vault_to_sandbox", new=AsyncMock()),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/import",
+            json={
+                "mcpServers": {
+                    "my-tool": {
+                        "command": "npx",
+                        "args": ["-y", "@foo/bar", "--api-key=EXAMPLE-OPAQUE-TOKEN-1234567890"],
+                    }
+                }
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["created"] == 1
+    assert body["secrets_created"] == ["MY_TOOL_API_KEY"]
+    create_secret.assert_awaited_once()
+    sec_args, _ = create_secret.await_args
+    assert sec_args[2] == "EXAMPLE-OPAQUE-TOKEN-1234567890"
+    # The arg now references the vault; the raw token is gone from config + response.
+    _, ins_kwargs = insert.await_args
+    assert ins_kwargs["config"]["args"] == [
+        "-y", "@foo/bar", "--api-key=${vault:MY_TOOL_API_KEY}"
+    ]
+    assert "EXAMPLE-OPAQUE-TOKEN-1234567890" not in resp.text
+
+
+@pytest.mark.asyncio
 async def test_import_dedupes_identical_token_across_servers(client):
     ws = _ws()
     base = _agent_config([])

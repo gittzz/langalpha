@@ -131,6 +131,12 @@ def test_url_accepts_public_https():
         "https://127.0.0.1/mcp",  # loopback
         "https://169.254.169.254/latest/meta-data",  # link-local metadata
         "https://100.64.0.1/mcp",  # CGNAT 100.64/10 (not is_global)
+        "https://2130706433/mcp",  # decimal-int 127.0.0.1 (inet_aton form)
+        "https://0x7f000001/mcp",  # hex 127.0.0.1
+        "https://0177.0.0.1/mcp",  # octal-octet 127.0.0.1
+        "https://127.1/mcp",  # short-dotted 127.0.0.1
+        "https://2852039166/mcp",  # decimal-int 169.254.169.254 metadata
+        "https://[::ffff:169.254.169.254]/mcp",  # ipv4-mapped metadata
         "https://[::1]/mcp",  # ipv6 loopback
         "https://localhost/mcp",  # localhost
         "https://svc.local/mcp",  # *.local
