@@ -152,6 +152,10 @@ class BackgroundTask:
     per_call_records: list[dict[str, Any]] = field(default_factory=list)
     """Token usage records collected when subagent completes."""
 
+    tool_usage: dict[str, int] = field(default_factory=dict)
+    """Billing-keyed infrastructure tool usage (e.g. "TavilySearchTool:deep" → 2),
+    snapshotted from the per-task ToolUsageTracker when the subagent completes."""
+
     collector_response_id: str | None = None
     """Response ID of the collector that claimed this task for persistence.
     Set atomically during the _mark_completed filter to prevent two collectors

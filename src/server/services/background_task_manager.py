@@ -896,6 +896,7 @@ class BackgroundTaskManager:
 
         for task in tasks:
             task.per_call_records = []
+            task.tool_usage = {}
             task.asyncio_task = None
             task.handler_task = None
             if cache is not None:
@@ -1247,7 +1248,12 @@ class BackgroundTaskManager:
                     # None branch in the next deploy.
                     if t.spawned_run_id is not None and t.spawned_run_id != run_id:
                         continue
-                    if t.is_pending or t.captured_event_count > 0 or t.per_call_records:
+                    if (
+                        t.is_pending
+                        or t.captured_event_count > 0
+                        or t.per_call_records
+                        or t.tool_usage
+                    ):
                         t.collector_response_id = response_id
                         tasks_to_collect.append(t)
             if tasks_to_collect:
@@ -1722,21 +1728,54 @@ class BackgroundTaskManager:
     ) -> None:
         """Persist each subagent's token usage as a separate row with msg_type='task'."""
         from src.server.services.persistence.usage import UsagePersistenceService
+        from src.server.services.background_registry_store import BackgroundRegistryStore
 
-        tasks_with_records = [t for t in tasks if t.per_call_records]
-        if not tasks_with_records:
+        # Snapshot-and-clear usage under the registry lock, gated on still
+        # owning the task (collector_response_id == response_id). A resume
+        # clears that field, so a stale collector that re-claimed the same task
+        # at turn-N end skips here while turn-N+1's collector bills the merged
+        # usage exactly once — no double-persist across the resume window.
+        bg_registry = await BackgroundRegistryStore.get_instance().get_registry(thread_id)
+
+        claimed: list[tuple[Any, list, dict]] = []
+        if bg_registry is not None:
+            async with bg_registry._lock:
+                for task in tasks:
+                    if task.collector_response_id != response_id:
+                        continue
+                    if not (task.per_call_records or task.tool_usage):
+                        continue
+                    records = task.per_call_records
+                    tool_usage = task.tool_usage
+                    task.per_call_records = []
+                    task.tool_usage = {}
+                    claimed.append((task, records, tool_usage))
+        else:
+            for task in tasks:
+                if not (task.per_call_records or task.tool_usage):
+                    continue
+                records = task.per_call_records
+                tool_usage = task.tool_usage
+                task.per_call_records = []
+                task.tool_usage = {}
+                claimed.append((task, records, tool_usage))
+
+        if not claimed:
             return
 
         persisted_count = 0
 
-        for task in tasks_with_records:
+        for task, records, tool_usage in claimed:
             try:
                 usage_service = UsagePersistenceService(
                     thread_id=thread_id,
                     workspace_id=workspace_id,
                     user_id=user_id,
                 )
-                await usage_service.track_llm_usage(task.per_call_records)
+                await usage_service.track_llm_usage(records)
+
+                if tool_usage:
+                    usage_service.record_tool_usage_batch(tool_usage)
 
                 if usage_service._token_usage is not None:
                     usage_service._token_usage["task_id"] = task.task_id
@@ -1759,7 +1798,7 @@ class BackgroundTaskManager:
                 )
 
         if persisted_count:
-            total_records = sum(len(t.per_call_records) for t in tasks_with_records)
+            total_records = sum(len(records) for _, records, _ in claimed)
             logger.info(
                 f"[SubagentUsage] Persisted {persisted_count} subagent usage row(s) "
                 f"({total_records} LLM calls) for response_id={response_id} "
