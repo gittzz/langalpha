@@ -1,14 +1,16 @@
 import React, { useCallback, useMemo, useState } from 'react';
-import { X, Plus, Trash2, Loader2, Zap } from 'lucide-react';
+import { X, Plus, Trash2, Loader2, Zap, ClipboardPaste } from 'lucide-react';
 import { VaultSecretPicker } from './VaultSecretPicker';
 import { McpDiscoverResult } from './McpDiscoverResult';
+import { parseMcpServersJson } from './mcpImport';
 import {
   ALLOWED_COMMANDS,
   EXPOSURE_MODES,
   TRANSPORTS,
+  collectVaultRefs,
   validateMcpServer,
 } from './mcpSchemas';
-import type { McpServerInput, McpDiscoveryResult, EffectiveServer } from '../../utils/api';
+import { formatApiErrorDetail, type McpServerInput, type McpDiscoveryResult, type EffectiveServer } from '../../utils/api';
 
 /**
  * Create/edit modal for a workspace (or catalog) MCP server.
@@ -27,8 +29,18 @@ type Transport = (typeof TRANSPORTS)[number];
 type Exposure = (typeof EXPOSURE_MODES)[number];
 
 interface KV {
+  /** Stable React key — rows hold stateful children (VaultSecretPicker), so we
+   *  must key on identity, not array index, or deleting a middle row leaks the
+   *  picker's draft/mode onto its neighbor. */
+  id: string;
   key: string;
   value: string;
+}
+
+let _kvSeq = 0;
+function nextKvId(): string {
+  _kvSeq += 1;
+  return `kv-${_kvSeq}`;
 }
 
 function kvsToMap(kvs: KV[]): Record<string, string> {
@@ -37,6 +49,10 @@ function kvsToMap(kvs: KV[]): Record<string, string> {
     if (key.trim()) out[key.trim()] = value;
   }
   return out;
+}
+
+function mapToKVs(m: Record<string, string>): KV[] {
+  return Object.entries(m).map(([key, value]) => ({ id: nextKvId(), key, value }));
 }
 
 export interface McpServerModalProps {
@@ -88,10 +104,54 @@ export function McpServerModal({
   const [exposure, setExposure] = useState<Exposure>(
     (initial?.tool_exposure_mode as Exposure) ?? 'summary',
   );
+  const [discoveryUsesSecrets, setDiscoveryUsesSecrets] = useState<boolean>(
+    initial?.discovery_uses_secrets ?? false,
+  );
 
   const [errors, setErrors] = useState<Array<{ path: string; message: string }>>([]);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<McpDiscoveryResult | null>(null);
+
+  // Paste-to-fill: parse a standard mcpServers blob and fill the form from its
+  // first server. Inline secrets land as literal values the user can vault via
+  // the picker (bulk "Import JSON" auto-extracts them instead).
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [pasteNote, setPasteNote] = useState<string | null>(null);
+
+  function applyPaste() {
+    const res = parseMcpServersJson(pasteText);
+    const first = res.servers.find((s) => !s.error) ?? res.servers[0];
+    if (res.error || !first || first.error) {
+      setPasteNote(res.error ?? first?.error ?? 'No server found in the pasted config.');
+      return;
+    }
+    setName(first.name);
+    setTransport(first.transport);
+    setCommand(first.command || 'npx');
+    setArgs(first.args);
+    setUrl(first.url);
+    setEnv(mapToKVs(first.env));
+    setHeaders(mapToKVs(first.headers));
+    if (first.description) setDescription(first.description);
+    if (first.instruction) setInstruction(first.instruction);
+    setExposure(first.toolExposureMode);
+    setErrors([]);
+    const extra = res.servers.length - 1;
+    setPasteNote(
+      extra > 0
+        ? `Filled "${first.name}". ${extra} more in the blob — use Import JSON to add all.`
+        : `Filled from "${first.name}".`,
+    );
+    setPasteOpen(false);
+  }
+
+  // An authenticated remote server needs its header even to list tools, so
+  // discovery must resolve secrets — the toggle is forced on for it (the backend
+  // enforces the same; this just keeps the UI honest).
+  const remoteAuthForcesDiscoverySecrets =
+    transport !== 'stdio' && collectVaultRefs(kvsToMap(headers)).length > 0;
+  const effectiveDiscoverySecrets = discoveryUsesSecrets || remoteAuthForcesDiscoverySecrets;
 
   const buildPayload = useCallback((): McpServerInput => {
     const base: McpServerInput = {
@@ -100,12 +160,13 @@ export function McpServerModal({
       description,
       instruction,
       tool_exposure_mode: exposure,
+      discovery_uses_secrets: effectiveDiscoverySecrets,
     };
     if (transport === 'stdio') {
       return { ...base, command, args, env: kvsToMap(env) };
     }
     return { ...base, url: url.trim(), headers: kvsToMap(headers) };
-  }, [name, transport, command, args, url, env, headers, description, instruction, exposure]);
+  }, [name, transport, command, args, url, env, headers, description, instruction, exposure, effectiveDiscoverySecrets]);
 
   const validation = useMemo(() => validateMcpServer(buildPayload()), [buildPayload]);
 
@@ -133,11 +194,10 @@ export function McpServerModal({
       const res = await onDiscover(buildPayload());
       setTestResult(res);
     } catch (err) {
-      const e = err as { response?: { data?: { detail?: string } }; message?: string };
       setTestResult({
         status: 'error',
         tools: [],
-        error: e?.response?.data?.detail || e?.message || 'Discovery failed',
+        error: formatApiErrorDetail(err),
       });
     } finally {
       setTesting(false);
@@ -178,6 +238,57 @@ export function McpServerModal({
         </h3>
 
         <div className="flex flex-col gap-4 overflow-y-auto" style={{ flex: 1, minHeight: 0 }}>
+          {/* Paste-to-fill (add mode only) */}
+          {!isEdit && (
+            <div className="flex flex-col gap-2 p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)' }}>
+              {!pasteOpen ? (
+                <button
+                  type="button"
+                  onClick={() => { setPasteOpen(true); setPasteNote(null); }}
+                  className="inline-flex items-center gap-1.5 text-[11px] self-start"
+                  style={{ color: 'var(--color-accent-primary)' }}
+                >
+                  <ClipboardPaste className="h-3.5 w-3.5" />
+                  Paste from JSON config
+                </button>
+              ) : (
+                <>
+                  <textarea
+                    value={pasteText}
+                    onChange={(e) => setPasteText(e.target.value)}
+                    placeholder={'{ "mcpServers": { "my-server": { "command": "npx", "args": ["-y", "pkg"] } } }'}
+                    rows={4}
+                    spellCheck={false}
+                    className="w-full px-2 py-1.5 text-[11px] rounded bg-transparent outline-none font-mono resize-none"
+                    style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
+                  />
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={applyPaste}
+                      disabled={!pasteText.trim()}
+                      className="px-2.5 py-1 text-[11px] rounded transition-colors disabled:opacity-50"
+                      style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+                    >
+                      Fill form
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setPasteOpen(false); setPasteText(''); setPasteNote(null); }}
+                      className="px-2.5 py-1 text-[11px] rounded transition-colors hover:bg-foreground/10"
+                      style={{ color: 'var(--color-text-tertiary)' }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </>
+              )}
+              {pasteNote && (
+                <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>{pasteNote}</p>
+              )}
+            </div>
+          )}
+
           {/* Name */}
           <Field label="Name">
             <input
@@ -331,6 +442,35 @@ export function McpServerModal({
             </div>
           </Field>
 
+          {/* Discovery secret usage */}
+          <Field
+            label="Tool discovery"
+            hint={
+              remoteAuthForcesDiscoverySecrets
+                ? 'This server has an authenticated header, so discovery must use your secrets to list its tools.'
+                : 'Off (default): tool discovery runs without your vault secrets. Turn on only if this server needs authentication to list its tools.'
+            }
+          >
+            <label
+              className="flex items-center gap-2 text-sm"
+              style={{
+                color: 'var(--color-text-primary)',
+                cursor: remoteAuthForcesDiscoverySecrets ? 'not-allowed' : 'pointer',
+                opacity: remoteAuthForcesDiscoverySecrets ? 0.7 : 1,
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={effectiveDiscoverySecrets}
+                disabled={remoteAuthForcesDiscoverySecrets}
+                onChange={(e) => setDiscoveryUsesSecrets(e.target.checked)}
+                className="h-4 w-4 rounded"
+                style={{ accentColor: 'var(--color-accent-primary)' }}
+              />
+              Use my secrets during discovery
+            </label>
+          </Field>
+
           {/* Test connection result */}
           {testResult && <McpDiscoverResult result={testResult} />}
 
@@ -343,16 +483,20 @@ export function McpServerModal({
 
         {/* Footer actions */}
         <div className="flex items-center justify-between gap-2 pt-4 mt-2 border-t" style={{ borderColor: 'var(--color-border-muted)' }}>
-          {allowDiscover && onDiscover ? (
+          {/* Discovery runs against the PERSISTED server, so it's only offered
+              when editing an existing row — and labelled to make clear it tests
+              the saved config, not unsaved edits in this form. */}
+          {allowDiscover && onDiscover && isEdit ? (
             <button
               type="button"
               onClick={handleTest}
-              disabled={testing || !validation.ok}
+              disabled={testing || saving || !validation.ok}
+              title="Runs discovery against the saved server. Save first to test edits."
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
               style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
             >
               {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
-              Test connection
+              Test saved config
             </button>
           ) : <span />}
 
@@ -387,7 +531,7 @@ function refsToKVs(refs: string[]): KV[] {
   // We can recover the ref form `${vault:NAME}` but not the original key name,
   // so seed each ref under a blank key the user re-labels. Most servers use a
   // single secret, so this is acceptable for v1.
-  return (refs ?? []).map((name) => ({ key: '', value: `\${vault:${name}}` }));
+  return (refs ?? []).map((name) => ({ id: nextKvId(), key: '', value: `\${vault:${name}}` }));
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +604,7 @@ function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreat
     <div className="flex flex-col gap-2">
       {kvs.map((kv, i) => (
         <div
-          key={i}
+          key={kv.id}
           className="flex flex-col gap-1.5 p-2 rounded"
           style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}
         >
@@ -494,7 +638,7 @@ function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreat
       ))}
       <button
         type="button"
-        onClick={() => onChange([...kvs, { key: '', value: '' }])}
+        onClick={() => onChange([...kvs, { id: nextKvId(), key: '', value: '' }])}
         className="inline-flex items-center gap-1 text-[11px] self-start"
         style={{ color: 'var(--color-accent-primary)' }}
       >

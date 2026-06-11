@@ -7,7 +7,7 @@ import {
   useDeleteMcpCatalogServer,
 } from '@/hooks/useMcpServers';
 import { McpServerModal } from './McpServerModal';
-import type { CatalogServer, McpServerInput, EffectiveServer } from '../../utils/api';
+import { formatApiErrorDetail, type CatalogServer, type McpServerInput, type EffectiveServer } from '../../utils/api';
 
 /**
  * The Templates view — the user's reusable MCP catalog. Each template can be
@@ -56,7 +56,7 @@ export function TemplatesView({
   onAddToWorkspace,
   workspaceServerNames,
 }: TemplatesViewProps) {
-  const { data: catalog, isLoading } = useMcpCatalog();
+  const { data: catalog, isLoading, error } = useMcpCatalog();
   const createMutation = useCreateMcpCatalogServer();
   const updateMutation = useUpdateMcpCatalogServer();
   const deleteMutation = useDeleteMcpCatalogServer();
@@ -78,8 +78,7 @@ export function TemplatesView({
       setModalOpen(false);
       setEditing(null);
     } catch (err) {
-      const e = err as { response?: { data?: { detail?: string } }; message?: string };
-      setSubmitError(e?.response?.data?.detail || e?.message || 'Failed to save template');
+      setSubmitError(formatApiErrorDetail(err));
     }
   }
 
@@ -102,7 +101,9 @@ export function TemplatesView({
     );
   }
 
-  const templates = catalog ?? [];
+  const templates = catalog?.servers ?? [];
+  const maxServers = catalog?.max_servers ?? 0;
+  const atCap = maxServers > 0 && templates.length >= maxServers;
 
   return (
     <div className="flex flex-col gap-3">
@@ -113,7 +114,9 @@ export function TemplatesView({
         <button
           type="button"
           onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors"
+          disabled={atCap}
+          title={atCap ? `At ${maxServers}/${maxServers} — delete one first` : undefined}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
           style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
         >
           <Plus className="h-3 w-3" />
@@ -121,7 +124,11 @@ export function TemplatesView({
         </button>
       </div>
 
-      {templates.length === 0 ? (
+      {error ? (
+        <div className="text-xs p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-loss)' }}>
+          {(error as { message?: string })?.message || 'Failed to load templates'}
+        </div>
+      ) : templates.length === 0 ? (
         <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
           No templates yet. Create one to reuse across workspaces.
         </div>

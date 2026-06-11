@@ -3,9 +3,10 @@ import { AlertCircle, CheckCircle2, Clock, Wrench } from 'lucide-react';
 import type { McpDiscoveryResult } from '../../utils/api';
 
 /**
- * Renders the outcome of a discovery probe: the discovered tool list on
- * success, the error text on failure, or a "pending" note when the workspace
- * was stopped and discovery couldn't run yet.
+ * Renders the outcome of a discovery probe: the discovered tool list on a
+ * `connected` success, the error text on failure, or a "pending" note when the
+ * workspace was stopped and discovery couldn't run yet. Any other status falls
+ * through to the connected/tool-list rendering.
  */
 
 interface McpDiscoverResultProps {

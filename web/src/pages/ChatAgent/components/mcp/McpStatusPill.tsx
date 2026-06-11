@@ -3,7 +3,7 @@ import { AlertCircle, CheckCircle2, Clock, KeyRound, MinusCircle, HelpCircle } f
 import type { McpStatus } from '../../utils/api';
 
 /**
- * The status matrix for an effective MCP server row.
+ * The terminal status pill for an effective MCP server row.
  *
  * - connected  → green
  * - error      → red (the row also surfaces the error text)
@@ -12,8 +12,9 @@ import type { McpStatus } from '../../utils/api';
  * - disabled   → muted
  * - unknown    → muted fallback
  *
- * The backend never emits `not_synced`; that transient state is derived on the
- * frontend after a mutation (see `notSynced`) and rendered as its own hint pill.
+ * In-flight states (verifying / applying) are not rendered here — `McpLifecycle`
+ * owns the progressing track and delegates to this pill only for terminal
+ * states.
  */
 
 interface StatusMeta {
@@ -27,37 +28,37 @@ const STATUS_META: Record<McpStatus, StatusMeta> = {
   connected: {
     label: 'Connected',
     color: 'var(--color-profit)',
-    bg: 'var(--color-bg-card)',
+    bg: 'var(--color-profit-soft)',
     icon: CheckCircle2,
   },
   error: {
     label: 'Error',
     color: 'var(--color-loss)',
-    bg: 'var(--color-bg-card)',
+    bg: 'var(--color-loss-soft)',
     icon: AlertCircle,
   },
   needs_secret: {
     label: 'Needs secret',
     color: 'var(--color-warning, #d97706)',
-    bg: 'var(--color-bg-card)',
+    bg: 'var(--color-warning-soft)',
     icon: KeyRound,
   },
   pending: {
     label: 'Pending',
     color: 'var(--color-text-tertiary)',
-    bg: 'var(--color-bg-card)',
+    bg: 'var(--color-bg-default)',
     icon: Clock,
   },
   disabled: {
     label: 'Disabled',
     color: 'var(--color-text-tertiary)',
-    bg: 'var(--color-bg-card)',
+    bg: 'var(--color-bg-default)',
     icon: MinusCircle,
   },
   unknown: {
     label: 'Unknown',
     color: 'var(--color-text-tertiary)',
-    bg: 'var(--color-bg-card)',
+    bg: 'var(--color-bg-default)',
     icon: HelpCircle,
   },
 };
@@ -84,25 +85,6 @@ export function McpStatusPill({ status, enabled }: McpStatusPillProps) {
     >
       <Icon className="h-3 w-3" />
       {meta.label}
-    </span>
-  );
-}
-
-/**
- * Transient frontend-only hint shown on a row right after a successful
- * mutation. The backend applies the change on the next agent run (≤30s), so
- * there is a window where the live config and the DB disagree — this surfaces
- * that to the user. Never derived from a backend status.
- */
-export function NotSyncedHint() {
-  return (
-    <span
-      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded font-medium"
-      style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-card)' }}
-      data-testid="mcp-not-synced"
-    >
-      <Clock className="h-3 w-3" />
-      Not synced — applies shortly (within ~30s)
     </span>
   );
 }

@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { Plus, Loader2, ServerCog } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence } from 'framer-motion';
+import { Plus, ServerCog, Download } from 'lucide-react';
 import {
   useWorkspaceMcpServers,
   useAddWorkspaceMcpServer,
@@ -7,27 +8,48 @@ import {
   useToggleWorkspaceMcpServer,
   useDeleteWorkspaceMcpServer,
   useDiscoverWorkspaceMcpServer,
+  useImportWorkspaceMcpServers,
+  usePromoteMcpServerToTemplate,
+  useMcpCatalog,
+  useDelayedFalse,
 } from '@/hooks/useMcpServers';
-import { getVaultSecrets, type EffectiveServer, type McpServerInput } from '../../utils/api';
+import { toast } from '@/components/ui/use-toast';
+import { formatApiErrorDetail, getVaultSecrets, type EffectiveServer, type McpServerInput } from '../../utils/api';
 import { McpServerRow } from './McpServerRow';
 import { McpServerModal } from './McpServerModal';
+import { McpImportModal } from './McpImportModal';
 import { TemplatesView } from './TemplatesView';
 
 /**
  * The "MCP" tab in the workspace settings panel. Segmented control switches
  * between the effective per-workspace list and the user's template catalog.
  *
- * After any successful mutation (add/edit/toggle/delete/discover-driven change)
- * the affected row shows a transient "not synced — applies shortly" hint, since
- * the backend applies the change on the next agent run (≤30s), not live.
+ * Three UX guarantees this component owns:
+ *  - **Live discovery progress.** A freshly-added (or any `pending`) workspace
+ *    server doesn't sit on a dead "Pending" pill: when the sandbox is running we
+ *    auto-run the synchronous discovery probe (`runDiscover`), so the row shows
+ *    "Verifying…" → resolves to Connected (N tools) / Error / Needs secret. Each
+ *    pending name is probed at most once per mount (the backend debounces too).
+ *    Saving a server also kicks a background warm, so a stopped workspace shows
+ *    "Starting workspace…" and the row resolves once it's up — verify happens
+ *    regardless of whether the sandbox was already running.
+ *  - **Honest apply state.** The backend bumps a `config_version` on every
+ *    mutation and applies it to the running agent in the background; the GET
+ *    response reports the session's `applied_config_version`. We derive `synced`
+ *    (applied ≥ saved) from that — a version-accurate signal that replaces the
+ *    old 30s timer guess. While not yet applied, the row's lifecycle shows
+ *    "Applying to agent…"; once caught up it reads "Ready". We poll while
+ *    anything is still settling (see `useWorkspaceMcpServers`).
+ *  - **Stable order.** Display order is frozen on first load (`orderRef`): new
+ *    servers append, removed ones drop out, but toggling never reorders a row —
+ *    it restyles in place. Order re-sorts only on the next open (remount). This
+ *    kills the "row teleports to the bottom when you switch it off" jank.
  *
  * `onOpenVaultTab` deep-links to the Vault tab (optionally prefilling a secret
  * name) for the needs_secret "Set up NAME" affordance.
  */
 
 type SubView = 'workspace' | 'templates';
-
-const NOT_SYNCED_MS = 30_000;
 
 interface McpTabProps {
   workspaceId: string;
@@ -44,6 +66,16 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   const toggleMutation = useToggleWorkspaceMcpServer(workspaceId);
   const deleteMutation = useDeleteWorkspaceMcpServer(workspaceId);
   const discoverMutation = useDiscoverWorkspaceMcpServer(workspaceId);
+  const importMutation = useImportWorkspaceMcpServers(workspaceId);
+  const promoteMutation = usePromoteMcpServerToTemplate(workspaceId);
+
+  // Template names drive the promote flow: an existing name needs an overwrite
+  // confirm before clobbering. Cheap (60s staleTime), often already warm.
+  const { data: catalogData } = useMcpCatalog();
+  const templateNames = React.useMemo(
+    () => new Set((catalogData?.servers ?? []).map((t) => t.name)),
+    [catalogData],
+  );
 
   // Vault secret names for the picker (loaded lazily; failure is non-fatal).
   const [secretNames, setSecretNames] = useState<string[]>([]);
@@ -63,32 +95,109 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
       .catch(() => {});
   }
 
-  // Transient "not synced" tracking — a set of server names recently mutated.
-  const [notSynced, setNotSynced] = useState<Record<string, number>>({});
-  const flagNotSynced = React.useCallback((name: string) => {
-    setNotSynced((prev) => ({ ...prev, [name]: Date.now() }));
-    setTimeout(() => {
-      setNotSynced((prev) => {
-        const next = { ...prev };
-        delete next[name];
-        return next;
-      });
-    }, NOT_SYNCED_MS);
-  }, []);
-
   // Modal state
   const [modalOpen, setModalOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [editing, setEditing] = useState<EffectiveServer | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [togglingName, setTogglingName] = useState<string | null>(null);
   const [deletingName, setDeletingName] = useState<string | null>(null);
+  // Set when "Save as template" hits an existing template name → confirm overwrite.
+  const [promoteConfirm, setPromoteConfirm] = useState<string | null>(null);
 
-  const servers = data?.servers ?? [];
+  // Memoized so the `?? []` fallback doesn't allocate a fresh array each render
+  // (which would re-fire the order memo + auto-discover effect needlessly).
+  const servers = useMemo(() => data?.servers ?? [], [data]);
   const sandboxRunning = data?.sandbox_running ?? false;
+  // The sandbox is coming up (a proactive apply / workspace entry kicked a warm).
+  // Drives the "Starting workspace…" copy + lets rows show in-progress instead
+  // of "stopped" through the gap.
+  const sandboxWarming = data?.sandbox_warming ?? false;
   const maxServers = data?.max_servers ?? 20;
   const workspaceCount = servers.filter((s) => s.origin === 'workspace').length;
   const atCap = workspaceCount >= maxServers;
   const workspaceServerNames = new Set(servers.map((s) => s.name));
+
+  // Apply axis: the running session has loaded the saved config when its applied
+  // version has caught up to the workspace's config version. Version-accurate —
+  // replaces the old 30s "not synced" timer with the real apply state. Only
+  // meaningful while the sandbox is running (nothing is "live" when it's down).
+  const appliedVersion = data?.applied_config_version ?? null;
+  const configVersion = data?.config_version ?? 0;
+  const syncedNow = sandboxRunning && appliedVersion !== null && appliedVersion >= configVersion;
+  // Anti-flicker: every toggle/add/edit bumps the workspace-wide config_version,
+  // so the apply axis dips out-of-sync for the frame until the background apply
+  // lands — which would flash "Applying to agent…" on EVERY connected row the
+  // instant you toggle one (and churn the toggled row). Hold the synced state
+  // across a fast apply (≈ one poll cycle); a genuinely lagging apply still shows.
+  const synced = useDelayedFalse(syncedNow, 2600);
+
+  // Frozen display order. The backend re-sorts disabled workspace servers to the
+  // bottom, so a naive render makes a row teleport the instant you toggle it
+  // off. We pin each name to the position it first appeared in this mount; new
+  // servers append, removed ones drop, but a toggle only restyles in place. The
+  // order re-sorts on the next open (remount resets the ref).
+  const orderRef = useRef<string[]>([]);
+  const orderedServers = useMemo(() => {
+    const byName = new Map(servers.map((s) => [s.name, s]));
+    const kept = orderRef.current.filter((n) => byName.has(n));
+    const keptSet = new Set(kept);
+    const appended = servers.map((s) => s.name).filter((n) => !keptSet.has(n));
+    const order = [...kept, ...appended];
+    orderRef.current = order;
+    return order.map((n) => byName.get(n)!);
+  }, [servers]);
+
+  // Names with a discovery probe currently in flight → row shows "Checking…".
+  const [checkingNames, setCheckingNames] = useState<Set<string>>(new Set());
+  // Pending names we've already auto-probed this mount (probe once, not on every
+  // refetch). Reset when the workspace changes (panel stays mounted across a
+  // workspace switch) or on unmount.
+  const autoCheckedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    autoCheckedRef.current = new Set();
+    setCheckingNames(new Set());
+  }, [workspaceId]);
+
+  const discoverAsync = discoverMutation.mutateAsync;
+  const runDiscover = useCallback(
+    async (name: string) => {
+      setCheckingNames((prev) => new Set(prev).add(name));
+      try {
+        await discoverAsync(name);
+      } catch {
+        // The error surfaces as the row's status (error) after the refetch;
+        // no toast needed for an inline probe.
+      } finally {
+        setCheckingNames((prev) => {
+          const next = new Set(prev);
+          next.delete(name);
+          return next;
+        });
+      }
+    },
+    [discoverAsync],
+  );
+
+  // Auto-resolve pending servers: instead of leaving a freshly-added server on a
+  // static "Pending", probe it once so the user sees Checking → Connected/Error.
+  // Only when the sandbox is running (discovery needs it) and only enabled
+  // workspace servers (disabled rows read as "Disabled"; builtins are always
+  // connected). The backend's 15s debounce backs up the once-per-mount guard.
+  useEffect(() => {
+    if (!sandboxRunning) return;
+    for (const s of servers) {
+      if (
+        s.origin === 'workspace' &&
+        s.enabled &&
+        s.status === 'pending' &&
+        !autoCheckedRef.current.has(s.name)
+      ) {
+        autoCheckedRef.current.add(s.name);
+        void runDiscover(s.name);
+      }
+    }
+  }, [servers, sandboxRunning, runDiscover]);
 
   async function handleSubmit(body: McpServerInput) {
     setSubmitError(null);
@@ -98,12 +207,10 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
       } else {
         await addMutation.mutateAsync(body);
       }
-      flagNotSynced(body.name);
       setModalOpen(false);
       setEditing(null);
     } catch (err) {
-      const e = err as { response?: { data?: { detail?: string } }; message?: string };
-      setSubmitError(e?.response?.data?.detail || e?.message || 'Failed to save server');
+      setSubmitError(formatApiErrorDetail(err));
     }
   }
 
@@ -111,7 +218,6 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
     setTogglingName(server.name);
     try {
       await toggleMutation.mutateAsync({ name: server.name, enabled });
-      flagNotSynced(server.name);
     } finally {
       setTogglingName(null);
     }
@@ -121,22 +227,47 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
     setDeletingName(server.name);
     try {
       await deleteMutation.mutateAsync(server.name);
-      flagNotSynced(server.name);
     } finally {
       setDeletingName(null);
     }
   }
 
+  async function doPromote(name: string, overwrite: boolean) {
+    try {
+      await promoteMutation.mutateAsync({ name, overwrite });
+      toast({
+        title: overwrite ? 'Template updated' : 'Saved as template',
+        description: `"${name}" is now in your Templates — add it to any workspace.`,
+      });
+    } catch (err) {
+      toast({
+        variant: 'destructive',
+        title: 'Could not save template',
+        description: formatApiErrorDetail(err),
+      });
+    }
+  }
+
+  function handlePromote(server: EffectiveServer) {
+    // Existing template → confirm overwrite; new name → promote straight away.
+    if (templateNames.has(server.name)) {
+      setPromoteConfirm(server.name);
+    } else {
+      void doPromote(server.name, false);
+    }
+  }
+
   async function handleAddFromTemplate(templateName: string) {
     await addMutation.mutateAsync({ from_template: templateName });
-    flagNotSynced(templateName);
     setView('workspace');
   }
 
   async function handleDiscoverFromModal(body: McpServerInput) {
-    // The modal's "Test connection" needs the server persisted first. If it's a
-    // new server, the row-level discover is the right entry point — here we run
-    // discovery against the existing server name (edits) and surface results.
+    // "Test saved config" is offered only when editing an existing row (the
+    // modal gates it on isEdit), so we probe the PERSISTED server by name. The
+    // name field is locked on edit, so body.name is the saved server; unsaved
+    // edits in the form aren't tested until they're saved (the button label says
+    // as much). Discovery has no ad-hoc-definition endpoint by design.
     return discoverMutation.mutateAsync(body.name);
   }
 
@@ -175,22 +306,75 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
                 {workspaceCount} / {maxServers}
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
-              disabled={atCap}
-              title={atCap ? `At ${maxServers}/${maxServers} — remove one first` : undefined}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-              style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
-            >
-              <Plus className="h-3 w-3" />
-              Add server
-            </button>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setImportOpen(true)}
+                disabled={atCap}
+                title={atCap ? `At ${maxServers}/${maxServers} — remove one first` : 'Paste a standard mcpServers JSON config'}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
+                style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
+              >
+                <Download className="h-3 w-3" />
+                Import JSON
+              </button>
+              <button
+                type="button"
+                onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
+                disabled={atCap}
+                title={atCap ? `At ${maxServers}/${maxServers} — remove one first` : undefined}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
+                style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+              >
+                <Plus className="h-3 w-3" />
+                Add server
+              </button>
+            </div>
           </div>
 
-          {!sandboxRunning && (
+          {!sandboxRunning && sandboxWarming && (
             <div className="text-[11px] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
-              Workspace is stopped. New servers stay pending until the workspace starts and discovery runs.
+              Starting workspace — your servers are checked automatically as soon as it&apos;s up.
+            </div>
+          )}
+
+          {!sandboxRunning && !sandboxWarming && (
+            <div className="text-[11px] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
+              Workspace is stopped — saving a server starts it back up and checks the server automatically.
+            </div>
+          )}
+
+          {promoteConfirm && (
+            <div
+              className="flex items-center justify-between gap-3 text-[11px] p-2 rounded"
+              style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
+            >
+              <span className="min-w-0">
+                Template <span className="font-medium">{promoteConfirm}</span> already exists. Overwrite it with this server&apos;s current config?
+              </span>
+              <div className="flex items-center gap-1.5 flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const name = promoteConfirm;
+                    setPromoteConfirm(null);
+                    await doPromote(name, true);
+                  }}
+                  disabled={promoteMutation.isPending}
+                  className="px-2 py-1 rounded disabled:opacity-50"
+                  style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+                >
+                  Overwrite
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPromoteConfirm(null)}
+                  className="px-2 py-1 rounded hover:bg-foreground/10"
+                  style={{ color: 'var(--color-text-tertiary)' }}
+                >
+                  Cancel
+                </button>
+              </div>
             </div>
           )}
 
@@ -210,22 +394,26 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
             </div>
           ) : (
             <div className="flex flex-col gap-1.5">
-              {servers.map((server) => (
-                <McpServerRow
-                  key={server.name}
-                  server={server}
-                  toggling={togglingName === server.name || deletingName === server.name}
-                  showNotSynced={notSynced[server.name] !== undefined}
-                  onToggle={(enabled) => handleToggle(server, enabled)}
-                  onEdit={() => { setEditing(server); setSubmitError(null); setModalOpen(true); }}
-                  onDiscover={async () => {
-                    await discoverMutation.mutateAsync(server.name);
-                    flagNotSynced(server.name);
-                  }}
-                  onDelete={() => handleDelete(server)}
-                  onSetupSecret={(name) => onOpenVaultTab?.(name)}
-                />
-              ))}
+              <AnimatePresence initial={false}>
+                {orderedServers.map((server) => (
+                  <McpServerRow
+                    key={server.name}
+                    server={server}
+                    toggling={togglingName === server.name}
+                    deleting={deletingName === server.name}
+                    checking={checkingNames.has(server.name)}
+                    synced={synced}
+                    sandboxRunning={sandboxRunning}
+                    sandboxWarming={sandboxWarming}
+                    onToggle={(enabled) => handleToggle(server, enabled)}
+                    onEdit={() => { setEditing(server); setSubmitError(null); setModalOpen(true); }}
+                    onDiscover={() => runDiscover(server.name)}
+                    onDelete={() => handleDelete(server)}
+                    onPromoteToTemplate={server.origin === 'workspace' ? () => handlePromote(server) : undefined}
+                    onSetupSecret={(name) => onOpenVaultTab?.(name)}
+                  />
+                ))}
+              </AnimatePresence>
             </div>
           )}
         </div>
@@ -253,13 +441,16 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
         />
       )}
 
-      {/* Discovery loading hint (row kebab "Test connection") */}
-      {discoverMutation.isPending && (
-        <div className="inline-flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
-          <Loader2 className="h-3 w-3 animate-spin" />
-          Testing connection…
-        </div>
+      {importOpen && (
+        <McpImportModal
+          onClose={() => setImportOpen(false)}
+          onImport={(payload) => importMutation.mutateAsync(payload)}
+          onImported={(_createdNames, secretsCreated) => {
+            if (secretsCreated.length > 0) refetchSecretNames();
+          }}
+        />
       )}
+
     </div>
   );
 }

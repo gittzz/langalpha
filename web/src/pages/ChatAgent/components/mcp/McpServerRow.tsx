@@ -1,13 +1,18 @@
 import React from 'react';
-import { MoreVertical, Pencil, Zap, Trash2, Server, KeyRound, Loader2 } from 'lucide-react';
+import { motion } from 'framer-motion';
+import { MoreVertical, Pencil, Zap, Trash2, Server, KeyRound, Loader2, BookmarkPlus } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
 } from '@/components/ui/dropdown-menu';
-import { McpStatusPill, NotSyncedHint } from './McpStatusPill';
+import { McpLifecycle } from './McpLifecycle';
 import type { EffectiveServer } from '../../utils/api';
+
+// Matches the spring used across the chat UI (ActivityBlock) so motion feels
+// consistent. SNAPPY for the toggle knob; the row layout/enter/exit reuse it.
+const SPRING_SNAPPY = { type: 'spring' as const, stiffness: 200, damping: 22 };
 
 /**
  * One row in the effective per-workspace MCP list.
@@ -15,21 +20,48 @@ import type { EffectiveServer } from '../../utils/api';
  * - Origin badge (builtin / workspace).
  * - Enabled toggle (the only interactive control for builtins).
  * - Tool count + status pill.
- * - Kebab menu: Edit / Test connection / Delete — all disabled for builtins.
+ * - Kebab menu: Edit / Test connection / Save as template / Delete — all
+ *   disabled for builtins. "Test connection" is also disabled when the server
+ *   is off (discovery only runs against enabled servers). "Save as template"
+ *   copies the server's definition up into the user's reusable catalog (vault
+ *   refs travel, values don't). A disabled workspace server still renders with
+ *   its toggle so it can be re-enabled.
  * - needs_secret rows surface a "Set up NAME" affordance that deep-links to the
  *   Vault tab with the secret name prefilled.
- * - After a successful mutation the parent flips `showNotSynced`, and the row
- *   shows the transient "applies shortly" hint.
+ * - The status area is a single `McpLifecycle` signal (Saved → Verifying →
+ *   Ready) that fuses the verify axis (discovery: `checking`/status) and the
+ *   apply axis (`synced`: the running agent has loaded the saved config). A
+ *   still-progressing server shows an animated track; a verified+applied one
+ *   collapses to the clean green pill.
+ *
+ * The row is a `motion.div`: the enabled toggle springs (no instant teleport),
+ * and rows animate in/out + reflow via `layout` when the parent adds/removes
+ * them. The parent freezes display order within a session, so toggling never
+ * reorders a row — it just restyles in place.
  */
 
 interface McpServerRowProps {
   server: EffectiveServer;
+  /** An enable/disable PATCH is in flight — locks the switch against a double
+   *  fire. Optimistic, so it shows NO spinner (the switch already moved). */
   toggling?: boolean;
-  showNotSynced?: boolean;
+  /** A delete is in flight — the row is actually leaving, so the kebab shows
+   *  the spinner. (Toggle does not.) */
+  deleting?: boolean;
+  /** A discovery probe is in flight for this row. */
+  checking?: boolean;
+  /** The running session has applied the saved config (apply axis complete). */
+  synced?: boolean;
+  /** Whether the workspace sandbox is running. */
+  sandboxRunning?: boolean;
+  /** The sandbox is warming up toward running (a background apply kicked it). */
+  sandboxWarming?: boolean;
   onToggle: (enabled: boolean) => void;
   onEdit: () => void;
   onDiscover: () => void;
   onDelete: () => void;
+  /** Save this workspace server's definition up into the user template catalog. */
+  onPromoteToTemplate?: () => void;
   /** Deep-link to the Vault tab, optionally prefilling a secret name. */
   onSetupSecret: (secretName: string) => void;
 }
@@ -37,18 +69,28 @@ interface McpServerRowProps {
 export function McpServerRow({
   server,
   toggling = false,
-  showNotSynced = false,
+  deleting = false,
+  checking = false,
+  synced = false,
+  sandboxRunning = false,
+  sandboxWarming = false,
   onToggle,
   onEdit,
   onDiscover,
   onDelete,
+  onPromoteToTemplate,
   onSetupSecret,
 }: McpServerRowProps) {
   const isBuiltin = server.origin === 'builtin';
 
   return (
-    <div
-      className="flex items-start justify-between gap-3 py-2.5 px-3 rounded-lg"
+    <motion.div
+      layout
+      initial={{ opacity: 0, y: -4 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, height: 0, marginTop: 0, paddingTop: 0, paddingBottom: 0 }}
+      transition={SPRING_SNAPPY}
+      className="flex items-start justify-between gap-3 py-2.5 px-3 rounded-lg overflow-hidden"
       style={{ backgroundColor: 'var(--color-bg-card)' }}
       data-testid={`mcp-row-${server.name}`}
     >
@@ -71,15 +113,22 @@ export function McpServerRow({
           </span>
         </div>
 
-        {/* Status + tool count */}
+        {/* Lifecycle (verify + apply) + tool count */}
         <div className="flex items-center gap-2 flex-wrap">
-          <McpStatusPill status={server.status} enabled={server.enabled} />
-          {server.enabled && server.tool_count > 0 && (
+          <McpLifecycle
+            status={server.status}
+            enabled={server.enabled}
+            origin={server.origin}
+            checking={checking}
+            synced={synced}
+            sandboxRunning={sandboxRunning}
+            sandboxWarming={sandboxWarming}
+          />
+          {server.enabled && server.status === 'connected' && server.tool_count > 0 && (
             <span className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
               {server.tool_count} tool{server.tool_count === 1 ? '' : 's'}
             </span>
           )}
-          {showNotSynced && <NotSyncedHint />}
         </div>
 
         {/* Error text */}
@@ -119,16 +168,17 @@ export function McpServerRow({
           role="switch"
           aria-checked={server.enabled}
           aria-label={`${server.enabled ? 'Disable' : 'Enable'} ${server.name}`}
-          disabled={toggling}
+          disabled={toggling || deleting}
           onClick={() => onToggle(!server.enabled)}
-          className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50"
+          className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
           style={{
             backgroundColor: server.enabled ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
           }}
         >
-          <span
-            className="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
-            style={{ transform: server.enabled ? 'translateX(18px)' : 'translateX(2px)' }}
+          <motion.span
+            className="inline-block h-4 w-4 rounded-full bg-white"
+            animate={{ x: server.enabled ? 18 : 2 }}
+            transition={SPRING_SNAPPY}
           />
         </button>
 
@@ -141,7 +191,7 @@ export function McpServerRow({
               style={{ color: 'var(--color-text-tertiary)' }}
               aria-label={`Actions for ${server.name}`}
             >
-              {toggling ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreVertical className="h-4 w-4" />}
+              {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreVertical className="h-4 w-4" />}
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
@@ -149,14 +199,21 @@ export function McpServerRow({
               <Pencil className="h-3.5 w-3.5 mr-2" />
               Edit
             </DropdownMenuItem>
-            <DropdownMenuItem disabled={isBuiltin} onSelect={() => onDiscover()}>
+            <DropdownMenuItem disabled={isBuiltin || !server.enabled} onSelect={() => onDiscover()}>
               <Zap className="h-3.5 w-3.5 mr-2" />
               Test connection
             </DropdownMenuItem>
             <DropdownMenuItem
+              disabled={isBuiltin || !onPromoteToTemplate}
+              onSelect={() => onPromoteToTemplate?.()}
+            >
+              <BookmarkPlus className="h-3.5 w-3.5 mr-2" />
+              Save as template
+            </DropdownMenuItem>
+            <DropdownMenuItem
               disabled={!server.deletable}
               onSelect={() => onDelete()}
-              className="text-red-600 focus:text-red-600"
+              variant="destructive"
             >
               <Trash2 className="h-3.5 w-3.5 mr-2" />
               Delete
@@ -164,6 +221,6 @@ export function McpServerRow({
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
-    </div>
+    </motion.div>
   );
 }

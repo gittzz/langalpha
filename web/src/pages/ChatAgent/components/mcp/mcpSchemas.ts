@@ -178,6 +178,9 @@ const nameField = z
 const descriptionField = z.string().max(DESCRIPTION_MAX).default('');
 const instructionField = z.string().max(INSTRUCTION_MAX).default('');
 const exposureField = z.enum(EXPOSURE_MODES).default('summary');
+// Off (default) = tool discovery runs secret-less. On = resolve vault secrets
+// during discovery (for servers that need auth even to list tools).
+const discoveryUsesSecretsField = z.boolean().optional().default(false);
 
 const urlField = z.string().superRefine((url, ctx) => {
   const reason = validateRemoteUrl(url);
@@ -195,6 +198,7 @@ const stdioSchema = z.object({
   description: descriptionField,
   instruction: instructionField,
   tool_exposure_mode: exposureField,
+  discovery_uses_secrets: discoveryUsesSecretsField,
 });
 
 const sseSchema = z.object({
@@ -205,6 +209,7 @@ const sseSchema = z.object({
   description: descriptionField,
   instruction: instructionField,
   tool_exposure_mode: exposureField,
+  discovery_uses_secrets: discoveryUsesSecretsField,
 });
 
 const httpSchema = z.object({
@@ -215,15 +220,8 @@ const httpSchema = z.object({
   description: descriptionField,
   instruction: instructionField,
   tool_exposure_mode: exposureField,
+  discovery_uses_secrets: discoveryUsesSecretsField,
 });
-
-// True discriminated union on `transport` (plan spec). sse/http are separate
-// branches because they share fields but carry distinct literal discriminants.
-export const McpServerSchema = z.discriminatedUnion('transport', [
-  stdioSchema,
-  sseSchema,
-  httpSchema,
-]);
 
 // Per-transport schema lookup for the form-level validator (which validates the
 // chosen branch directly to keep error paths simple in the modal).
@@ -244,6 +242,7 @@ export type McpServerForm = {
   description: string;
   instruction: string;
   tool_exposure_mode: (typeof EXPOSURE_MODES)[number];
+  discovery_uses_secrets: boolean;
 };
 
 /** Validate a raw form object, returning either ok or the list of errors. */

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { KeyRound, Plus, Loader2, Check } from 'lucide-react';
-import { createVaultSecret, type McpServerInput } from '../../utils/api';
+import { createVaultSecret, formatApiErrorDetail } from '../../utils/api';
 
 /**
  * Picks an existing workspace vault secret (emitting a `${vault:NAME}`
@@ -68,8 +68,7 @@ export function VaultSecretPicker({
       setNewName('');
       setNewValue('');
     } catch (err) {
-      const e = err as { response?: { data?: { detail?: string } }; message?: string };
-      setCreateError(e?.response?.data?.detail || e?.message || 'Failed to create secret');
+      setCreateError(formatApiErrorDetail(err));
     } finally {
       setSaving(false);
     }
@@ -202,5 +201,3 @@ export function VaultSecretPicker({
     </div>
   );
 }
-
-export type { McpServerInput };
