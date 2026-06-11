@@ -910,9 +910,15 @@ class SchemaOnlyRegistry:
         builtin_registry: "MCPRegistry",
         user_servers: list[MCPServerConfig],
         tool_schemas: dict[str, list[dict]],
+        disabled_builtin_names: frozenset[str] = frozenset(),
     ) -> None:
         self._builtin_registry = builtin_registry
         self._user_names = frozenset(s.name for s in user_servers)
+        # Built-ins a workspace turned off: excluded from get_all_tools(),
+        # connectors, and the effective config so the agent neither sees nor can
+        # call them (a disable-marker must take effect at runtime, not just in
+        # the resolver).
+        self._disabled_builtin_names = frozenset(disabled_builtin_names)
         # User-server tools, in deterministic per-server order, wrapped as
         # MCPToolInfo so every downstream reader (codegen, formatter, hash) sees
         # the same shape as a built-in. Original tool names are preserved;
@@ -933,9 +939,15 @@ class SchemaOnlyRegistry:
                 )
                 for schema in schemas
             ]
-        # Effective config: built-ins (verbatim) + user servers, so the
-        # formatter sees each user server's description/instruction/source.
-        effective_servers = [*builtin_registry.config.mcp.servers, *user_servers]
+        # Effective config: enabled built-ins (verbatim, minus disabled) + user
+        # servers, so the formatter sees each user server's
+        # description/instruction/source and never a workspace-disabled built-in.
+        effective_builtins = [
+            s
+            for s in builtin_registry.config.mcp.servers
+            if s.name not in self._disabled_builtin_names
+        ]
+        effective_servers = [*effective_builtins, *user_servers]
         self.config = _SchemaConfig(builtin_registry.config, effective_servers)
 
     @property
@@ -945,14 +957,27 @@ class SchemaOnlyRegistry:
 
     @property
     def connectors(self) -> dict[str, "MCPServerConnector"]:
-        """Built-in connectors ONLY — user servers have no host connector, ever."""
-        return self._builtin_registry.connectors
+        """Built-in connectors ONLY — user servers have no host connector, ever.
+
+        Workspace-disabled built-ins are excluded so a disabled built-in's
+        connector is neither visible nor callable.
+        """
+        connectors = self._builtin_registry.connectors
+        if not self._disabled_builtin_names:
+            return connectors
+        return {
+            name: conn
+            for name, conn in connectors.items()
+            if name not in self._disabled_builtin_names
+        }
 
     def get_all_tools(self) -> dict[str, list[MCPToolInfo]]:
-        """Built-in tools (verbatim) then user-server tools (append-only)."""
-        tools_by_server: dict[str, list[MCPToolInfo]] = dict(
-            self._builtin_registry.get_all_tools()
-        )
+        """Enabled built-in tools (minus disabled), then user-server tools."""
+        tools_by_server: dict[str, list[MCPToolInfo]] = {
+            name: tools
+            for name, tools in self._builtin_registry.get_all_tools().items()
+            if name not in self._disabled_builtin_names
+        }
         tools_by_server.update(self._user_tools)
         return tools_by_server
 
@@ -985,16 +1010,23 @@ def build_composite_registry(
     builtin_registry: "MCPRegistry",
     user_servers: list[MCPServerConfig],
     tool_schemas: dict[str, list[dict]],
+    disabled_builtin_names: frozenset[str] = frozenset(),
 ) -> Any:
     """Append user-server schemas onto the frozen built-in registry.
 
     ``user_servers`` are ``source='workspace'``, enabled, in resolver order
     (built-ins config-order, then user servers alphabetical). ``tool_schemas``
     maps a server name to its sanitized ``[{name, description, input_schema}]``
-    snapshot; only ``status='ok'`` servers appear. When ``user_servers`` is
-    empty the built-in registry is returned UNCHANGED (identity), keeping
-    zero-user-server workspaces byte-identical downstream.
+    snapshot; only ``status='ok'`` servers appear. ``disabled_builtin_names``
+    are built-ins a workspace turned off — excluded from tools/connectors/config
+    so the agent can't see or call them at runtime.
+
+    When there are NO user servers AND no disabled built-ins, the built-in
+    registry is returned UNCHANGED (identity), keeping clean workspaces
+    byte-identical downstream.
     """
-    if not user_servers:
+    if not user_servers and not disabled_builtin_names:
         return builtin_registry
-    return SchemaOnlyRegistry(builtin_registry, user_servers, tool_schemas)
+    return SchemaOnlyRegistry(
+        builtin_registry, user_servers, tool_schemas, disabled_builtin_names
+    )

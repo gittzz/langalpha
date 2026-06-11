@@ -7,6 +7,7 @@ import json
 import shlex
 import textwrap
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,11 @@ from ptc_agent.core.sandbox.runtime import (
 )
 
 from ..mcp_registry import MCPRegistry
+from ..mcp_sanitize import (
+    discovery_should_use_secrets,
+    sanitize_tool_name,
+    vault_refs,
+)
 from ..tool_generator import ToolFunctionGenerator
 
 logger = structlog.get_logger(__name__)
@@ -990,15 +996,27 @@ class PTCSandbox:
     def _compute_user_mcp_config_hash(self) -> str:
         """Hash user (``source='workspace'``) server CONFIG — never secret values.
 
-        Captures transport/command/args/url and header/env key NAMES so a
-        config-only edit (e.g. new header name, changed args) re-uploads the
-        regenerated ``mcp_client.py`` even when tool schemas are unchanged.
-        Returns "" when there are no user servers so builtin-only workspaces are
-        untouched (regression #1).
+        Captures transport/command/args/url, header/env key NAMES, and the
+        ``${vault:NAME}`` ref names referenced per key (names only) so a
+        config-only edit — including a vault-ref retarget under the same key
+        (``${vault:OLD}`` → ``${vault:NEW}``) — re-uploads the regenerated
+        ``mcp_client.py`` even when tool schemas are unchanged. Returns "" when
+        there are no user servers so builtin-only workspaces are untouched.
         """
         user_servers = self._user_servers()
         if not user_servers:
             return ""
+
+        def _vault_refs_by_key(mapping: dict | None) -> dict[str, list[str]]:
+            # Per key: the sorted vault-ref NAMES embedded in its value. Captures
+            # which secret a value resolves without ever hashing literal values.
+            out: dict[str, list[str]] = {}
+            for k, v in (mapping or {}).items():
+                refs = sorted(set(vault_refs(str(v))))
+                if refs:
+                    out[k] = refs
+            return out
+
         parts: list[str] = []
         for server in sorted(user_servers, key=lambda s: s.name):
             payload = {
@@ -1008,10 +1026,24 @@ class PTCSandbox:
                 "command": server.command,
                 "args": list(server.args or []),
                 "url": server.url,
-                # Key NAMES only — values may be ${vault:NAME} refs or literals,
-                # neither of which belongs in a manifest hash.
+                # The EFFECTIVE secret-less-discovery decision changes the
+                # generated client's vault-gating, so it must churn the upload
+                # hash. Using the effective value (not the raw flag) means a
+                # remote server that gains/loses an authenticated header
+                # re-syncs even if the stored flag is untouched.
+                "discovery_uses_secrets": discovery_should_use_secrets(server),
+                # Key NAMES only — literal values never belong in a manifest hash.
                 "env_keys": sorted((getattr(server, "env", {}) or {}).keys()),
                 "header_keys": sorted((getattr(server, "headers", {}) or {}).keys()),
+                # Vault-ref NAMES per key (and in the URL): a retarget to a new
+                # secret under the same key changes which secret the regenerated
+                # client embeds, so it MUST churn the hash. Names only, never
+                # literal secret values.
+                "env_vault_refs": _vault_refs_by_key(getattr(server, "env", {})),
+                "header_vault_refs": _vault_refs_by_key(
+                    getattr(server, "headers", {})
+                ),
+                "url_vault_refs": sorted(set(vault_refs(server.url or ""))),
             }
             parts.append(json.dumps(payload, sort_keys=True))
         return hashlib.sha256("\n".join(parts).encode()).hexdigest()
@@ -2210,7 +2242,9 @@ except OSError as e:
         except Exception as e:
             logger.warning(f"Scrapling browser install skipped: {e}")
 
-    async def _upload_mcp_client_module(self) -> None:
+    async def _upload_mcp_client_module(
+        self, extra_servers: list[Any] | None = None
+    ) -> None:
         """Upload the config-only ``mcp_client.py`` (no schema dependency).
 
         Split out from :meth:`_install_tool_modules` so the client — which the
@@ -2218,12 +2252,30 @@ except OSError as e:
         schemas exist. The client is a pure function of the effective server
         configs (transport/command/args/url/header-names), so it is safe to
         regenerate ahead of discovery.
+
+        ``extra_servers`` carries freshly-resolved configs for an on-demand
+        discovery whose session may predate the edit. They are merged over the
+        session's enabled set by name (override an edited server, append a new
+        one) so the probe sees pending changes without dropping other servers
+        from the runtime client.
         """
         assert self.runtime is not None
         work_dir = self._work_dir
         enabled_servers = [
             server for server in self.config.mcp.servers if server.enabled
         ]
+        if extra_servers:
+            for srv in extra_servers:
+                if not getattr(srv, "enabled", True):
+                    continue
+                idx = next(
+                    (i for i, s in enumerate(enabled_servers) if s.name == srv.name),
+                    None,
+                )
+                if idx is None:
+                    enabled_servers.append(srv)
+                else:
+                    enabled_servers[idx] = srv
         # Pass the sandbox's real work dir (Lane A handoff): the client embeds
         # the vault path + mcp_servers path from it. Defaulting would point the
         # vault/server paths at the wrong directory after a working-dir change.
@@ -2350,7 +2402,15 @@ except OSError as e:
                 doc = self.tool_generator.generate_tool_documentation(
                     tool, source=source
                 )
-                doc_path = f"{work_dir}/tools/docs/{server_name}/{tool.name}.md"
+                # Untrusted workspace tool names could contain ``..`` or ``/`` and
+                # traverse out of the docs dir; use the sanitized identifier for
+                # the filename. Builtin names are already valid identifiers, so
+                # sanitize_tool_name leaves them unchanged (byte-identical path).
+                if source == "workspace":
+                    doc_name = sanitize_tool_name(tool.name) or "_invalid_tool"
+                else:
+                    doc_name = tool.name
+                doc_path = f"{work_dir}/tools/docs/{server_name}/{doc_name}.md"
                 upload_item: tuple[bytes, str, tuple[str, dict[str, str]] | None] = (
                     doc.encode("utf-8"),
                     doc_path,
@@ -2425,15 +2485,19 @@ except OSError as e:
         work_dir = self._work_dir
 
         # Upload a config-current mcp_client.py FIRST (it depends only on config,
-        # not on schemas) so discovery runs against the latest server set.
-        await self._upload_mcp_client_module()
+        # not on schemas) so discovery runs against the latest server set. Pass
+        # the servers being discovered so an on-demand probe reflects a pending
+        # add/edit the live session has not re-resolved yet (≤30s window).
+        await self._upload_mcp_client_module(extra_servers=servers)
 
         sem = asyncio.Semaphore(self._DISCOVERY_CONCURRENCY)
         client_path = f"{work_dir}/tools/mcp_client.py"
 
         async def _discover_one(server: Any) -> tuple[str, dict[str, Any]]:
             name = server.name
-            out_path = f"{work_dir}/_internal/.mcp_discover_{abs(hash(name)) % 10**8}.json"
+            # Unique per invocation: concurrent discoveries of the same server
+            # (background kick + on-demand /discover) must not share a file.
+            out_path = f"{work_dir}/_internal/.mcp_discover_{uuid.uuid4().hex}.json"
             async with sem:
                 try:
                     cmd = (

@@ -48,6 +48,26 @@ def vault_refs(value: str) -> list[str]:
     return VAULT_REF_RE.findall(value or "")
 
 
+def discovery_should_use_secrets(server) -> bool:
+    """Whether tool discovery should resolve vault secrets for a server.
+
+    The stored ``discovery_uses_secrets`` flag wins when set. Beyond that, a
+    workspace ``sse``/``http`` server whose headers reference a vault secret is
+    authenticated: it needs that header even to ``tools/list``, and the
+    credential goes to the user's own URL (no untrusted-subprocess concern), so
+    discovery resolves secrets for it automatically. Stdio servers keep the
+    secret-less default — there the flag guards an untrusted subprocess.
+    """
+    if bool(getattr(server, "discovery_uses_secrets", False)):
+        return True
+    if getattr(server, "source", "builtin") == "workspace" and getattr(
+        server, "transport", None
+    ) in ("sse", "http"):
+        headers = getattr(server, "headers", {}) or {}
+        return any(VAULT_REF_RE.search(str(v)) for v in headers.values())
+    return False
+
+
 def sanitize_tool_name(name: str) -> str | None:
     """Coerce a tool name into a legal, non-keyword Python identifier.
 

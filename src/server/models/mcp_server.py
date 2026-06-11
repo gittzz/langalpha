@@ -21,12 +21,22 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Literal, Optional
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from src.ptc_agent.core.mcp_sanitize import VAULT_REF_RE
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    """Flatten a Pydantic ValidationError into a JSON-safe detail string."""
+    parts = []
+    for err in exc.errors(include_url=False):
+        loc = ".".join(str(p) for p in err.get("loc", ())) or "body"
+        parts.append(f"{loc}: {err.get('msg', 'invalid')}")
+    return "; ".join(parts) or "validation error"
 
 # ---------------------------------------------------------------------------
 # Shared constants — single source of truth for validators (also mirrored
@@ -126,19 +136,14 @@ def validate_remote_url(url: str) -> str:
     ):
         raise ValueError(f"url host {host!r} is not allowed")
 
-    # Literal IP blocklist: loopback / private / link-local / metadata / ULA.
+    # Literal IP blocklist: anything not globally routable. ``is_global`` covers
+    # private/loopback/link-local/reserved/multicast/unspecified AND CGNAT
+    # (100.64.0.0/10), which the explicit-category checks missed.
     try:
         ip = ipaddress.ip_address(host_l.strip("[]"))
     except ValueError:
         ip = None
-    if ip is not None and (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    ):
+    if ip is not None and not ip.is_global:
         raise ValueError(f"url host {host!r} resolves to a disallowed IP range")
     return url
 
@@ -161,6 +166,9 @@ class McpServerInput(BaseModel):
     description: str = Field("", max_length=DESCRIPTION_MAX)
     instruction: str = Field("", max_length=INSTRUCTION_MAX)
     tool_exposure_mode: Literal["summary", "detailed"] = "summary"
+    # Off (default) = tool discovery runs secret-less. On = resolve real vault
+    # secrets during discovery (for servers that need auth even to list tools).
+    discovery_uses_secrets: bool = False
 
     model_config = {"extra": "forbid"}
 
@@ -228,15 +236,8 @@ class McpServerInput(BaseModel):
             "description": self.description,
             "instruction": self.instruction,
             "tool_exposure_mode": self.tool_exposure_mode,
+            "discovery_uses_secrets": self.discovery_uses_secrets,
         }
-
-
-class FromTemplateInput(BaseModel):
-    """POST body variant that copies a user catalog template into a workspace."""
-
-    from_template: str = Field(..., min_length=1, max_length=64)
-
-    model_config = {"extra": "forbid"}
 
 
 class EnabledInput(BaseModel):
@@ -245,6 +246,173 @@ class EnabledInput(BaseModel):
     enabled: bool
 
     model_config = {"extra": "forbid"}
+
+
+class PromoteInput(BaseModel):
+    """POST body for promoting a workspace server into the user template catalog.
+
+    ``overwrite`` replaces an existing template of the same name; without it a
+    name clash is a 409 so the UI can confirm before clobbering.
+    """
+
+    overwrite: bool = False
+
+    model_config = {"extra": "forbid"}
+
+
+# ---------------------------------------------------------------------------
+# Standard `mcpServers` JSON parser
+# ---------------------------------------------------------------------------
+#
+# Users typically have an MCP server config in the de-facto-standard shape used
+# by Claude Desktop / Cursor / etc.:
+#
+#   {"mcpServers": {"<name>": {"command"|"url", "type"|"transport", ...}}}
+#
+# These helpers normalize that blob into canonical :class:`McpServerInput`
+# kwargs so it can be imported as-is: transport aliases are mapped, server keys
+# are coerced into our ``NAME_RE`` shape, and only the fields we persist are
+# carried through (unknown keys like ``disabled`` are dropped). The parser is
+# pure — literal secret values stay inline; the import endpoint extracts them
+# to the vault before validation.
+
+# Transport aliases seen in standard configs. Compared after lowercasing and
+# stripping non-letters, so ``streamable-http`` / ``streamable_http`` /
+# ``streamableHttp`` all collapse to ``streamablehttp``.
+_TRANSPORT_ALIASES = {
+    "stdio": "stdio",
+    "http": "http",
+    "streamablehttp": "http",
+    "streamable": "http",
+    "sse": "sse",
+}
+
+
+@dataclass
+class ParsedMcpServer:
+    """One entry from a parsed ``mcpServers``-style blob.
+
+    ``config`` holds canonical :class:`McpServerInput` kwargs with literal
+    secret values STILL INLINE — the import endpoint extracts them to the vault
+    before validation. ``error`` is set when the entry can't be normalized
+    (uncoercible name, undetermined transport); such entries skip insert.
+    """
+
+    original_name: str
+    name: str
+    renamed: bool
+    config: dict[str, Any] = dataclass_field(default_factory=dict)
+    error: Optional[str] = None
+
+
+def coerce_mcp_name(raw: Any) -> tuple[Optional[str], bool]:
+    """Coerce an arbitrary server key into a legal MCP name (``NAME_RE``).
+
+    Illegal characters become ``_`` and a leading digit is prefixed, so
+    ``hexin-ifind-ds-stock-mcp`` → ``hexin_ifind_ds_stock_mcp``. Returns
+    ``(name, renamed)``, or ``(None, False)`` when nothing salvageable remains.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None, False
+    cand = re.sub(r"[^0-9A-Za-z_]", "_", raw)
+    if cand and cand[0].isdigit():
+        cand = f"_{cand}"
+    cand = cand[:64]
+    if not cand or not NAME_RE.match(cand):
+        return None, False
+    return cand, cand != raw
+
+
+def normalize_transport(
+    raw: Any, *, has_command: bool, has_url: bool
+) -> Optional[str]:
+    """Map a standard-config ``type``/``transport`` to our transport enum.
+
+    Falls back to inference when the type is absent: a ``command`` ⇒ stdio, a
+    ``url`` ⇒ http. Returns ``None`` when unrecognized and inference is
+    ambiguous.
+    """
+    if isinstance(raw, str) and raw.strip():
+        key = re.sub(r"[^a-z]", "", raw.lower())
+        return _TRANSPORT_ALIASES.get(key)
+    if has_command and not has_url:
+        return "stdio"
+    if has_url and not has_command:
+        return "http"
+    return None
+
+
+def _normalize_server_entry(raw_name: Any, body: Any) -> ParsedMcpServer:
+    raw_label = raw_name if isinstance(raw_name, str) else str(raw_name)
+    name, renamed = coerce_mcp_name(raw_name)
+    if name is None:
+        return ParsedMcpServer(
+            raw_label, raw_label, False,
+            error="name could not be normalized to a valid identifier",
+        )
+    if not isinstance(body, dict):
+        return ParsedMcpServer(
+            raw_label, name, renamed,
+            error="server definition must be a JSON object",
+        )
+
+    raw_type = body.get("type") or body.get("transport") or body.get("transportType")
+    transport = normalize_transport(
+        raw_type,
+        has_command=bool(body.get("command")),
+        has_url=bool(body.get("url")),
+    )
+    if transport is None:
+        hint = f" (type={raw_type!r})" if raw_type else ""
+        return ParsedMcpServer(
+            raw_label, name, renamed,
+            error=f"could not determine transport{hint}",
+        )
+
+    config: dict[str, Any] = {"name": name, "transport": transport}
+    # Carry only the canonical fields for the resolved transport; the validator
+    # rejects cross-transport fields, and unknown keys are dropped on purpose.
+    if transport == "stdio":
+        for key in ("command", "args", "env"):
+            if body.get(key) is not None:
+                config[key] = body[key]
+    else:
+        for key in ("url", "headers"):
+            if body.get(key) is not None:
+                config[key] = body[key]
+    for key in ("description", "instruction", "tool_exposure_mode"):
+        if body.get(key) is not None:
+            config[key] = body[key]
+    return ParsedMcpServer(raw_label, name, renamed, config)
+
+
+def _unwrap_servers_map(payload: Any) -> dict[str, Any]:
+    """Find the ``{name: def}`` map inside a parsed config blob."""
+    if not isinstance(payload, dict):
+        return {}
+    for key in ("mcpServers", "mcp_servers", "servers"):
+        inner = payload.get(key)
+        if isinstance(inner, dict):
+            return inner
+    # A single, self-naming server object (``{"name": ..., "url"|"command": ...}``).
+    if isinstance(payload.get("name"), str) and any(
+        k in payload for k in ("command", "url", "type", "transport", "args", "headers", "env")
+    ):
+        return {payload["name"]: payload}
+    # Otherwise assume the dict itself is the ``{name: def}`` map.
+    return payload
+
+
+def parse_mcp_servers_payload(payload: Any) -> list[ParsedMcpServer]:
+    """Parse a standard ``mcpServers`` blob into normalized server entries.
+
+    Accepts ``{"mcpServers": {name: def}}`` (the common shape), a bare
+    ``{name: def}`` map, or a single self-naming server object. Never raises on
+    a malformed entry — the bad entry carries an ``error`` and the rest parse.
+    """
+    return [
+        _normalize_server_entry(k, v) for k, v in _unwrap_servers_map(payload).items()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +455,8 @@ class EffectiveServer(BaseModel):
     header_refs: list[str] = Field(default_factory=list)
     description: str = ""
     instruction: str = ""
-    tool_exposure_mode: Optional[str] = None
+    tool_exposure_mode: str = "summary"
+    discovery_uses_secrets: bool = False
     command: Optional[str] = None
     args: list[str] = Field(default_factory=list)
     url: Optional[str] = None
@@ -301,6 +470,15 @@ class EffectiveServerList(BaseModel):
     sandbox_running: bool
     max_servers: int
     config_version: int
+    # The version the running session has actually applied (loaded into the live
+    # agent), or None when no warm session exists. The frontend derives the
+    # version-accurate "synced" state from applied >= config_version.
+    applied_config_version: Optional[int] = None
+    # True while the sandbox is transitioning *up* toward running (a proactive
+    # MCP apply, or workspace entry, just kicked a warm). Lets the UI keep
+    # polling — and show "Starting workspace…" — through the stopped→running
+    # gap instead of resting on a stale "stopped".
+    sandbox_warming: bool = False
 
 
 class CatalogServer(BaseModel):
@@ -316,8 +494,16 @@ class CatalogServer(BaseModel):
     description: str = ""
     instruction: str = ""
     tool_exposure_mode: str = "summary"
+    discovery_uses_secrets: bool = False
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class CatalogServerList(BaseModel):
+    """GET /api/v1/mcp/servers payload."""
+
+    servers: list[CatalogServer]
+    max_servers: int
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +533,7 @@ def catalog_row_to_response(row: dict[str, Any]) -> CatalogServer:
         description=row.get("description") or "",
         instruction=row.get("instruction") or "",
         tool_exposure_mode=row.get("tool_exposure_mode") or "summary",
+        discovery_uses_secrets=bool(row.get("discovery_uses_secrets", False)),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
     )

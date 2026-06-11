@@ -15,8 +15,7 @@ effective-list endpoint and the sandbox-sync path can import the same logic
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ptc_agent.config.core import MCPServerConfig
 
@@ -35,8 +34,9 @@ class ResolvedMCP:
     ``servers`` is deterministic (built-ins in config order, then user servers
     alphabetical). ``builtin_names`` / ``user_names`` partition the effective
     set by origin. ``disabled_builtin_names`` lists built-ins removed by a
-    disable-marker row (excluded from ``servers``, but the API needs them so
-    the UI keeps a re-enable toggle). ``version`` is
+    disable-marker row, and ``disabled_workspace_servers`` lists disabled
+    user servers — both are excluded from ``servers`` (so they don't run) but
+    carried so the API can keep a re-enable toggle in the UI. ``version`` is
     ``workspaces.mcp_config_version``.
     """
 
@@ -45,6 +45,7 @@ class ResolvedMCP:
     user_names: frozenset[str]
     version: int
     disabled_builtin_names: frozenset[str] = frozenset()
+    disabled_workspace_servers: list[MCPServerConfig] = field(default_factory=list)
 
 
 def workspace_row_to_server_config(row: dict) -> MCPServerConfig:
@@ -77,8 +78,7 @@ async def resolve_mcp_config(
     workspace with zero rows returns the built-in objects unchanged (no copies)
     so zero-user-server workspaces stay byte-identical downstream.
     """
-    from src.server.database.mcp_servers import list_workspace_servers
-    from src.server.database.workspace import get_workspace
+    from src.server.database.mcp_servers import get_workspace_servers_and_version
 
     # Built-ins from the global config, enabled only, in declaration order.
     builtin_servers = [
@@ -87,12 +87,10 @@ async def resolve_mcp_config(
     ]
     builtin_name_set = {s.name for s in builtin_servers}
 
-    # Two independent reads — the workspace rows and the version counter —
-    # batched so the resolver pays one round-trip, not two.
-    rows, version = await asyncio.gather(
-        list_workspace_servers(workspace_id),
-        _read_config_version(get_workspace, workspace_id),
-    )
+    # Read the workspace rows AND the version counter in one snapshot-consistent
+    # transaction. Reading them separately could observe a CRUD mutation
+    # half-applied and cache the new server set under the stale version key.
+    rows, version = await get_workspace_servers_and_version(workspace_id)
 
     # Short-circuit: no workspace rows ⇒ the effective set IS the built-in
     # list (same objects, no copies) so the hot path stays byte-identical.
@@ -106,6 +104,7 @@ async def resolve_mcp_config(
 
     disabled_builtins: set[str] = set()
     user_servers: list[MCPServerConfig] = []
+    disabled_user_servers: list[MCPServerConfig] = []
     for row in rows:
         if row["source"] == "builtin":
             # Disable-marker: only acts when it turns a built-in off.
@@ -113,8 +112,6 @@ async def resolve_mcp_config(
                 disabled_builtins.add(row["name"])
             continue
         # source == 'workspace'
-        if not row["enabled"]:
-            continue
         if row["name"] in builtin_name_set:
             # Backstop for the API's 409: a user server must never collide with
             # a built-in name. Skip + log; do not let it shadow the built-in.
@@ -125,17 +122,26 @@ async def resolve_mcp_config(
             )
             continue
         try:
-            user_servers.append(workspace_row_to_server_config(row))
+            cfg = workspace_row_to_server_config(row)
         except Exception:
             logger.error(
                 "[MCP] Failed to parse workspace server %r in workspace %s; "
                 "skipping.", row["name"], workspace_id, exc_info=True,
             )
+            continue
+        # Disabled workspace servers are excluded from the effective set (they
+        # don't run), but carried separately so the API keeps a re-enable
+        # toggle in the UI — mirrors disabled_builtin_names for built-ins.
+        if row["enabled"]:
+            user_servers.append(cfg)
+        else:
+            disabled_user_servers.append(cfg)
 
     effective_builtins = [
         s for s in builtin_servers if s.name not in disabled_builtins
     ]
     user_servers.sort(key=lambda s: s.name)
+    disabled_user_servers.sort(key=lambda s: s.name)
 
     return ResolvedMCP(
         servers=[*effective_builtins, *user_servers],
@@ -143,12 +149,5 @@ async def resolve_mcp_config(
         user_names=frozenset(s.name for s in user_servers),
         version=version,
         disabled_builtin_names=frozenset(disabled_builtins & builtin_name_set),
+        disabled_workspace_servers=disabled_user_servers,
     )
-
-
-async def _read_config_version(get_workspace, workspace_id: str) -> int:
-    """Read ``mcp_config_version`` for a workspace, defaulting to 0."""
-    ws = await get_workspace(workspace_id)
-    if not ws:
-        return 0
-    return int(ws.get("mcp_config_version") or 0)

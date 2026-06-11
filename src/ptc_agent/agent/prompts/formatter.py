@@ -7,7 +7,7 @@ and are kept in Python rather than templates.
 import structlog
 from typing import Any
 
-from ptc_agent.core.mcp_sanitize import sanitize_tool_text
+from ptc_agent.core.mcp_sanitize import sanitize_tool_name, sanitize_tool_text
 
 logger = structlog.get_logger(__name__)
 
@@ -34,6 +34,50 @@ WORKSPACE_DETAILED_MAX_CHARS = 8000
 def _is_workspace_source(config: Any) -> bool:
     """True when ``config`` is an untrusted user-provided (workspace) server."""
     return bool(config) and getattr(config, "source", "builtin") == "workspace"
+
+
+def _safe_tool_name(name: Any, *, workspace: bool) -> str:
+    """Render a tool name into a single prompt line.
+
+    For workspace (untrusted) servers, strip newlines and neutralize any
+    injection text so a hostile tool name can't smuggle a fake directive into
+    the detailed listing. Builtin names render verbatim (byte-identical).
+    """
+    text = str(name)
+    if not workspace:
+        return text
+    return sanitize_tool_text(text.replace("\r", " ").replace("\n", " "))
+
+
+def _safe_param_name(name: Any, *, workspace: bool) -> str:
+    """Render a tool PARAMETER name into a prompt-safe token.
+
+    A workspace (untrusted) param name is coerced to a bare identifier, so a
+    hostile name like ``x)\\nInstructions: ...`` collapses to one inert token and
+    can't open a fake directive line in the detailed listing. Builtin params
+    render verbatim (byte-identical).
+    """
+    if not workspace:
+        return str(name)
+    return sanitize_tool_name(str(name)) or "arg"
+
+
+def _safe_param_text(text: Any, *, workspace: bool) -> str:
+    """Render an untrusted param type/default (or tool description) inline-safe.
+
+    Strips newlines and neutralizes injection text so the value can't break onto
+    its own prompt line, while preserving brackets etc. so legit types like
+    ``list[str]`` stay intact. Builtin values render verbatim (byte-identical).
+    The length bound is the detailed-mode total cap (not the smaller default), so
+    per-field sanitization never shrinks the body out from under that cap's
+    fall-back-to-summary check.
+    """
+    if not workspace:
+        return str(text)
+    return sanitize_tool_text(
+        str(text).replace("\r", " ").replace("\n", " "),
+        WORKSPACE_DETAILED_MAX_CHARS,
+    )
 
 
 def _workspace_server_header(server_name: str, config: Any) -> list[str]:
@@ -219,8 +263,9 @@ def _format_server_detailed(server_name: str, tools: list, config: Any) -> list:
     lines.append(f"  Module: tools/{server_name}.py")
     lines.append("  Available tools:")
 
+    workspace = _is_workspace_source(config)
     for tool in tools:
-        tool_line = f"    - {tool['name']}("
+        tool_line = f"    - {_safe_tool_name(tool['name'], workspace=workspace)}("
 
         # Add parameters
         if tool.get("parameters"):
@@ -230,24 +275,24 @@ def _format_server_detailed(server_name: str, tools: list, config: Any) -> list:
             elif isinstance(params, dict):
                 param_strs = []
                 for pname, pinfo in params.items():
-                    ptype = pinfo.get("type", "any")
-                    required = pinfo.get("required", False)
-                    if required:
-                        param_strs.append(f"{pname}: {ptype}")
+                    safe_name = _safe_param_name(pname, workspace=workspace)
+                    safe_type = _safe_param_text(pinfo.get("type", "any"), workspace=workspace)
+                    if pinfo.get("required", False):
+                        param_strs.append(f"{safe_name}: {safe_type}")
                     else:
-                        default = pinfo.get("default", "None")
-                        param_strs.append(f"{pname}: {ptype} = {default}")
+                        safe_default = _safe_param_text(pinfo.get("default", "None"), workspace=workspace)
+                        param_strs.append(f"{safe_name}: {safe_type} = {safe_default}")
                 tool_line += ", ".join(param_strs)
 
         tool_line += ")"
 
         # Add return type
         if tool.get("return_type"):
-            tool_line += f" -> {tool['return_type']}"
+            tool_line += f" -> {_safe_param_text(tool['return_type'], workspace=workspace)}"
 
         # Add description
         if tool.get("description"):
-            tool_line += f": {tool['description']}"
+            tool_line += f": {_safe_param_text(tool['description'], workspace=workspace)}"
 
         lines.append(tool_line)
 
@@ -336,8 +381,9 @@ def _format_tool_summary_detailed(
         lines.append(f"  Module: tools/{server_name}.py")
         lines.append("  Available tools:")
 
+        workspace = _is_workspace_source(config)
         for tool in tools:
-            tool_line = f"    - {tool['name']}("
+            tool_line = f"    - {_safe_tool_name(tool['name'], workspace=workspace)}("
 
             # Add parameters
             if tool.get("parameters"):
@@ -347,24 +393,24 @@ def _format_tool_summary_detailed(
                 elif isinstance(params, dict):
                     param_strs = []
                     for pname, pinfo in params.items():
-                        ptype = pinfo.get("type", "any")
-                        required = pinfo.get("required", False)
-                        if required:
-                            param_strs.append(f"{pname}: {ptype}")
+                        safe_name = _safe_param_name(pname, workspace=workspace)
+                        safe_type = _safe_param_text(pinfo.get("type", "any"), workspace=workspace)
+                        if pinfo.get("required", False):
+                            param_strs.append(f"{safe_name}: {safe_type}")
                         else:
-                            default = pinfo.get("default", "None")
-                            param_strs.append(f"{pname}: {ptype} = {default}")
+                            safe_default = _safe_param_text(pinfo.get("default", "None"), workspace=workspace)
+                            param_strs.append(f"{safe_name}: {safe_type} = {safe_default}")
                     tool_line += ", ".join(param_strs)
 
             tool_line += ")"
 
             # Add return type
             if tool.get("return_type"):
-                tool_line += f" -> {tool['return_type']}"
+                tool_line += f" -> {_safe_param_text(tool['return_type'], workspace=workspace)}"
 
             # Add description
             if tool.get("description"):
-                tool_line += f": {tool['description']}"
+                tool_line += f": {_safe_param_text(tool['description'], workspace=workspace)}"
 
             lines.append(tool_line)
 

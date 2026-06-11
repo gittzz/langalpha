@@ -2,9 +2,10 @@
 
 Adds the catalog of user-level MCP server templates (user_mcp_servers),
 the per-workspace source of truth (workspace_mcp_servers), the discovery
-schema cache keyed by config version (workspace_mcp_tool_schemas), and a
-mcp_config_version counter on workspaces that every workspace-row mutation
-bumps so sessions can detect config drift without a new per-turn query.
+schema cache keyed by a per-server config hash (workspace_mcp_tool_schemas),
+and a mcp_config_version counter on workspaces that every workspace-row
+mutation bumps so sessions can detect config drift without a new per-turn
+query.
 
 Secrets are never stored here — env/header values hold "${vault:NAME}"
 references resolved against workspace_vault_secrets at sandbox runtime.
@@ -39,17 +40,15 @@ def upgrade() -> None:
             description TEXT NOT NULL DEFAULT '',
             instruction TEXT NOT NULL DEFAULT '',
             tool_exposure_mode VARCHAR(16) NOT NULL DEFAULT 'summary',
+            discovery_uses_secrets BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(user_id, name)
         )
     """)
 
-    op.execute("""
-        CREATE INDEX IF NOT EXISTS idx_user_mcp_servers_user
-        ON user_mcp_servers(user_id)
-    """)
-
+    # No separate user_id index: UNIQUE(user_id, name) already serves
+    # user_id-prefix lookups and ORDER BY name.
     op.execute("DROP TRIGGER IF EXISTS update_user_mcp_servers_updated_at ON user_mcp_servers")
     op.execute("""
         CREATE TRIGGER update_user_mcp_servers_updated_at
@@ -73,11 +72,7 @@ def upgrade() -> None:
         )
     """)
 
-    op.execute("""
-        CREATE INDEX IF NOT EXISTS idx_workspace_mcp_servers_workspace
-        ON workspace_mcp_servers(workspace_id)
-    """)
-
+    # No separate workspace_id index: UNIQUE(workspace_id, name) covers it.
     op.execute("DROP TRIGGER IF EXISTS update_workspace_mcp_servers_updated_at ON workspace_mcp_servers")
     op.execute("""
         CREATE TRIGGER update_workspace_mcp_servers_updated_at
@@ -85,25 +80,29 @@ def upgrade() -> None:
         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()
     """)
 
-    # Discovery cache keyed by (workspace, server, config_version) so package
-    # drift across a version bump is recorded distinctly.
+    # Discovery cache keyed by a per-server config_hash (a fingerprint of that
+    # server's own discovery-affecting config) so a cached snapshot survives
+    # unrelated mutations to OTHER servers and is invalidated only when that
+    # server's own config changes.
     op.execute("""
         CREATE TABLE IF NOT EXISTS workspace_mcp_tool_schemas (
             workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
             server_name VARCHAR(255) NOT NULL,
-            config_version INTEGER NOT NULL,
+            config_hash TEXT NOT NULL,
             tools JSONB NOT NULL DEFAULT '[]',
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             error TEXT NOT NULL DEFAULT '',
             observed_meta JSONB NOT NULL DEFAULT '{}',
             discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE(workspace_id, server_name, config_version)
+            UNIQUE(workspace_id, server_name, config_hash)
         )
     """)
 
+    # Lookup is latest-snapshot-per-server (any hash); the caller matches the
+    # hash against the server's current fingerprint.
     op.execute("""
         CREATE INDEX IF NOT EXISTS idx_workspace_mcp_tool_schemas_lookup
-        ON workspace_mcp_tool_schemas(workspace_id, config_version)
+        ON workspace_mcp_tool_schemas(workspace_id, server_name, discovered_at DESC)
     """)
 
     # Versioned config tag: schema-cache key + session-cache invalidation

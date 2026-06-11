@@ -8,7 +8,12 @@ import structlog
 from ptc_agent.config.core import MCPServerConfig
 
 from .mcp_registry import MCPToolInfo
-from .mcp_sanitize import sanitize_tool_name, sanitize_tool_set, sanitize_tool_text
+from .mcp_sanitize import (
+    discovery_should_use_secrets,
+    sanitize_tool_name,
+    sanitize_tool_set,
+    sanitize_tool_text,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -206,6 +211,25 @@ except ImportError:
         func_name = _safe_func_name(tool.name)
         params = tool.get_parameters()
 
+        # For untrusted workspace servers, coerce each param NAME into a legal
+        # identifier (a hostile schema key could otherwise inject code or break
+        # the module); skip names that can't be salvaged. Builtins keep the raw
+        # key verbatim so their generated code stays byte-identical.
+        if source == "workspace":
+            usable: dict[str, dict[str, Any]] = {}
+            for param_name, param_info in params.items():
+                safe_param = sanitize_tool_name(param_name)
+                if safe_param is None or safe_param in usable:
+                    logger.warning(
+                        "Skipped invalid/colliding param for workspace MCP tool",
+                        server=server_name,
+                        tool=tool.name,
+                        param=param_name,
+                    )
+                    continue
+                usable[safe_param] = param_info
+            params = usable
+
         # Build parameter list - required parameters must come before optional
         param_list = []
 
@@ -231,15 +255,34 @@ except ImportError:
         # Generate docstring
         docstring = self._generate_docstring(tool, params, source)
 
-        # Generate function body
-        arg_dict_entries = [
-            f'        "{param_name}": {param_name},' for param_name in params
-        ]
+        # Generate function body. For workspace servers the arg-dict KEY is
+        # emitted via repr (the param name is untrusted text); builtins keep the
+        # historical double-quoted literal so their output is byte-identical.
+        if source == "workspace":
+            arg_dict_entries = [
+                f"        {param_name!r}: {param_name}," for param_name in params
+            ]
+        else:
+            arg_dict_entries = [
+                f'        "{param_name}": {param_name},' for param_name in params
+            ]
 
         args_dict = "\n".join(arg_dict_entries)
 
         # Extract return type from description for better type hints
         return_type, _ = self._extract_return_info(tool.description)
+
+        # Workspace tool names are untrusted — emit server/tool via repr so a
+        # hostile name can't escape the string literal and inject code. Builtins
+        # keep the historical double-quoted literal (byte-identical).
+        if source == "workspace":
+            call_line = (
+                f"    return _call_mcp_tool({server_name!r}, {tool.name!r}, arguments)"
+            )
+        else:
+            call_line = (
+                f'    return _call_mcp_tool("{server_name}", "{tool.name}", arguments)'
+            )
 
         return f'''def {func_name}({param_str}) -> {return_type}:
     """{docstring}"""
@@ -250,7 +293,7 @@ except ImportError:
     # Remove None values
     arguments = {{k: v for k, v in arguments.items() if v is not None}}
 
-    return _call_mcp_tool("{server_name}", "{tool.name}", arguments)'''
+{call_line}'''
 
     def _generate_docstring(
         self, tool: MCPToolInfo, params: dict[str, Any], source: str = "builtin"
@@ -577,7 +620,10 @@ def _build_proc_env(config, server_name="?", *, discovery=False):
         for _k in ("PATH", "HOME", "LANG", "LC_ALL"):
             if _k in os.environ:
                 proc_env[_k] = os.environ[_k]
-        vault = _load_vault()
+        # Secret-less discovery (default): every ${{vault:NAME}} ref hits the
+        # inert path. Opt in per server via discovery_uses_secrets for servers
+        # that need auth even to list tools. Normal calls always resolve.
+        vault = _load_vault() if (not discovery or config.get("discovery_uses_secrets")) else {{}}
         missing = []
         for _name, _val in (config.get("env") or {{}}).items():
             proc_env[_name] = _resolve_vault_refs(
@@ -615,7 +661,9 @@ def _resolve_sse(config, server_name, *, discovery=False):
 
         return _re.sub(r"\\$\\{{([^}}]+)\\}}", _env_sub, url), {{}}
 
-    vault = _load_vault()
+    # Secret-less discovery (default): refs resolve inert. Opt in per server via
+    # discovery_uses_secrets. Normal calls (discovery=False) always resolve.
+    vault = _load_vault() if (not discovery or config.get("discovery_uses_secrets")) else {{}}
     missing = []
     url = _resolve_vault_refs(url, vault, missing=missing, discovery=discovery)
     headers = {{}}
@@ -673,11 +721,13 @@ def _resolve_sse(config, server_name, *, discovery=False):
                 url = server.url or ""
                 if is_workspace:
                     headers_repr = repr(dict(getattr(server, "headers", {}) or {}))
+                    dus = discovery_should_use_secrets(server)
                     servers_dict += f"""    "{server.name}": {{
         "transport": "{server.transport}",
         "url": {url!r},
         "source": "workspace",
         "headers": {headers_repr},
+        "discovery_uses_secrets": {dus!r},
     }},
 """
                 else:
@@ -718,12 +768,14 @@ def _resolve_sse(config, server_name, *, discovery=False):
                     # Values are NOT secrets: vault refs are placeholders resolved
                     # in-sandbox; literals are user-supplied non-secret config.
                     env_repr = repr(dict(getattr(server, "env", {}) or {}))
+                    dus = discovery_should_use_secrets(server)
                     servers_dict += f"""    "{server.name}": {{
         "transport": "stdio",
         "command": "{command}",
         "args": [{args_list}],
         "source": "workspace",
         "env": {env_repr},
+        "discovery_uses_secrets": {dus!r},
     }},
 """
                 else:
@@ -972,7 +1024,7 @@ def _initialize_sse_server(server_name: str{discovery_param}) -> None:
 
     url = config.get("url")
     if not url:
-        msg = f"SSE server {{server_name}} has no URL configured"
+        msg = f"Remote MCP server {{server_name}} has no URL configured"
         raise ValueError(msg)
 {sse_init_resolve}
     # Send initialize request
@@ -1010,7 +1062,7 @@ def _initialize_sse_server(server_name: str{discovery_param}) -> None:
         _sse_sessions[server_name] = True
 
     except Exception as e:  # noqa: BLE001 - Re-raising as RuntimeError with context
-        msg = f"Failed to initialize SSE server {{server_name}}: {{e}}"
+        msg = f"Failed to initialize remote MCP server {{server_name}}: {{e}}"
         raise RuntimeError(msg) from e
 
 

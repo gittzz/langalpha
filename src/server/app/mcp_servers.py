@@ -14,36 +14,53 @@ Endpoints (all require_workspace_owner):
 - PATCH  /api/v1/workspaces/{id}/mcp/servers/{name}/enabled
 - DELETE /api/v1/workspaces/{id}/mcp/servers/{name}
 - POST   /api/v1/workspaces/{id}/mcp/servers/{name}/discover
+- POST   /api/v1/workspaces/{id}/mcp/servers/{name}/promote
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
 
+from src.ptc_agent.core.mcp_sanitize import VAULT_REF_RE
 from src.server.database.mcp_servers import (
     MAX_MCP_SERVERS_PER_WORKSPACE,
+    create_catalog_server,
     delete_workspace_server,
     get_catalog_server,
     get_tool_schemas,
+    get_workspace_servers_and_version,
+    insert_workspace_server,
     list_workspace_servers,
     set_workspace_server_enabled,
+    update_catalog_server,
     upsert_workspace_server,
 )
-from src.server.database.vault_secrets import get_workspace_secret_names
+from src.server.database.vault_secrets import (
+    create_secret as create_secret_db,
+    get_workspace_secret_names,
+)
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.handlers.chat.mcp_config import resolve_mcp_config
+from src.server.services.mcp_discovery import mcp_discovery_fingerprint
 from src.server.models.mcp_server import (
+    CatalogServer,
     EffectiveServer,
     EffectiveServerList,
     EnabledInput,
     McpServerInput,
+    PromoteInput,
     ToolSummary,
+    _format_validation_error,
+    catalog_row_to_response,
     collect_vault_refs,
+    parse_mcp_servers_payload,
 )
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.utils.api import CurrentUserId, handle_api_exceptions, require_workspace_owner
@@ -57,19 +74,20 @@ router = APIRouter(prefix="/api/v1/workspaces", tags=["MCP Servers"])
 # pending (kept simple — no Redis).
 _DISCOVER_DEBOUNCE_SECONDS = 15
 
+# On bulk import, an env/header value is auto-extracted into a vault secret when
+# it looks like a credential — either the key name reads like one, or the value
+# is a long opaque token. Benign config (``MODE=prod``, ``LOG_LEVEL=ERROR``)
+# stays an inline literal so we don't clutter the vault.
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(secret|token|password|passwd|pwd|apikey|api[_-]?key|access[_-]?key|"
+    r"authorization|auth|bearer|credential|cred|private[_-]?key|\bpat\b|\bkey\b)"
+)
+_OPAQUE_TOKEN_MIN_LEN = 20
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _format_validation_error(exc: ValidationError) -> str:
-    """Flatten a Pydantic ValidationError into a JSON-safe detail string."""
-    parts = []
-    for err in exc.errors(include_url=False):
-        loc = ".".join(str(p) for p in err.get("loc", ())) or "body"
-        parts.append(f"{loc}: {err.get('msg', 'invalid')}")
-    return "; ".join(parts) or "validation error"
 
 
 def _builtin_names() -> set[str]:
@@ -87,16 +105,22 @@ async def _require_owned_workspace(workspace_id: str, user_id: str) -> dict:
     return workspace
 
 
+def _missing_secrets(
+    env_refs: list[str], header_refs: list[str], secret_names: set[str]
+) -> list[str]:
+    """Sorted, de-duplicated vault refs not present in the workspace vault."""
+    return sorted({n for n in (*env_refs, *header_refs) if n not in secret_names})
+
+
 def _derive_status(
     *,
     origin: str,
-    enabled: bool,
     env_refs: list[str],
     header_refs: list[str],
     secret_names: set[str],
     schema_row: dict[str, Any] | None,
-) -> tuple[str, str]:
-    """Derive the (status, error) pair for one effective server.
+) -> tuple[str, str, list[str]]:
+    """Derive the (status, error, missing_secrets) triple for one effective server.
 
     - builtin disabled-marker rows never reach here (excluded from effective).
     - builtins are process-global ⇒ ``connected``.
@@ -105,19 +129,19 @@ def _derive_status(
     - else from the schema cache at the current version: ``ok`` ⇒ connected,
       ``error`` ⇒ error (with text), missing row ⇒ pending.
     """
+    missing = _missing_secrets(env_refs, header_refs, secret_names)
     if origin == "builtin":
-        return "connected", ""
-    missing = [n for n in (*env_refs, *header_refs) if n not in secret_names]
+        return "connected", "", missing
     if missing:
-        return "needs_secret", ""
+        return "needs_secret", "", missing
     if schema_row is None:
-        return "pending", ""
+        return "pending", "", missing
     status = schema_row.get("status")
     if status == "ok":
-        return "connected", ""
+        return "connected", "", missing
     if status == "error":
-        return "error", str(schema_row.get("error") or "discovery failed")
-    return "pending", ""
+        return "error", str(schema_row.get("error") or "discovery failed"), missing
+    return "pending", "", missing
 
 
 def _tools_from_schema(schema_row: dict[str, Any] | None) -> list[ToolSummary]:
@@ -135,6 +159,17 @@ def _tools_from_schema(schema_row: dict[str, Any] | None) -> list[ToolSummary]:
 
 def _sandbox_running(workspace: dict) -> bool:
     return workspace.get("status") == "running"
+
+
+# Statuses where the sandbox is on its way *up* toward running — a warm is in
+# flight (our proactive MCP apply, or workspace entry, kicked one). The UI uses
+# this to keep polling and show "Starting workspace…" through the
+# stopped→starting→running gap, rather than freezing on a stale "stopped".
+_WARMING_STATUSES = frozenset({"starting", "creating"})
+
+
+def _sandbox_warming(workspace: dict) -> bool:
+    return workspace.get("status") in _WARMING_STATUSES
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +194,7 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
 
     resolved = await resolve_mcp_config(base_config, user_id, workspace_id)
     secret_names = await get_workspace_secret_names(workspace_id)
-    schema_rows = await get_tool_schemas(workspace_id, resolved.version)
+    schema_rows = await get_tool_schemas(workspace_id)
     schema_by_name = {r["server_name"]: r for r in schema_rows}
 
     servers: list[EffectiveServer] = []
@@ -168,16 +203,18 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
         env_refs = collect_vault_refs(dict(srv.env or {}))
         header_refs = collect_vault_refs(dict(srv.headers or {}))
         schema_row = schema_by_name.get(srv.name) if origin == "workspace" else None
-        status, error = _derive_status(
+        # Accept a cached snapshot only if it's for THIS server's current config.
+        # A stale-hash row (the server's own config changed but it hasn't been
+        # re-discovered yet) reads as pending → re-verify; an unrelated mutation
+        # leaves the hash untouched → the row stays a valid hit.
+        if schema_row is not None and schema_row.get("config_hash") != mcp_discovery_fingerprint(srv):
+            schema_row = None
+        status, error, missing = _derive_status(
             origin=origin,
-            enabled=srv.enabled,
             env_refs=env_refs,
             header_refs=header_refs,
             secret_names=secret_names,
             schema_row=schema_row,
-        )
-        missing = sorted(
-            {n for n in (*env_refs, *header_refs) if n not in secret_names}
         )
         tools = _tools_from_schema(schema_row)
         servers.append(
@@ -197,7 +234,10 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
                 header_refs=header_refs,
                 description=srv.description or "",
                 instruction=srv.instruction or "",
-                tool_exposure_mode=srv.tool_exposure_mode,
+                tool_exposure_mode=srv.tool_exposure_mode or "summary",
+                discovery_uses_secrets=bool(
+                    getattr(srv, "discovery_uses_secrets", False)
+                ),
                 command=srv.command,
                 args=list(srv.args or []),
                 url=srv.url,
@@ -227,7 +267,7 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
                 header_refs=[],
                 description=srv.description or "",
                 instruction=srv.instruction or "",
-                tool_exposure_mode=srv.tool_exposure_mode,
+                tool_exposure_mode=srv.tool_exposure_mode or "summary",
                 command=srv.command,
                 args=list(srv.args or []),
                 url=srv.url,
@@ -235,11 +275,58 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
             )
         )
 
+    # Disabled workspace servers are likewise dropped from the resolver's
+    # effective set; surface them (greyed, with their toggle) so disabling a
+    # workspace server isn't a one-way trip — mirrors the disabled-builtin
+    # re-add above.
+    for srv in resolved.disabled_workspace_servers:
+        env_refs = collect_vault_refs(dict(srv.env or {}))
+        header_refs = collect_vault_refs(dict(srv.headers or {}))
+        servers.append(
+            EffectiveServer(
+                name=srv.name,
+                origin="workspace",
+                transport=srv.transport,
+                enabled=False,
+                editable=True,
+                deletable=True,
+                status="disabled",
+                error="",
+                tool_count=0,
+                tools=[],
+                missing_secrets=[],
+                env_refs=env_refs,
+                header_refs=header_refs,
+                description=srv.description or "",
+                instruction=srv.instruction or "",
+                tool_exposure_mode=srv.tool_exposure_mode or "summary",
+                discovery_uses_secrets=bool(
+                    getattr(srv, "discovery_uses_secrets", False)
+                ),
+                command=srv.command,
+                args=list(srv.args or []),
+                url=srv.url,
+                config_version=resolved.version,
+            )
+        )
+
+    # Version the running session has actually applied (no I/O) — drives the
+    # frontend's version-accurate "synced" state. None when no warm session.
+    applied_version: int | None = None
+    try:
+        applied_version = WorkspaceManager.get_instance().get_applied_mcp_config_version(
+            workspace_id
+        )
+    except Exception:
+        logger.debug("[mcp] applied version lookup failed for %s", workspace_id)
+
     return EffectiveServerList(
         servers=servers,
         sandbox_running=_sandbox_running(workspace),
+        sandbox_warming=_sandbox_warming(workspace),
         max_servers=MAX_MCP_SERVERS_PER_WORKSPACE,
         config_version=resolved.version,
+        applied_config_version=applied_version,
     )
 
 
@@ -270,23 +357,24 @@ async def add_server(
             status_code=409,
             detail=f"{server.name!r} collides with a built-in server name",
         )
-    existing = {r["name"] for r in await list_workspace_servers(workspace_id)}
-    if server.name in existing:
-        raise HTTPException(
-            status_code=409, detail=f"{server.name!r} already exists in this workspace"
-        )
 
     try:
-        row = await upsert_workspace_server(
+        # Conflict-safe insert (ON CONFLICT DO NOTHING): a concurrent create of
+        # the same new name can't silently turn into an UPDATE. None ⇒ the name
+        # already exists. The pre-check above only short-circuits built-ins.
+        row = await insert_workspace_server(
             workspace_id,
             server.name,
-            source="workspace",
-            enabled=True,
             config=server.to_config_blob(),
         )
     except ValueError as e:
         # DB layer signals over-cap by raising ValueError under the advisory lock.
         raise HTTPException(status_code=409, detail=str(e))
+    if row is None:
+        raise HTTPException(
+            status_code=409, detail=f"{server.name!r} already exists in this workspace"
+        )
+    _schedule_proactive_apply(workspace_id, user_id)
     return {"name": row["name"], "source": row["source"], "enabled": row["enabled"]}
 
 
@@ -314,9 +402,312 @@ async def _server_from_template(user_id: str, body: dict) -> McpServerInput:
             description=template.get("description") or "",
             instruction=template.get("instruction") or "",
             tool_exposure_mode=template.get("tool_exposure_mode") or "summary",
+            discovery_uses_secrets=bool(
+                template.get("discovery_uses_secrets", False)
+            ),
         )
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors(include_url=False))
+        raise HTTPException(status_code=422, detail=_format_validation_error(e))
+
+
+# ---------------------------------------------------------------------------
+# POST — promote a workspace server UP into the user's template catalog
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{workspace_id}/mcp/servers/{name}/promote", status_code=201)
+@handle_api_exceptions("promote workspace MCP server to template", logger)
+async def promote_server(
+    workspace_id: str,
+    name: str,
+    user_id: CurrentUserId,
+    body: PromoteInput | None = None,
+) -> CatalogServer:
+    """Save a workspace server's definition as a reusable user-level template.
+
+    The inverse of ``from_template``: copies the workspace row's config into the
+    user catalog (re-validated through the same input model). Only
+    ``${vault:NAME}`` reference names travel — secret values are workspace-scoped
+    and never copied, so the template surfaces ``missing_secrets`` when later
+    added to another workspace. ``overwrite`` replaces an existing template of
+    the same name; without it a name clash is a 409.
+    """
+    await _require_owned_workspace(workspace_id, user_id)
+    overwrite = bool(body and body.overwrite)
+
+    if name in _builtin_names():
+        raise HTTPException(
+            status_code=409,
+            detail="Built-in servers are global; only workspace servers can be "
+            "saved as templates",
+        )
+
+    rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
+    existing = rows.get(name)
+    if existing is None or existing["source"] != "workspace":
+        raise HTTPException(status_code=404, detail="MCP server not found")
+
+    # Re-validate the stored config so a template is never minted from a row that
+    # no longer passes the (possibly tightened) policy.
+    try:
+        server = McpServerInput(**(existing.get("config") or {}))
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=_format_validation_error(e))
+
+    fields = {
+        "transport": server.transport,
+        "command": server.command,
+        "args": server.args,
+        "url": server.url,
+        "env": server.env,
+        "headers": server.headers,
+        "description": server.description,
+        "instruction": server.instruction,
+        "tool_exposure_mode": server.tool_exposure_mode,
+        "discovery_uses_secrets": server.discovery_uses_secrets,
+    }
+
+    if overwrite:
+        row = await update_catalog_server(user_id, server.name, updates=fields)
+        if row is not None:
+            return catalog_row_to_response(row)
+        # Nothing to overwrite (raced delete / never existed) ⇒ fall through.
+
+    if await get_catalog_server(user_id, server.name) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A template named {server.name!r} already exists. "
+            "Pass overwrite to replace it.",
+        )
+    try:
+        row = await create_catalog_server(user_id, server.name, **fields)
+    except ValueError as e:
+        # DB layer signals over-cap (or a raced duplicate) by raising ValueError.
+        raise HTTPException(status_code=409, detail=str(e))
+    return catalog_row_to_response(row)
+
+
+# ---------------------------------------------------------------------------
+# POST — bulk import a standard `mcpServers` JSON blob
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{workspace_id}/mcp/servers/import")
+@handle_api_exceptions("import workspace MCP servers", logger)
+async def import_servers(
+    workspace_id: str,
+    user_id: CurrentUserId,
+    body: dict = Body(...),
+) -> dict:
+    """Parse a standard ``{"mcpServers": {...}}`` blob and create each server.
+
+    Names are coerced to our identifier shape, transports are mapped, and inline
+    literal secrets are auto-extracted into the workspace vault (rewritten to
+    ``${vault:NAME}`` refs, deduped by value across the import). Per-server
+    outcomes are reported so a partial import is legible. Like every mutation,
+    this only writes DB rows + bumps the config version — the change applies on
+    the next agent run (≤30s).
+    """
+    await _require_owned_workspace(workspace_id, user_id)
+
+    parsed = parse_mcp_servers_payload(body)
+    if not parsed:
+        raise HTTPException(
+            status_code=422,
+            detail='No MCP servers found. Expected a JSON object like '
+            '{"mcpServers": { "<name>": { ... } }}.',
+        )
+
+    builtins = _builtin_names()
+    existing_rows, _ = await get_workspace_servers_and_version(workspace_id)
+    existing_names = {r["name"] for r in existing_rows}
+    current_ws_count = sum(1 for r in existing_rows if r["source"] == "workspace")
+    used_secret_names = set(await get_workspace_secret_names(workspace_id))
+
+    # value → ${vault:NAME}, so an identical token reused across servers (common
+    # for a single provider) is stored once.
+    allocated: dict[str, str] = {}
+    secrets_created: list[str] = []
+    seen_names: set[str] = set()
+    results: list[dict[str, Any]] = []
+    created_count = 0
+
+    for entry in parsed:
+        base = {
+            "original_name": entry.original_name,
+            "name": entry.name,
+            "renamed": entry.renamed,
+        }
+        if entry.error:
+            results.append({**base, "status": "invalid", "error": entry.error})
+            continue
+        if entry.name in builtins:
+            results.append(
+                {**base, "status": "skipped", "reason": "collides with a built-in server"}
+            )
+            continue
+        if entry.name in seen_names or entry.name in existing_names:
+            reason = (
+                "duplicate name after normalization"
+                if entry.name in seen_names
+                else "already exists in this workspace"
+            )
+            status = "skipped" if entry.name in seen_names else "exists"
+            results.append({**base, "status": status, "reason": reason})
+            continue
+        if current_ws_count + created_count >= MAX_MCP_SERVERS_PER_WORKSPACE:
+            results.append(
+                {
+                    **base,
+                    "status": "error",
+                    "error": f"workspace MCP server cap "
+                    f"({MAX_MCP_SERVERS_PER_WORKSPACE}) reached",
+                }
+            )
+            continue
+
+        seen_names.add(entry.name)
+        config = dict(entry.config)
+        try:
+            made = await _extract_literals_to_vault(
+                workspace_id,
+                entry.name,
+                config,
+                allocated=allocated,
+                used_secret_names=used_secret_names,
+            )
+        except ValueError as e:
+            results.append({**base, "status": "error", "error": str(e)})
+            continue
+
+        # An authenticated remote server needs its header even to list tools, so
+        # discovery must resolve secrets — set it explicitly so the stored value
+        # (and the UI toggle) is honest (matches discovery_should_use_secrets).
+        if config.get("transport") in ("http", "sse"):
+            headers = config.get("headers") or {}
+            if any(VAULT_REF_RE.search(str(v)) for v in headers.values()):
+                config["discovery_uses_secrets"] = True
+
+        try:
+            server = McpServerInput(**config)
+        except ValidationError as e:
+            results.append(
+                {**base, "status": "invalid", "error": _format_validation_error(e)}
+            )
+            continue
+
+        try:
+            row = await insert_workspace_server(
+                workspace_id, server.name, config=server.to_config_blob()
+            )
+        except ValueError as e:
+            results.append({**base, "status": "error", "error": str(e)})
+            continue
+        if row is None:
+            results.append({**base, "status": "exists"})
+            continue
+
+        secrets_created.extend(made)
+        created_count += 1
+        results.append({**base, "status": "created"})
+
+    # Imported secrets are usable immediately on a live sandbox (best-effort);
+    # the server set itself applies on the next agent run.
+    if secrets_created:
+        await _push_vault_to_sandbox(workspace_id)
+
+    _, version = await get_workspace_servers_and_version(workspace_id)
+    if created_count > 0:
+        _schedule_proactive_apply(workspace_id, user_id)
+    return {
+        "results": results,
+        "created": created_count,
+        "secrets_created": secrets_created,
+        "config_version": version,
+    }
+
+
+def _looks_like_secret(key: str, value: str) -> bool:
+    """Heuristic: should this env/header literal be vaulted rather than inlined?"""
+    if _SECRET_KEY_RE.search(key or ""):
+        return True
+    v = value or ""
+    return len(v) >= _OPAQUE_TOKEN_MIN_LEN and " " not in v and not v.isdigit()
+
+
+def _vault_secret_name(server_name: str, key: str, used: set[str]) -> str:
+    """Allocate a unique, NAME_RE-legal vault secret name for ``server.key``."""
+    base = re.sub(r"[^A-Za-z0-9_]", "_", f"{server_name}_{key}".upper())
+    if base and base[0].isdigit():
+        base = f"_{base}"
+    base = base[:64] or "IMPORTED_SECRET"
+    name = base
+    i = 2
+    while name in used:
+        suffix = f"_{i}"
+        name = f"{base[: 64 - len(suffix)]}{suffix}"
+        i += 1
+    return name
+
+
+async def _extract_literals_to_vault(
+    workspace_id: str,
+    server_name: str,
+    config: dict[str, Any],
+    *,
+    allocated: dict[str, str],
+    used_secret_names: set[str],
+) -> list[str]:
+    """Move credential-looking env/header literals into the vault, in place.
+
+    Existing ``${vault:NAME}`` refs and benign config literals are left alone.
+    Returns the names of any vault secrets created. May raise ``ValueError`` if
+    the vault secret cap is reached.
+    """
+    created: list[str] = []
+    for field in ("env", "headers"):
+        mapping = config.get(field)
+        if not isinstance(mapping, dict):
+            continue
+        out: dict[str, Any] = {}
+        for k, v in mapping.items():
+            if (
+                not isinstance(v, str)
+                or not v.strip()
+                or VAULT_REF_RE.fullmatch(v)
+                or not _looks_like_secret(str(k), v)
+            ):
+                out[k] = v
+                continue
+            ref = allocated.get(v)
+            if ref is None:
+                secret_name = _vault_secret_name(server_name, str(k), used_secret_names)
+                await create_secret_db(
+                    workspace_id,
+                    secret_name,
+                    v,
+                    f"Imported with MCP server {server_name}",
+                )
+                used_secret_names.add(secret_name)
+                created.append(secret_name)
+                ref = f"${{vault:{secret_name}}}"
+                allocated[v] = ref
+            out[k] = ref
+        config[field] = out
+    return created
+
+
+async def _push_vault_to_sandbox(workspace_id: str) -> None:
+    """Best-effort push of vault secrets to a running sandbox (mirrors vault.py)."""
+    try:
+        wm = WorkspaceManager.get_instance()
+        await wm.push_vault_secrets(workspace_id)
+    except Exception:
+        logger.warning(
+            "[mcp] failed to push imported vault secrets for %s",
+            workspace_id,
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +743,7 @@ async def edit_server(
         enabled=bool(existing["enabled"]),
         config=body.to_config_blob(),
     )
+    _schedule_proactive_apply(workspace_id, user_id)
     return {"name": row["name"], "source": row["source"], "enabled": row["enabled"]}
 
 
@@ -376,11 +768,13 @@ async def set_enabled(
             await upsert_workspace_server(
                 workspace_id, name, source="builtin", enabled=False, config=None
             )
+        _schedule_proactive_apply(workspace_id, user_id)
         return {"name": name, "enabled": body.enabled}
 
     found = await set_workspace_server_enabled(workspace_id, name, body.enabled)
     if not found:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    _schedule_proactive_apply(workspace_id, user_id)
     return {"name": name, "enabled": body.enabled}
 
 
@@ -402,6 +796,7 @@ async def delete_server(
     found = await delete_workspace_server(workspace_id, name)
     if not found:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    _schedule_proactive_apply(workspace_id, user_id)
     return {"ok": True}
 
 
@@ -434,21 +829,47 @@ async def discover_server(
     if server is None or name not in resolved.user_names:
         raise HTTPException(status_code=404, detail="MCP server not found")
 
-    # Debounce: if the cached row at this version is fresh and not pending,
-    # return it without re-running discovery.
-    existing = {
-        r["server_name"]: r
-        for r in await get_tool_schemas(workspace_id, resolved.version)
-    }
+    # Debounce: if the cached snapshot is for this server's CURRENT config and is
+    # fresh + not pending, return it without re-running discovery. A stale-hash
+    # row (config changed) always falls through to a real probe.
+    existing = {r["server_name"]: r for r in await get_tool_schemas(workspace_id)}
     cached = existing.get(name)
-    if cached is not None and cached.get("status") != "pending":
-        if _is_fresh(cached.get("discovered_at")):
-            return {"server": _discovery_row_to_dict(cached)}
+    if (
+        cached is not None
+        and cached.get("config_hash") == mcp_discovery_fingerprint(server)
+        and cached.get("status") != "pending"
+        and _is_fresh(cached.get("discovered_at"))
+    ):
+        return {"server": _discovery_row_to_dict(cached)}
 
     sandbox = _get_live_sandbox(workspace_id, workspace)
-    rows = await discover_and_cache(workspace_id, sandbox, [server], resolved.version)
+    rows = await discover_and_cache(workspace_id, sandbox, [server])
     row = rows[0] if rows else None
     return {"server": _discovery_row_to_dict(row)}
+
+
+# Strong refs to in-flight proactive-apply tasks so they aren't GC'd mid-run.
+_proactive_apply_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_proactive_apply(workspace_id: str, user_id: str) -> None:
+    """Front-load verifying + applying a just-saved MCP config.
+
+    Fire-and-forget so it never blocks (or fails) the mutation response. It
+    drives a background session acquire that brings the applied config up to the
+    new version — warming (cold-starting) the sandbox if it isn't running yet —
+    so the change is discovered and live before the user's next turn (no
+    surprise). Best-effort: any failure falls back to the next-message apply.
+    """
+    try:
+        wm = WorkspaceManager.get_instance()
+    except Exception:
+        return
+    task = asyncio.create_task(
+        wm.proactively_apply_mcp_config(workspace_id, user_id)
+    )
+    _proactive_apply_tasks.add(task)
+    task.add_done_callback(_proactive_apply_tasks.discard)
 
 
 def _get_live_sandbox(workspace_id: str, workspace: dict) -> Any | None:
@@ -492,14 +913,23 @@ def _is_fresh(discovered_at: Any) -> bool:
     return age < _DISCOVER_DEBOUNCE_SECONDS
 
 
+def _discovery_status(raw: Any) -> str:
+    """Map a schema-cache status to the McpStatus enum the effective list emits.
+
+    The cache stores ``ok``; the API surfaces ``connected`` so the discovery
+    probe and the effective list agree. ``error`` / ``pending`` pass through.
+    """
+    return "connected" if raw == "ok" else (str(raw) if raw else "pending")
+
+
 def _discovery_row_to_dict(row: dict[str, Any] | None) -> dict[str, Any]:
     if not row:
         return {"status": "pending", "tools": [], "error": ""}
     return {
         "server_name": row.get("server_name"),
-        "status": row.get("status"),
+        "status": _discovery_status(row.get("status")),
         "tools": row.get("tools") or [],
         "error": row.get("error") or "",
-        "config_version": row.get("config_version"),
+        "config_hash": row.get("config_hash"),
         "discovered_at": row.get("discovered_at"),
     }

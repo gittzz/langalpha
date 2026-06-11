@@ -8,12 +8,17 @@ vault access (the generated client substitutes inert placeholders).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any
 
 from ptc_agent.config.core import MCPServerConfig
-from ptc_agent.core.mcp_sanitize import sanitize_tool_name, sanitize_tool_text
+from ptc_agent.core.mcp_sanitize import (
+    VAULT_REF_RE,
+    sanitize_tool_name,
+    sanitize_tool_text,
+)
 
 from src.server.database import mcp_servers as mcp_db
 
@@ -23,6 +28,46 @@ logger = logging.getLogger(__name__)
 # detailed-mode caps live in the formatter; these bound what we cache at all.
 MAX_TOOLS_PER_SERVER = 64
 MAX_SCHEMA_CHARS_PER_SERVER = 200_000
+
+
+def mcp_discovery_fingerprint(server: MCPServerConfig) -> str:
+    """Stable per-server hash of discovery-affecting config — never secret values.
+
+    Captures everything that can change a server's ``tools/list`` result:
+    transport, command, args, url, env/header key NAMES + the ``${vault:NAME}``
+    refs each key targets, and the secret-less-discovery decision. It deliberately
+    EXCLUDES ``enabled`` (toggling a server off/on reuses its cached schema —
+    nothing about its tools changed) and the prompt-only fields (description /
+    instruction / tool_exposure_mode).
+
+    This is the discovery-cache key, keyed off the server's OWN identity, so
+    mutating or toggling an UNRELATED server never orphans this one's snapshot.
+    Names only — literal secret values never enter the hash.
+    """
+
+    def _refs_by_key(mapping: dict | None) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for key, value in (mapping or {}).items():
+            refs = sorted(set(VAULT_REF_RE.findall(str(value))))
+            if refs:
+                out[key] = refs
+        return out
+
+    env = getattr(server, "env", {}) or {}
+    headers = getattr(server, "headers", {}) or {}
+    payload = {
+        "transport": getattr(server, "transport", None),
+        "command": getattr(server, "command", None),
+        "args": list(getattr(server, "args", []) or []),
+        "url": getattr(server, "url", None),
+        "discovery_uses_secrets": bool(getattr(server, "discovery_uses_secrets", False)),
+        "env_keys": sorted(env.keys()),
+        "header_keys": sorted(headers.keys()),
+        "env_vault_refs": _refs_by_key(env),
+        "header_vault_refs": _refs_by_key(headers),
+        "url_vault_refs": sorted(set(VAULT_REF_RE.findall(getattr(server, "url", "") or ""))),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def sanitize_discovered_tools(
@@ -71,14 +116,15 @@ async def discover_and_cache(
     workspace_id: str,
     sandbox: Any,
     servers: list[MCPServerConfig],
-    config_version: int,
 ) -> list[dict[str, Any]]:
     """Discover ``servers`` inside ``sandbox``, sanitize, and cache snapshots.
 
-    Per-server error isolation: one broken server yields an ``error`` row and
-    never blocks the others. A missing/stopped sandbox (or a sandbox predating
-    the discovery driver) marks every server ``pending``. Returns the upserted
-    ``workspace_mcp_tool_schemas`` rows.
+    Each snapshot is cached under the server's own config fingerprint
+    (``mcp_discovery_fingerprint``), not the workspace config version, so it
+    survives unrelated mutations. Per-server error isolation: one broken server
+    yields an ``error`` row and never blocks the others. A missing/stopped
+    sandbox (or one predating the discovery driver) marks every server
+    ``pending``. Returns the upserted ``workspace_mcp_tool_schemas`` rows.
     """
     rows: list[dict[str, Any]] = []
     discover = getattr(sandbox, "discover_user_mcp_schemas", None) if sandbox else None
@@ -86,7 +132,8 @@ async def discover_and_cache(
         for server in servers:
             rows.append(
                 await mcp_db.upsert_tool_schemas(
-                    workspace_id, server.name, config_version, status="pending"
+                    workspace_id, server.name, mcp_discovery_fingerprint(server),
+                    status="pending",
                 )
             )
         return rows
@@ -98,6 +145,7 @@ async def discover_and_cache(
         results = {s.name: {"status": "error", "error": str(exc), "tools": []} for s in servers}
 
     for server in servers:
+        fingerprint = mcp_discovery_fingerprint(server)
         result = results.get(server.name) or {
             "status": "error",
             "error": "no discovery result returned",
@@ -108,7 +156,7 @@ async def discover_and_cache(
                 await mcp_db.upsert_tool_schemas(
                     workspace_id,
                     server.name,
-                    config_version,
+                    fingerprint,
                     status="error",
                     error=str(result.get("error") or "discovery failed")[:2000],
                 )
@@ -119,7 +167,7 @@ async def discover_and_cache(
             await mcp_db.upsert_tool_schemas(
                 workspace_id,
                 server.name,
-                config_version,
+                fingerprint,
                 tools=kept,
                 status="ok",
                 observed_meta={

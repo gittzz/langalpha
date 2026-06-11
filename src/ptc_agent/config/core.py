@@ -128,6 +128,7 @@ class MCPServerConfig(BaseModel):
     # 'builtin' = from agent_config.yaml; 'workspace' = user-configured per-workspace.
     # Workspace servers are untrusted: vault-only secret resolution, neutral prompt framing.
     source: Literal["builtin", "workspace"] = "builtin"
+    discovery_uses_secrets: bool = False  # workspace servers: resolve vault secrets during discovery (default off = secret-less probe)
 
 
 class MCPConfig(BaseModel):

@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
+from pydantic import ValidationError
 
 from src.server.database.mcp_servers import (
+    MAX_CATALOG_SERVERS_PER_USER,
     create_catalog_server,
     delete_catalog_server,
     get_catalog_server,
@@ -28,7 +30,9 @@ from src.server.database.mcp_servers import (
 )
 from src.server.models.mcp_server import (
     CatalogServer,
+    CatalogServerList,
     McpServerInput,
+    _format_validation_error,
     catalog_row_to_response,
 )
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
@@ -40,27 +44,37 @@ router = APIRouter(prefix="/api/v1/mcp", tags=["MCP Catalog"])
 
 @router.get("/servers")
 @handle_api_exceptions("list MCP catalog servers", logger)
-async def list_servers(user_id: CurrentUserId) -> dict:
+async def list_servers(user_id: CurrentUserId) -> CatalogServerList:
     rows = await list_catalog_servers(user_id)
-    return {"servers": [catalog_row_to_response(r).model_dump() for r in rows]}
+    return CatalogServerList(
+        servers=[catalog_row_to_response(r) for r in rows],
+        max_servers=MAX_CATALOG_SERVERS_PER_USER,
+    )
 
 
 @router.post("/servers", status_code=201)
 @handle_api_exceptions("create MCP catalog server", logger)
-async def create_server(body: McpServerInput, user_id: CurrentUserId) -> CatalogServer:
+async def create_server(
+    user_id: CurrentUserId, body: dict = Body(...)
+) -> CatalogServer:
+    try:
+        server = McpServerInput(**body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=_format_validation_error(e))
     try:
         row = await create_catalog_server(
             user_id,
-            body.name,
-            transport=body.transport,
-            command=body.command,
-            args=body.args,
-            url=body.url,
-            env=body.env,
-            headers=body.headers,
-            description=body.description,
-            instruction=body.instruction,
-            tool_exposure_mode=body.tool_exposure_mode,
+            server.name,
+            transport=server.transport,
+            command=server.command,
+            args=server.args,
+            url=server.url,
+            env=server.env,
+            headers=server.headers,
+            description=server.description,
+            instruction=server.instruction,
+            tool_exposure_mode=server.tool_exposure_mode,
+            discovery_uses_secrets=server.discovery_uses_secrets,
         )
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -79,11 +93,15 @@ async def get_server(name: str, user_id: CurrentUserId) -> CatalogServer:
 @router.put("/servers/{name}")
 @handle_api_exceptions("update MCP catalog server", logger)
 async def update_server(
-    name: str, body: McpServerInput, user_id: CurrentUserId
+    name: str, user_id: CurrentUserId, body: dict = Body(...)
 ) -> CatalogServer:
+    try:
+        server = McpServerInput(**body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=_format_validation_error(e))
     # The path name is authoritative; a renamed body is rejected to avoid
     # silently creating a second row under a different key.
-    if body.name != name:
+    if server.name != name:
         raise HTTPException(
             status_code=409, detail="name in body must match the path name"
         )
@@ -91,15 +109,16 @@ async def update_server(
         user_id,
         name,
         updates={
-            "transport": body.transport,
-            "command": body.command,
-            "args": body.args,
-            "url": body.url,
-            "env": body.env,
-            "headers": body.headers,
-            "description": body.description,
-            "instruction": body.instruction,
-            "tool_exposure_mode": body.tool_exposure_mode,
+            "transport": server.transport,
+            "command": server.command,
+            "args": server.args,
+            "url": server.url,
+            "env": server.env,
+            "headers": server.headers,
+            "description": server.description,
+            "instruction": server.instruction,
+            "tool_exposure_mode": server.tool_exposure_mode,
+            "discovery_uses_secrets": server.discovery_uses_secrets,
         },
     )
     if not row:
