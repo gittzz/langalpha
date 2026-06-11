@@ -1737,22 +1737,8 @@ class BackgroundTaskManager:
         # usage exactly once — no double-persist across the resume window.
         bg_registry = await BackgroundRegistryStore.get_instance().get_registry(thread_id)
 
-        claimed: list[tuple[Any, list, dict]] = []
-        if bg_registry is not None:
-            async with bg_registry._lock:
-                for task in tasks:
-                    if task.collector_response_id != response_id:
-                        continue
-                    if not (task.per_call_records or task.tool_usage):
-                        continue
-                    records = task.per_call_records
-                    tool_usage = task.tool_usage
-                    task.per_call_records = []
-                    task.tool_usage = {}
-                    claimed.append((task, records, tool_usage))
-        else:
-            # Registry gone (thread teardown) — tasks still carry their claim,
-            # so the same ownership gate applies without the lock.
+        def _claim_owned_usage() -> list[tuple[Any, list, dict]]:
+            out: list[tuple[Any, list, dict]] = []
             for task in tasks:
                 if task.collector_response_id != response_id:
                     continue
@@ -1762,12 +1748,22 @@ class BackgroundTaskManager:
                 tool_usage = task.tool_usage
                 task.per_call_records = []
                 task.tool_usage = {}
-                claimed.append((task, records, tool_usage))
+                out.append((task, records, tool_usage))
+            return out
+
+        if bg_registry is not None:
+            async with bg_registry._lock:
+                claimed = _claim_owned_usage()
+        else:
+            # Registry gone (thread teardown) — tasks still carry their claim,
+            # and the claim body has no awaits, so it's atomic without the lock.
+            claimed = _claim_owned_usage()
 
         if not claimed:
             return
 
         persisted_count = 0
+        persisted_records = 0
 
         for task, records, tool_usage in claimed:
             try:
@@ -1793,6 +1789,7 @@ class BackgroundTaskManager:
                     is_byok=is_byok,
                 )
                 persisted_count += 1
+                persisted_records += len(records)
 
             except Exception as e:
                 logger.error(
@@ -1802,10 +1799,9 @@ class BackgroundTaskManager:
                 )
 
         if persisted_count:
-            total_records = sum(len(records) for _, records, _ in claimed)
             logger.info(
                 f"[SubagentUsage] Persisted {persisted_count} subagent usage row(s) "
-                f"({total_records} LLM calls) for response_id={response_id} "
+                f"({persisted_records} LLM calls) for response_id={response_id} "
                 f"thread_id={thread_id}"
             )
 

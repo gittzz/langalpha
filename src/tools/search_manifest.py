@@ -11,7 +11,8 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +66,11 @@ def _load_manifest() -> Dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
-def get_search_providers() -> Dict[str, SearchProviderSpec]:
-    """Load and validate the provider specs, keyed by provider name."""
+def get_search_providers() -> Mapping[str, SearchProviderSpec]:
+    """Load and validate the provider specs, keyed by provider name.
+
+    Read-only mapping: the lru_cache shares one object across all callers.
+    """
     manifest = _load_manifest()
     providers: Dict[str, SearchProviderSpec] = {}
 
@@ -104,7 +108,7 @@ def get_search_providers() -> Dict[str, SearchProviderSpec]:
 
     if not providers:
         raise RuntimeError(f"No search providers defined in {_MANIFEST_PATH}")
-    return providers
+    return MappingProxyType(providers)
 
 
 def get_search_provider_spec(name: str) -> Optional[SearchProviderSpec]:
@@ -113,10 +117,10 @@ def get_search_provider_spec(name: str) -> Optional[SearchProviderSpec]:
 
 
 @lru_cache(maxsize=1)
-def get_auxiliary_search_pricing() -> Dict[str, Dict[str, Any]]:
+def get_auxiliary_search_pricing() -> Mapping[str, Dict[str, Any]]:
     """Pricing entries for search tools that aren't depth-selectable providers
     (image search, research) — consumed by the infrastructure billing table."""
-    return _load_manifest().get("auxiliary_tools", {})
+    return MappingProxyType(_load_manifest().get("auxiliary_tools", {}))
 
 
 def _tier_floor() -> int:
