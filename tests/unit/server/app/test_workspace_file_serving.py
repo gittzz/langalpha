@@ -423,7 +423,12 @@ async def test_format_pdf_renders_html(mock_ws, mock_fp, _wd, _vault, mock_rende
     mock_render.return_value = b"%PDF-1.7 fake pdf bytes"
 
     resp = await serve_workspace_file_endpoint(
-        workspace_id=WS_ID, path="results/report.html", inject=None, format="pdf"
+        workspace_id=WS_ID,
+        path="results/report.html",
+        inject=None,
+        format="pdf",
+        scale=None,
+        page_numbers=False,
     )
 
     assert resp.status_code == 200
@@ -436,7 +441,43 @@ async def test_format_pdf_renders_html(mock_ws, mock_fp, _wd, _vault, mock_rende
     # No CSP on the PDF response.
     assert "Content-Security-Policy" not in resp.headers
     mock_render.assert_awaited_once_with(
-        _EXPECTED_INTERNAL_URL, workspace_serve_prefix=_EXPECTED_SERVE_PREFIX
+        _EXPECTED_INTERNAL_URL,
+        workspace_serve_prefix=_EXPECTED_SERVE_PREFIX,
+        scale=None,
+        page_numbers=False,
+    )
+
+
+@pytest.mark.asyncio
+@patch(_RENDER_PATCH, new_callable=AsyncMock)
+@patch(_VAULT_PATCH, new_callable=AsyncMock, return_value={})
+@patch(_WD_PATCH, return_value="/home/workspace")
+@patch(_FP_PATCH)
+@patch(_DBWS_PATCH, new_callable=AsyncMock)
+async def test_format_pdf_scale_and_page_numbers_pass_through(
+    mock_ws, mock_fp, _wd, _vault, mock_render
+):
+    mock_ws.return_value = _workspace("stopped")
+    mock_fp.get_file_content = AsyncMock(
+        return_value=_db_text_record("<html><body>report</body></html>")
+    )
+    mock_render.return_value = b"%PDF-1.7 fake pdf bytes"
+
+    resp = await serve_workspace_file_endpoint(
+        workspace_id=WS_ID,
+        path="results/report.html",
+        inject=None,
+        format="pdf",
+        scale=0.8,
+        page_numbers=True,
+    )
+
+    assert resp.status_code == 200
+    mock_render.assert_awaited_once_with(
+        _EXPECTED_INTERNAL_URL,
+        workspace_serve_prefix=_EXPECTED_SERVE_PREFIX,
+        scale=0.8,
+        page_numbers=True,
     )
 
 

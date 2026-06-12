@@ -1323,6 +1323,8 @@ async def render_workspace_file_pdf(
     path: str,
     *,
     workspace: dict[str, Any] | None = None,
+    scale: float | None = None,
+    page_numbers: bool = False,
 ) -> Response:
     """Render a workspace HTML file to PDF via headless Chromium.
 
@@ -1363,7 +1365,10 @@ async def render_workspace_file_pdf(
     serve_prefix = f"{base}/api/v1/wsfiles/{workspace_id}/"
     try:
         pdf_bytes = await pdf_render.render_workspace_pdf(
-            internal_url, workspace_serve_prefix=serve_prefix
+            internal_url,
+            workspace_serve_prefix=serve_prefix,
+            scale=scale,
+            page_numbers=page_numbers,
         )
     except pdf_render.PdfRenderUnavailable:
         raise HTTPException(status_code=501, detail="PDF rendering not available")
@@ -1390,16 +1395,24 @@ async def serve_workspace_file_endpoint(
     path: str,
     inject: str | None = Query(None, description="Set to 'theme' to splice theme-sync into HTML."),
     format: str | None = Query(None, description="Set to 'pdf' to render HTML as a PDF."),
+    scale: float | None = Query(
+        None, ge=0.5, le=2.0, description="PDF only: render scale (0.5–2.0)."
+    ),
+    page_numbers: bool = Query(
+        False, description="PDF only: draw an 'N / total' footer in the page margin."
+    ),
 ) -> Response:
     """Serve a workspace file by path with sandboxed CSP (unauthenticated).
 
     Workspace UUID is the credential; uniform 404 for unknown workspace,
     missing file, or traversal. ``?inject=theme`` adds theme-sync to HTML only.
     ``?format=pdf`` renders HTML files to PDF server-side; other values serve
-    normally.
+    normally. ``scale`` and ``page_numbers`` apply only with ``format=pdf``.
     """
     if format == "pdf":
-        return await render_workspace_file_pdf(workspace_id, path)
+        return await render_workspace_file_pdf(
+            workspace_id, path, scale=scale, page_numbers=page_numbers
+        )
     return await serve_workspace_file(
         workspace_id, path, inject_theme=(inject == "theme")
     )

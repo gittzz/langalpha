@@ -230,6 +230,21 @@ async () => {
 # paint wider than its container in the snapshot.
 _CANVAS_CLAMP_CSS = "canvas { max-width: 100% !important; }"
 
+# Bounds for the caller-supplied render scale (Chromium itself accepts 0.1–2;
+# below 0.5 output is unreadably small, so we don't offer it).
+PDF_SCALE_MIN = 0.5
+PDF_SCALE_MAX = 2.0
+
+# Header/footer drawn by Chromium in the page margins when page numbers are
+# requested. The header must be explicitly blank or Chromium prints its
+# default date/title line. Templates require inline font-size or render at 0.
+_PDF_HEADER_TEMPLATE = "<span></span>"
+_PDF_FOOTER_TEMPLATE = (
+    '<div style="font-size:9px; width:100%; text-align:center; color:#777;">'
+    '<span class="pageNumber"></span> / <span class="totalPages"></span>'
+    "</div>"
+)
+
 _EXECUTABLE_MISSING_HINT = "executable doesn't exist"
 
 _browser = None
@@ -269,12 +284,20 @@ async def _get_browser():
         return _browser
 
 
-async def render_workspace_pdf(internal_url: str, *, workspace_serve_prefix: str) -> bytes:
+async def render_workspace_pdf(
+    internal_url: str,
+    *,
+    workspace_serve_prefix: str,
+    scale: float | None = None,
+    page_numbers: bool = False,
+) -> bytes:
     """Render a workspace HTML URL to PDF bytes in headless Chromium.
 
     ``internal_url`` is the server's own loopback wsfiles URL; subresource
     requests are SSRF-gated to ``workspace_serve_prefix`` plus the CDN
-    allowlist. Raises ``PdfRenderUnavailable`` / ``PdfRenderTimeout`` /
+    allowlist. ``scale`` (clamped to 0.5–2.0) shrinks/enlarges the whole
+    rendering; ``page_numbers`` draws a centered ``N / total`` footer in the
+    page margin. Raises ``PdfRenderUnavailable`` / ``PdfRenderTimeout`` /
     ``PdfRenderError`` for the corresponding failure classes.
     """
     from playwright.async_api import Error as PlaywrightError
@@ -318,7 +341,14 @@ async def render_workspace_pdf(internal_url: str, *, workspace_serve_prefix: str
                 await page.evaluate(
                     "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
                 )
-                return await page.pdf(print_background=True, prefer_css_page_size=True)
+                pdf_kwargs: dict = {"print_background": True, "prefer_css_page_size": True}
+                if scale is not None:
+                    pdf_kwargs["scale"] = min(PDF_SCALE_MAX, max(PDF_SCALE_MIN, scale))
+                if page_numbers:
+                    pdf_kwargs["display_header_footer"] = True
+                    pdf_kwargs["header_template"] = _PDF_HEADER_TEMPLATE
+                    pdf_kwargs["footer_template"] = _PDF_FOOTER_TEMPLATE
+                return await page.pdf(**pdf_kwargs)
 
             try:
                 return await asyncio.wait_for(_render(), timeout=_RENDER_TIMEOUT_MS / 1000)

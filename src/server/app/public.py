@@ -461,6 +461,12 @@ async def serve_shared_file(
     path: str = Path(..., description="File path within the shared workspace."),
     inject: str | None = Query(None, description="Set to 'theme' to splice theme-sync into HTML."),
     format: str | None = Query(None, description="Set to 'pdf' to render HTML as a PDF."),
+    scale: float | None = Query(
+        None, ge=0.5, le=2.0, description="PDF only: render scale (0.5–2.0)."
+    ),
+    page_numbers: bool = Query(
+        False, description="PDF only: draw an 'N / total' footer in the page margin."
+    ),
 ) -> Response:
     """Serve a shared workspace file inline with a sandboxed CSP. Requires allow_files.
 
@@ -478,7 +484,9 @@ async def serve_shared_file(
         raise HTTPException(status_code=404, detail="Not found")
 
     if format == "pdf":
-        return await render_workspace_file_pdf(workspace_id, path, workspace=workspace)
+        return await render_workspace_file_pdf(
+            workspace_id, path, workspace=workspace, scale=scale, page_numbers=page_numbers
+        )
 
     return await serve_workspace_file(
         workspace_id,

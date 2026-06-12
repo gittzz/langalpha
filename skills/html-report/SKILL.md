@@ -202,6 +202,18 @@ If any element starts at `opacity: 0` for an entrance animation, the `opacity: 1
 
 Named sizes (`a4`, `legal`, ...) with optional `landscape` work too. Without a declaration, export is portrait Letter — don't design landscape-wide content and skip the declaration.
 
+**Print typography.** Screen sizing usually reads too large on paper. Inside `@media print`, set print-affecting sizes in `pt` and tighten slightly:
+
+```css
+@media print {
+  body { font-size: 10.5pt; line-height: 1.45; }
+  h1 { font-size: 17pt; }  h2 { font-size: 13pt; }  h3 { font-size: 11pt; }
+  .card, section { padding: 10pt 12pt; }
+}
+```
+
+Aim for 10–11pt body text — the register of a printed research note. Keep table cell padding compact (`4pt 8pt`) so wide tables fit. Page margins come from `@page { margin: ... }`, not body padding.
+
 ## Authoring Workflow
 
 1. **Fetch and validate data** first (check for empty/None results). Sample or aggregate to a sensible size.
