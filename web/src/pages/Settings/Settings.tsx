@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { User, LogOut, Trash2, MessageSquareText, Sun, Moon, Monitor, Link2, Unlink, ExternalLink, Shield, ClipboardCopy, Search, Pin, Settings2 } from 'lucide-react';
+import { User, LogOut, Trash2, MessageSquareText, Sun, Moon, Monitor, Link2, Unlink, ExternalLink, Shield, ClipboardCopy, Search, Pin, Settings2, FileText, Code2 } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
@@ -575,6 +575,26 @@ function Settings() {
     }
   };
 
+  const handleOutputFormatChange = async (format: 'markdown' | 'html') => {
+    const currentAgentPref = (prefsData as any)?.agent_preference || {};
+    // null deletes the key (default behavior); 'html' opts into HTML reports.
+    const nextOutputFormat = format === 'html' ? 'html' : null;
+    try {
+      await updatePrefsMutation.mutateAsync({
+        agent_preference: {
+          ...currentAgentPref,
+          output_format: nextOutputFormat,
+        },
+      });
+    } catch {
+      toast({
+        variant: 'destructive',
+        title: t('common.error'),
+        description: t('settings.failedToSaveSettings'),
+      });
+    }
+  };
+
   const handleModifyPreferences = async () => {
     try {
       const flashWs = await getFlashWorkspace();
@@ -976,7 +996,7 @@ function Settings() {
                           border: '1px solid var(--color-border-muted)',
                         }}
                       >
-                        {Object.entries(data).map(([key, value]) => (
+                        {Object.entries(data).filter(([key]) => key !== 'output_format').map(([key, value]) => (
                           value != null && value !== '' && (
                             <div key={key} className="flex gap-2">
                               <span className="shrink-0 font-medium" style={{ color: 'var(--color-text-secondary)' }}>
@@ -1005,6 +1025,49 @@ function Settings() {
                   </p>
                 </div>
               )}
+
+              {/* Output Format */}
+              {(() => {
+                const outputFormat = ((prefsData as any)?.agent_preference?.output_format) === 'html' ? 'html' : 'markdown';
+                return (
+                  <div className="p-3 rounded-lg" style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}>
+                    <div className="flex items-center justify-between gap-3">
+                      <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                        {t('settings.outputFormat')}
+                      </label>
+                      <div className="inline-flex rounded-lg overflow-hidden" style={{ border: '1px solid var(--color-border-muted)' }}>
+                        <button
+                          type="button"
+                          onClick={() => handleOutputFormatChange('markdown')}
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium transition-colors"
+                          style={{
+                            backgroundColor: outputFormat === 'markdown' ? 'var(--color-accent-soft)' : 'transparent',
+                            color: outputFormat === 'markdown' ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
+                          }}
+                        >
+                          <FileText className="h-3.5 w-3.5" />
+                          {t('settings.outputFormatDefault')}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleOutputFormatChange('html')}
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium transition-colors"
+                          style={{
+                            backgroundColor: outputFormat === 'html' ? 'var(--color-accent-soft)' : 'transparent',
+                            color: outputFormat === 'html' ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
+                          }}
+                        >
+                          <Code2 className="h-3.5 w-3.5" />
+                          {t('settings.outputFormatHtml')}
+                        </button>
+                      </div>
+                    </div>
+                    <p className="text-xs mt-2" style={{ color: 'var(--color-text-tertiary)' }}>
+                      {t('settings.outputFormatDescription')}
+                    </p>
+                  </div>
+                );
+              })()}
 
               {error && (
                 <div className="p-3 rounded-md" style={{ backgroundColor: 'var(--color-loss-soft)', border: '1px solid var(--color-border-loss)' }}>
