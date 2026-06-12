@@ -182,10 +182,17 @@ PDF export = the browser's print-to-PDF. Every report **must** include an `@medi
 
   /* never let entrance animations leave content invisible in the PDF */
   *, *::before, *::after { animation: none !important; transition: none !important; opacity: 1 !important; }
+
+  /* collapse side-by-side layouts — paper is ~816px wide; squeezed columns
+     overlap charts and crush prose */
+  .row, .grid, .columns { display: block !important; }
+  .row > *, .grid > *, .columns > * { width: 100% !important; max-width: 100% !important; }
 }
 ```
 
 If any element starts at `opacity: 0` for an entrance animation, the `opacity: 1 !important` rule above is what stops the PDF from exporting blank — keep it. Test the print path before declaring done.
+
+**Multi-column layouts print badly.** Print width is ~816 CSS px — a flex/grid row pairing a chart card with a text column does not fit and will overlap or crush. Either keep the document single-column throughout (safest for a report), or include print rules like the collapse block above for every side-by-side container you create. Chart wrappers keep their fixed height either way.
 
 ## Authoring Workflow
 

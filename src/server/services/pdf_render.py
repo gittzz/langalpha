@@ -76,6 +76,16 @@ _RENDER_SEMAPHORE = asyncio.Semaphore(2)
 _RENDER_TIMEOUT_MS = 30_000
 _GOTO_TIMEOUT_MS = 20_000
 
+# Letter paper at CSS 96dpi (8.5x11in). The viewport must match the print
+# width so responsive layouts and chart canvases render at paper size from
+# the start — otherwise Chart.js rasterizes at screen width and printToPDF
+# snapshots stale, oversized bitmaps over the reflowed layout.
+_PRINT_VIEWPORT = {"width": 816, "height": 1056}
+
+# Post-load settle before snapshotting: lets ResizeObserver-driven redraws
+# (Chart.js et al.) finish after print-media layout.
+_SETTLE_MS = 300
+
 _EXECUTABLE_MISSING_HINT = "executable doesn't exist"
 
 _browser = None
@@ -129,7 +139,7 @@ async def render_workspace_pdf(internal_url: str, *, workspace_serve_prefix: str
     browser = await _get_browser()
 
     async with _RENDER_SEMAPHORE:
-        context = await browser.new_context()
+        context = await browser.new_context(viewport=_PRINT_VIEWPORT)
         try:
 
             async def _route_handler(route, request):
@@ -140,6 +150,9 @@ async def render_workspace_pdf(internal_url: str, *, workspace_serve_prefix: str
 
             page = await context.new_page()
             await page.route("**/*", _route_handler)
+            # Lay out with print CSS from the first paint so charts size for
+            # paper instead of re-rendering during the print reflow.
+            await page.emulate_media(media="print")
 
             async def _render() -> bytes:
                 try:
@@ -152,7 +165,11 @@ async def render_workspace_pdf(internal_url: str, *, workspace_serve_prefix: str
                     # Networkidle never settled (long-polling asset, etc.) —
                     # fall back to a plain load and render what we have.
                     await page.goto(internal_url, wait_until="load", timeout=_GOTO_TIMEOUT_MS)
-                return await page.pdf(print_background=True)
+                await page.evaluate(
+                    "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+                )
+                await page.wait_for_timeout(_SETTLE_MS)
+                return await page.pdf(print_background=True, prefer_css_page_size=True)
 
             try:
                 return await asyncio.wait_for(_render(), timeout=_RENDER_TIMEOUT_MS / 1000)
