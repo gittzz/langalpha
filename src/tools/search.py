@@ -86,7 +86,10 @@ def get_web_search_tool(
     )
 
     # Depth-qualified billing key for multi-depth providers so each level
-    # bills at its own rate; single-depth providers keep the bare key.
+    # bills at its own rate; single-depth providers keep the bare key. Adding
+    # a second depth to a single-depth provider re-keys its new usage rows
+    # (bare -> qualified) — check anything reading raw tracking keys first;
+    # service-level keys are stable via suffix-stripping.
     tracking_name = (
         f"{spec.tracking_name}:{depth_spec.name}"
         if len(spec.depths) > 1

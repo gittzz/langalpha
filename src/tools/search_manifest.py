@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 _MANIFEST_PATH = Path(__file__).parent / "manifest" / "search_providers.json"
 
+# Kwargs the search.py dispatch passes to every builder; native_params must not
+# collide with them or the builder call raises TypeError at tool-build time.
+_RESERVED_BUILDER_KWARGS = frozenset({"max_results", "default_time_range", "verbose"})
+
 
 @dataclass(frozen=True)
 class DepthSpec:
@@ -51,7 +55,10 @@ class SearchProviderSpec:
     @property
     def default_depth_spec(self) -> DepthSpec:
         spec = self.depth(self.default_depth)
-        assert spec is not None  # guaranteed by _load_manifest validation
+        if spec is None:  # guaranteed present by get_search_providers validation
+            raise RuntimeError(
+                f"Search provider {self.name!r} default_depth {self.default_depth!r} missing"
+            )
         return spec
 
 
@@ -100,6 +107,13 @@ def get_search_providers() -> Mapping[str, SearchProviderSpec]:
         depth_names = [d.name for d in depths]
         if len(depth_names) != len(set(depth_names)):
             raise RuntimeError(f"Search provider {name!r} has duplicate depth names")
+        for d in depths:
+            reserved = _RESERVED_BUILDER_KWARGS & d.native_params.keys()
+            if reserved:
+                raise RuntimeError(
+                    f"Search provider {name!r} depth {d.name!r} native_params "
+                    f"collide with fixed builder kwargs: {sorted(reserved)}"
+                )
         if spec.depth(spec.default_depth) is None:
             raise RuntimeError(
                 f"Search provider {name!r} default_depth {spec.default_depth!r} "

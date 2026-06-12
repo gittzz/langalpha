@@ -130,3 +130,32 @@ class TestManifestValidation:
                 sm.get_search_providers()
         finally:
             sm.get_search_providers.cache_clear()
+
+    def test_native_params_must_not_collide_with_builder_kwargs(self, monkeypatch):
+        """search.py spreads native_params alongside max_results /
+        default_time_range / verbose — a colliding key would TypeError at
+        tool-build time, so the loader rejects it up front."""
+        import src.tools.search_manifest as sm
+
+        bad = {
+            "providers": {
+                "x": {
+                    "tracking_name": "XTool",
+                    "default_depth": "a",
+                    "depths": [
+                        {
+                            "name": "a",
+                            "credits_per_use": 1,
+                            "native_params": {"verbose": False},
+                        }
+                    ],
+                }
+            }
+        }
+        monkeypatch.setattr(sm, "_load_manifest", lambda: bad)
+        sm.get_search_providers.cache_clear()
+        try:
+            with pytest.raises(RuntimeError, match="collide with fixed builder kwargs"):
+                sm.get_search_providers()
+        finally:
+            sm.get_search_providers.cache_clear()
