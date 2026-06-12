@@ -345,6 +345,8 @@ hist = ticker.history(period="1y")
 
 ## UI Design Rules
 
+Read `skills/ui-design/SKILL.md` for design quality (typography, color, avoiding generic AI aesthetics).
+
 ### Dark Theme (Default)
 
 Match the Ginlix platform aesthetic:

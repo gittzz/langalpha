@@ -287,6 +287,20 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         exposure="ptc",
         command="web-scraping",
     ),
+    "html-report": SkillDefinition(
+        name="html-report",
+        description="Self-contained styled HTML reports written to results/: PDF-exportable research documents with inline data, charts, and theme-aware CSS",
+        tools=[],
+        skill_md_path="skills/html-report/SKILL.md",
+        exposure="ptc",
+    ),
+    "ui-design": SkillDefinition(
+        name="ui-design",
+        description="Design-quality reference for financial-research HTML output: typography, color, composition, and avoiding generic AI aesthetics",
+        tools=[],
+        skill_md_path="skills/ui-design/SKILL.md",
+        exposure="ptc",
+    ),
 }
 
 

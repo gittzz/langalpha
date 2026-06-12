@@ -14,9 +14,15 @@ Respond in the language of the user's locale ({{ user_profile.locale }}) unless 
 ## Agent Preferences
 
 You MUST follow these user preferences when responding:
-{% for key, value in user_profile.agent_preference.items() %}
+{% for key, value in user_profile.agent_preference.items() if key != "output_format" %}
 - **{{ key }}**: {{ value }}
 {% endfor %}
+{% if user_profile.agent_preference.output_format == "html" %}
+
+### Output Format: Styled HTML
+
+For substantial deliverables (reports, analyses, comparisons), produce a styled HTML document at `results/*.html` instead of plain markdown. Before authoring, you MUST `Read skills/html-report/SKILL.md` and `Read skills/ui-design/SKILL.md` to follow the authoring and design conventions. Trivial or short answers stay plain text in chat.
+{% endif %}
 {% endif %}
 
 ## Financial Context
