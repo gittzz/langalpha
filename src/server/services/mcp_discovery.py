@@ -44,6 +44,11 @@ def mcp_discovery_fingerprint(server: MCPServerConfig) -> str:
     mutating or toggling an UNRELATED server never orphans this one's snapshot.
     Shares :func:`discovery_affecting_payload` with the sandbox asset-upload hash
     so a config change can never invalidate one without the other.
+
+    Because only the ``${vault:NAME}`` ref STRING is hashed, changing a secret's
+    VALUE never churns this hash — vault mutations instead invalidate explicitly
+    (version bump + snapshot purge for secret-dependent servers; see
+    ``src/server/app/vault.py``).
     """
     payload = discovery_affecting_payload(server, include_identity=False)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -91,6 +96,38 @@ def sanitize_discovered_tools(
     return kept, skipped
 
 
+async def _stale_server_names(
+    workspace_id: str, servers: list[MCPServerConfig]
+) -> set[str]:
+    """Servers whose CURRENT DB config no longer matches their kick-time state.
+
+    A name is stale when its row is gone (deleted mid-discovery) or its
+    recomputed fingerprint differs (edited mid-discovery). Malformed rows
+    count as stale — dropping a result is always safe; clobbering is not.
+    """
+    from src.server.handlers.chat.mcp_config import workspace_row_to_server_config
+
+    rows = {
+        r["name"]: r
+        for r in await mcp_db.list_workspace_servers(workspace_id)
+        if r.get("source") == "workspace"
+    }
+    stale: set[str] = set()
+    for server in servers:
+        row = rows.get(server.name)
+        if row is None:
+            stale.add(server.name)
+            continue
+        try:
+            current_fp = mcp_discovery_fingerprint(workspace_row_to_server_config(row))
+        except Exception:  # noqa: BLE001
+            stale.add(server.name)
+            continue
+        if current_fp != mcp_discovery_fingerprint(server):
+            stale.add(server.name)
+    return stale
+
+
 async def discover_and_cache(
     workspace_id: str,
     sandbox: Any,
@@ -104,11 +141,19 @@ async def discover_and_cache(
     yields an ``error`` row and never blocks the others. A missing/stopped
     sandbox (or one predating the discovery driver) marks every server
     ``pending``. Returns the upserted ``workspace_mcp_tool_schemas`` rows.
+
+    Stale-result guard: discovery can take up to ~30s (stdio cold-start), so
+    before caching, each server's fingerprint is recomputed from its CURRENT
+    DB config; results for servers edited or deleted mid-discovery are dropped
+    (a late write would otherwise purge the newer config's snapshot).
     """
     rows: list[dict[str, Any]] = []
     discover = getattr(sandbox, "discover_user_mcp_schemas", None) if sandbox else None
     if discover is None:
+        stale = await _stale_server_names(workspace_id, servers)
         for server in servers:
+            if server.name in stale:
+                continue
             rows.append(
                 await mcp_db.upsert_tool_schemas(
                     workspace_id, server.name, mcp_discovery_fingerprint(server),
@@ -123,8 +168,17 @@ async def discover_and_cache(
         logger.warning("[MCP_DISCOVERY] sandbox discovery failed for %s: %s", workspace_id, exc)
         results = {s.name: {"status": "error", "error": str(exc), "tools": []} for s in servers}
 
+    stale = await _stale_server_names(workspace_id, servers)
     for server in servers:
         fingerprint = mcp_discovery_fingerprint(server)
+        if server.name in stale:
+            logger.info(
+                "[MCP_DISCOVERY] dropping stale result for %s/%s "
+                "(config changed or server removed mid-discovery)",
+                workspace_id,
+                server.name,
+            )
+            continue
         result = results.get(server.name) or {
             "status": "error",
             "error": "no discovery result returned",

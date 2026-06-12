@@ -1070,6 +1070,23 @@ class WorkspaceManager:
                 e,
             )
 
+    async def refresh_session_mcp(
+        self, workspace_id: str, user_id: str | None = None
+    ) -> None:
+        """Rebuild the live session's MCP composite WITHOUT a version bump.
+
+        For out-of-band schema-cache updates (the manual ``/discover`` probe)
+        where ``mcp_config_version`` is unchanged so ``_apply_session_mcp``
+        would short-circuit. Busting the session's cached version forces the
+        next apply to re-resolve, reload the fresh snapshots, and re-sync
+        wrappers — then the standard proactive-apply path does the work.
+        No-op (beyond a warm acquire) when no session is live.
+        """
+        session = self._sessions.get(workspace_id)
+        if session is not None:
+            session.mcp_config_version = None
+        await self.proactively_apply_mcp_config(workspace_id, user_id)
+
     async def get_session_for_workspace(
         self,
         workspace_id: str,

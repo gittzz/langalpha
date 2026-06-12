@@ -81,6 +81,64 @@ async def _push_to_sandbox(workspace_id: str) -> None:
         )
 
 
+async def _invalidate_mcp_for_secret(
+    workspace_id: str, user_id: str, secret_name: str
+) -> None:
+    """Best-effort MCP cache invalidation when a secret's VALUE changes.
+
+    The MCP discovery fingerprint hashes ``${vault:NAME}`` ref strings, never
+    values, so a vault mutation alone can't churn any config hash. When the
+    changed secret is referenced by a workspace MCP server we bump
+    ``mcp_config_version`` (live sessions re-resolve on next acquire), purge
+    discovery snapshots of referencing servers whose discovery runs WITH
+    secrets (their cached ``tools/list`` may depend on the credential), and
+    schedule a proactive apply so a ``needs_secret``/``pending`` server comes
+    alive without waiting for the user's next message.
+    """
+    try:
+        import json
+
+        from ptc_agent.core.mcp_sanitize import (
+            discovery_should_use_secrets,
+            vault_refs,
+        )
+
+        from src.server.database import mcp_servers as mcp_db
+        from src.server.handlers.chat.mcp_config import workspace_row_to_server_config
+
+        referencing: list[dict] = []
+        for row in await mcp_db.list_workspace_servers(workspace_id):
+            if row.get("source") != "workspace" or not row.get("config"):
+                continue
+            if secret_name in vault_refs(json.dumps(row["config"])):
+                referencing.append(row)
+        if not referencing:
+            return
+
+        for row in referencing:
+            try:
+                server = workspace_row_to_server_config(row)
+            except Exception:
+                continue
+            if discovery_should_use_secrets(server):
+                await mcp_db.delete_tool_schemas(workspace_id, row["name"])
+
+        await mcp_db.bump_workspace_mcp_version(workspace_id)
+
+        from src.server.app.mcp_servers import _schedule_proactive_apply
+
+        _schedule_proactive_apply(workspace_id, user_id)
+        logger.info(
+            f"[vault] secret {secret_name!r} change invalidated MCP config for "
+            f"workspace {workspace_id} ({len(referencing)} referencing server(s))"
+        )
+    except Exception:
+        logger.warning(
+            f"[vault] MCP invalidation failed for workspace {workspace_id}",
+            exc_info=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -108,6 +166,7 @@ async def create_secret(
         raise HTTPException(status_code=409, detail=str(e))
 
     await _push_to_sandbox(workspace_id)
+    await _invalidate_mcp_for_secret(workspace_id, user_id, body.name)
     return {"name": body.name}
 
 
@@ -126,6 +185,8 @@ async def update_secret_endpoint(
         raise HTTPException(status_code=404, detail="Secret not found")
 
     await _push_to_sandbox(workspace_id)
+    if body.value is not None:  # description-only edits can't affect discovery
+        await _invalidate_mcp_for_secret(workspace_id, user_id, name)
     return {"name": name}
 
 
@@ -156,6 +217,7 @@ async def delete_secret_endpoint(
         raise HTTPException(status_code=404, detail="Secret not found")
 
     await _push_to_sandbox(workspace_id)
+    await _invalidate_mcp_for_secret(workspace_id, user_id, name)
     return {"ok": True}
 
 

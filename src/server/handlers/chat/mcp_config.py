@@ -87,9 +87,11 @@ async def resolve_mcp_config(
     ]
     builtin_name_set = {s.name for s in builtin_servers}
 
-    # Read the workspace rows AND the version counter in one snapshot-consistent
-    # transaction. Reading them separately could observe a CRUD mutation
-    # half-applied and cache the new server set under the stale version key.
+    # Version is read BEFORE the rows (READ COMMITTED, not a snapshot) so a
+    # concurrent mutation can only skew toward (older version, newer rows) —
+    # the live version then exceeds what we cache and the next acquire
+    # re-resolves. The reverse pairing would cache stale rows under the new
+    # version and stick. See get_workspace_servers_and_version.
     rows, version = await get_workspace_servers_and_version(workspace_id)
 
     # Short-circuit: no workspace rows ⇒ the effective set IS the built-in

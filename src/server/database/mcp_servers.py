@@ -482,7 +482,10 @@ async def upsert_tool_schemas(
 
     Snapshots for the same server at OTHER config hashes are deleted in the
     same transaction — only the current config's snapshot is kept, so config
-    iteration doesn't accumulate dead rows.
+    iteration doesn't accumulate dead rows. A non-ok write never downgrades an
+    existing same-hash ``ok`` row (config unchanged ⇒ the cached tools are
+    still valid): the transient failure is recorded in ``error`` but tools,
+    status, and ``discovered_at`` are preserved.
     """
     async with get_db_connection() as conn:
         async with conn.transaction():
@@ -497,16 +500,20 @@ async def upsert_tool_schemas(
                 )
                 await cur.execute(
                     """
-                    INSERT INTO workspace_mcp_tool_schemas
+                    INSERT INTO workspace_mcp_tool_schemas AS t
                         (workspace_id, server_name, config_hash, tools, status,
                          error, observed_meta, discovered_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (workspace_id, server_name, config_hash) DO UPDATE
-                        SET tools = EXCLUDED.tools,
-                            status = EXCLUDED.status,
+                        SET tools = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                         THEN t.tools ELSE EXCLUDED.tools END,
+                            status = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                          THEN t.status ELSE EXCLUDED.status END,
                             error = EXCLUDED.error,
-                            observed_meta = EXCLUDED.observed_meta,
-                            discovered_at = NOW()
+                            observed_meta = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                                 THEN t.observed_meta ELSE EXCLUDED.observed_meta END,
+                            discovered_at = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                                 THEN t.discovered_at ELSE NOW() END
                     RETURNING workspace_id, server_name, config_hash, tools, status,
                               error, observed_meta, discovered_at
                     """,
@@ -516,6 +523,33 @@ async def upsert_tool_schemas(
                     ),
                 )
                 return _schema_row_to_dict(await cur.fetchone())
+
+
+async def delete_tool_schemas(workspace_id: str, server_name: str) -> int:
+    """Delete ALL discovery snapshots for one server (any hash). Returns count.
+
+    Used when a snapshot may be invalid despite an unchanged config hash —
+    e.g. a vault secret the server's discovery depends on changed value.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM workspace_mcp_tool_schemas "
+                "WHERE workspace_id = %s AND server_name = %s",
+                (workspace_id, server_name),
+            )
+            return cur.rowcount
+
+
+async def bump_workspace_mcp_version(workspace_id: str) -> None:
+    """Bump mcp_config_version outside a row mutation (own transaction).
+
+    For out-of-band invalidation (vault secret changes) where no
+    ``workspace_mcp_servers`` row is written but live sessions must re-resolve.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await _bump_version(cur, workspace_id)
 
 
 # ---------------------------------------------------------------------------

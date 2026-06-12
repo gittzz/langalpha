@@ -881,6 +881,12 @@ async def discover_server(
     sandbox = _get_live_sandbox(workspace_id, workspace)
     rows = await discover_and_cache(workspace_id, sandbox, [server])
     row = rows[0] if rows else None
+    if row is not None and row.get("status") == "ok":
+        # The probe wrote a fresh snapshot WITHOUT a version bump, so a live
+        # session's composite/summary would short-circuit past it on the next
+        # acquire. Refresh explicitly (background, best-effort) so the agent
+        # sees the same tools the UI now shows.
+        _schedule_session_mcp_refresh(workspace_id, user_id)
     return {"server": _discovery_row_to_dict(row)}
 
 
@@ -929,6 +935,22 @@ def _schedule_proactive_apply(workspace_id: str, user_id: str) -> None:
             _proactive_apply_pending.pop(workspace_id, None)
 
     task.add_done_callback(_cleanup)
+
+
+def _schedule_session_mcp_refresh(workspace_id: str, user_id: str) -> None:
+    """Background composite rebuild after an out-of-band schema-cache update.
+
+    Unlike ``_schedule_proactive_apply`` there is no version bump to apply, so
+    this goes through ``refresh_session_mcp`` (which busts the session's cached
+    version first). Undebounced: probes are explicit single user actions.
+    """
+    try:
+        wm = WorkspaceManager.get_instance()
+    except Exception:
+        return
+    task = asyncio.create_task(wm.refresh_session_mcp(workspace_id, user_id))
+    _proactive_apply_tasks.add(task)
+    task.add_done_callback(_proactive_apply_tasks.discard)
 
 
 def _get_live_sandbox(workspace_id: str, workspace: dict) -> Any | None:
