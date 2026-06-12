@@ -407,3 +407,91 @@ class TestSchemaCache:
         assert len(rows) == 1
         assert rows[0]["status"] == "error"
         assert rows[0]["error"] == "boom"
+
+    async def test_transient_error_never_downgrades_same_hash_ok(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        """A flaky probe (same config hash) must not erase a known-good
+        snapshot: tools/status/discovered_at are preserved, only the error
+        text is recorded for debugging."""
+        from src.server.database.mcp_servers import (
+            get_tool_schemas,
+            upsert_tool_schemas,
+        )
+
+        wid = seed_workspace["workspace_id"]
+        tools = [{"name": "t1", "description": "d", "input_schema": {}}]
+        await upsert_tool_schemas(wid, "acme", "hash-1", tools=tools, status="ok")
+        before = (await get_tool_schemas(wid))[0]
+
+        row = await upsert_tool_schemas(
+            wid, "acme", "hash-1", status="error", error="npx fetch hiccup",
+        )
+
+        assert row["status"] == "ok"
+        assert row["tools"] == tools
+        assert row["error"] == "npx fetch hiccup"
+        assert row["discovered_at"] == before["discovered_at"]
+        assert await _schema_raw_count(wid, "acme") == 1
+
+    async def test_pending_never_downgrades_same_hash_ok(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        """Probing a stopped workspace marks servers pending — that must not
+        wipe a working server's cached tools either."""
+        from src.server.database.mcp_servers import upsert_tool_schemas
+
+        wid = seed_workspace["workspace_id"]
+        tools = [{"name": "t1", "description": "d", "input_schema": {}}]
+        await upsert_tool_schemas(wid, "acme", "hash-1", tools=tools, status="ok")
+
+        row = await upsert_tool_schemas(wid, "acme", "hash-1", status="pending")
+
+        assert row["status"] == "ok"
+        assert row["tools"] == tools
+
+    async def test_error_at_new_hash_still_replaces(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        """The no-downgrade guard is same-hash only: a config CHANGE that then
+        fails discovery legitimately replaces the old config's snapshot."""
+        from src.server.database.mcp_servers import (
+            get_tool_schemas,
+            upsert_tool_schemas,
+        )
+
+        wid = seed_workspace["workspace_id"]
+        tools = [{"name": "t1", "description": "d", "input_schema": {}}]
+        await upsert_tool_schemas(wid, "acme", "hash-old", tools=tools, status="ok")
+
+        row = await upsert_tool_schemas(
+            wid, "acme", "hash-new", status="error", error="bad new config",
+        )
+
+        assert row["status"] == "error"
+        rows = await get_tool_schemas(wid)
+        assert len(rows) == 1 and rows[0]["config_hash"] == "hash-new"
+        assert await _schema_raw_count(wid, "acme") == 1
+
+    async def test_delete_tool_schemas_and_standalone_bump(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        """Vault-mutation invalidation primitives: purge one server's snapshots
+        (any hash) and bump the version outside a row mutation."""
+        from src.server.database.mcp_servers import (
+            bump_workspace_mcp_version,
+            delete_tool_schemas,
+            upsert_tool_schemas,
+        )
+
+        wid = seed_workspace["workspace_id"]
+        await upsert_tool_schemas(wid, "acme", "hash-1", status="ok")
+        await upsert_tool_schemas(wid, "beta", "hash-b", status="ok")
+
+        assert await delete_tool_schemas(wid, "acme") == 1
+        assert await _schema_raw_count(wid, "acme") == 0
+        assert await _schema_raw_count(wid, "beta") == 1
+
+        v0 = await _version(wid)
+        await bump_workspace_mcp_version(wid)
+        assert await _version(wid) == v0 + 1

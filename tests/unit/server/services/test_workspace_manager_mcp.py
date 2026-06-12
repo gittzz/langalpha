@@ -480,3 +480,27 @@ class TestAppliedVersionAndProactiveApply:
         wm._sessions["ws"] = _make_session(version=2, summary="s")
         wm.get_session_for_workspace = AsyncMock(side_effect=RuntimeError("boom"))
         await wm.proactively_apply_mcp_config("ws", "user-1")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_refresh_busts_session_version_then_applies(self):
+        """An out-of-band schema-cache update (manual /discover probe) has no
+        version bump, so the apply path would short-circuit; refresh busts the
+        session's cached version first so the re-acquire actually rebuilds."""
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_session(version=4, summary="cached")
+        wm._sessions["ws"] = session
+        wm.proactively_apply_mcp_config = AsyncMock()
+
+        await wm.refresh_session_mcp("ws", "user-1")
+
+        assert session.mcp_config_version is None
+        wm.proactively_apply_mcp_config.assert_awaited_once_with("ws", "user-1")
+
+    @pytest.mark.asyncio
+    async def test_refresh_without_live_session_still_applies(self):
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        wm.proactively_apply_mcp_config = AsyncMock()
+
+        await wm.refresh_session_mcp("ws-x", "user-1")
+
+        wm.proactively_apply_mcp_config.assert_awaited_once_with("ws-x", "user-1")

@@ -22,6 +22,7 @@ from src.server.services import mcp_discovery
 from src.server.services.mcp_discovery import (
     MAX_SCHEMA_CHARS_PER_SERVER,
     MAX_TOOLS_PER_SERVER,
+    _stale_server_names as _real_stale_server_names,
     discover_and_cache,
     mcp_discovery_fingerprint,
     sanitize_discovered_tools,
@@ -39,6 +40,18 @@ def _tool(name: str, *, description: str = "d", input_schema=None) -> dict:
 def _server(name: str):
     """A minimal stand-in for MCPServerConfig — discover_and_cache only reads .name."""
     return SimpleNamespace(name=name)
+
+
+@pytest.fixture(autouse=True)
+def _no_stale_servers(monkeypatch):
+    """Default: every kicked server's config is still current, so the
+    stale-result guard passes everything through. Guard-specific tests
+    override this with their own monkeypatch."""
+
+    async def _none(workspace_id, servers):
+        return set()
+
+    monkeypatch.setattr(mcp_discovery, "_stale_server_names", _none)
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +346,114 @@ class TestDiscoverAndCachePerServer:
 
         assert upsert.await_args.kwargs["status"] == "error"
         assert upsert.await_args.kwargs["error"] == "discovery failed"
+
+
+# ---------------------------------------------------------------------------
+# Stale-result guard — a late discovery must never clobber a newer config's row
+# ---------------------------------------------------------------------------
+
+
+def _cfg(name: str = "acme", **kw) -> MCPServerConfig:
+    base = dict(name=name, transport="stdio", command="npx", source="workspace")
+    base.update(kw)
+    return MCPServerConfig(**base)
+
+
+def _ws_row(name: str, config: dict) -> dict:
+    return {"name": name, "source": "workspace", "enabled": True, "config": config}
+
+
+@pytest.mark.asyncio
+class TestStaleServerNames:
+    async def test_deleted_edited_and_current_classified(self, monkeypatch):
+        rows = [
+            _ws_row("kept", {"transport": "stdio", "command": "npx"}),
+            _ws_row("edited", {"transport": "stdio", "command": "uvx"}),
+        ]
+        monkeypatch.setattr(
+            mcp_discovery.mcp_db, "list_workspace_servers",
+            AsyncMock(return_value=rows),
+        )
+        # Kick-time snapshots: "kept" still matches its row, "edited" was
+        # npx at kick but is uvx now, "deleted" has no row anymore.
+        stale = await _real_stale_server_names(
+            "ws", [_cfg("kept"), _cfg("edited"), _cfg("deleted")]
+        )
+        assert stale == {"edited", "deleted"}
+
+    async def test_malformed_row_counts_as_stale(self, monkeypatch):
+        rows = [_ws_row("bad", {"transport": "nonsense", "bogus_field": 1})]
+        monkeypatch.setattr(
+            mcp_discovery.mcp_db, "list_workspace_servers",
+            AsyncMock(return_value=rows),
+        )
+        stale = await _real_stale_server_names("ws", [_cfg("bad")])
+        assert stale == {"bad"}
+
+
+@pytest.mark.asyncio
+class TestDiscoverAndCacheStaleGuard:
+    async def test_ok_result_dropped_when_config_changed_mid_discovery(
+        self, monkeypatch
+    ):
+        upsert = AsyncMock()
+        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+
+        async def _stale(workspace_id, servers):
+            return {"acme"}
+
+        monkeypatch.setattr(mcp_discovery, "_stale_server_names", _stale)
+        sandbox = SimpleNamespace(
+            discover_user_mcp_schemas=AsyncMock(
+                return_value={"acme": {"status": "ok", "tools": [_tool("t1")]}}
+            )
+        )
+
+        rows = await discover_and_cache("ws", sandbox, [_server("acme")])
+
+        assert rows == []
+        upsert.assert_not_awaited()
+
+    async def test_only_the_stale_server_is_dropped(self, monkeypatch):
+        upserted: list[str] = []
+
+        async def _upsert(workspace_id, server_name, config_hash, **kw):
+            upserted.append(server_name)
+            return {"server_name": server_name, **kw}
+
+        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", _upsert)
+
+        async def _stale(workspace_id, servers):
+            return {"edited"}
+
+        monkeypatch.setattr(mcp_discovery, "_stale_server_names", _stale)
+        sandbox = SimpleNamespace(
+            discover_user_mcp_schemas=AsyncMock(
+                return_value={
+                    "edited": {"status": "ok", "tools": [_tool("a")]},
+                    "kept": {"status": "ok", "tools": [_tool("b")]},
+                }
+            )
+        )
+
+        rows = await discover_and_cache("ws", sandbox, [_server("edited"), _server("kept")])
+
+        assert upserted == ["kept"]
+        assert len(rows) == 1
+
+    async def test_pending_path_dropped_when_stale(self, monkeypatch):
+        upsert = AsyncMock()
+        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+
+        async def _stale(workspace_id, servers):
+            return {"acme"}
+
+        monkeypatch.setattr(mcp_discovery, "_stale_server_names", _stale)
+
+        rows = await discover_and_cache("ws", None, [_server("acme")])
+
+        assert rows == []
+        upsert.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -518,6 +518,26 @@ async def test_proactive_apply_coalesces_burst_mutations(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_schedule_session_mcp_refresh_drives_refresh(monkeypatch):
+    """The probe's post-ok hook drives WorkspaceManager.refresh_session_mcp
+    (undebounced — probes are explicit single user actions)."""
+    import asyncio as aio
+
+    from src.server.app import mcp_servers as mod
+
+    wm = MagicMock()
+    wm.refresh_session_mcp = AsyncMock()
+    monkeypatch.setattr(
+        mod.WorkspaceManager, "get_instance", classmethod(lambda cls: wm)
+    )
+
+    mod._schedule_session_mcp_refresh("ws-1", "user-1")
+    await aio.sleep(0.05)
+
+    wm.refresh_session_mcp.assert_awaited_once_with("ws-1", "user-1")
+
+
+@pytest.mark.asyncio
 async def test_add_server_rejects_bash_command(client):
     ws = _ws()
     base = _agent_config([])
