@@ -18,6 +18,9 @@ Endpoints:
 - GET    /api/v1/workspaces/{workspace_id}/files/download
 - POST   /api/v1/workspaces/{workspace_id}/files/upload
 - DELETE /api/v1/workspaces/{workspace_id}/files
+
+Plus an unauthenticated path-style serving router (workspace UUID = credential):
+- GET    /api/v1/wsfiles/{workspace_id}/{path:path}
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ import asyncio
 import hashlib
 import logging
 import mimetypes
+import re
 import shlex
 from typing import Any
 
@@ -1078,3 +1082,252 @@ async def delete_workspace_files(
                     )
 
     return {"deleted": deleted, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Unauthenticated path-style file serving (`/api/v1/wsfiles/...`)
+# ---------------------------------------------------------------------------
+#
+# Gives `.html` deliverables true served semantics: a document served at
+# `/wsfiles/{ws}/results/report.html` can reference `charts/foo.png` and the
+# browser resolves it relatively to `/wsfiles/{ws}/results/charts/foo.png`.
+# The workspace UUID (128-bit) is the access credential, mirroring the
+# `preview_redirect_router` posture: uniform 404 for missing/unauthorized,
+# and never wake a stopped sandbox (denial-of-wallet protection).
+#
+# This is an internal serving mechanism, NOT a sharing primitive — the
+# workspace UUID grants read access to every file in the workspace.
+# User-facing sharing goes through permission-scoped thread-share tokens.
+
+wsfiles_router = APIRouter(prefix="/api/v1", tags=["Workspace File Serving"])
+
+# Short private cache: HTML reports and their assets are effectively immutable
+# for a turn, but the workspace UUID is a bearer credential so we never allow
+# shared/public caches to retain the bytes.
+_WSFILES_CACHE_CONTROL = "private, max-age=60"
+
+# Forces an opaque origin even though the iframe loads via `src=`, so
+# agent/prompt-injected HTML can never reach app cookies/localStorage.
+_WSFILES_CSP = "sandbox allow-scripts"
+
+# Explicit MIME map for common web asset types. mimetypes' platform tables are
+# inconsistent for several of these (notably .js, .mjs, .woff2), so we pin them.
+_EXPLICIT_MIME_TYPES: dict[str, str] = {
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".avif": "image/avif",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".txt": "text/plain; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+    ".pdf": "application/pdf",
+    ".wasm": "application/wasm",
+}
+
+# Theme-sync script spliced after <head> when `?inject=theme` is set. Listens
+# for `widget:themeUpdate` postMessages and applies `--color-*` custom
+# properties to :root, matching the inline-widget theme protocol.
+_THEME_INJECTION = (
+    '<meta name="color-scheme" content="light dark">'
+    "<script>(function(){window.addEventListener('message',function(e){"
+    "var d=e&&e.data;"
+    "if(!d||d.type!=='widget:themeUpdate'||!d.vars)return;"
+    "var r=document.documentElement;"
+    "for(var k in d.vars){if(k.indexOf('--color-')===0){"
+    "r.style.setProperty(k,d.vars[k]);}}});})();</script>"
+)
+
+
+def _guess_content_type(path: str) -> str:
+    """Resolve a Content-Type for a served file, preferring the explicit map."""
+    suffix = ""
+    if "." in path:
+        suffix = "." + path.rsplit(".", 1)[-1].lower()
+    if suffix in _EXPLICIT_MIME_TYPES:
+        return _EXPLICIT_MIME_TYPES[suffix]
+    guessed, _enc = mimetypes.guess_type(path)
+    return guessed or "application/octet-stream"
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    """True for content types whose bytes should be redacted / theme-injected."""
+    ct = content_type.split(";", 1)[0].strip().lower()
+    return (
+        ct.startswith("text/")
+        or ct in ("application/json", "application/xml", "image/svg+xml")
+        or ct.endswith("+json")
+        or ct.endswith("+xml")
+    )
+
+
+def _is_html_content_type(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().lower() in ("text/html", "text/htm")
+
+
+def _inject_theme_into_html(html: str) -> str:
+    """Splice the theme-sync snippet immediately after <head> (case-insensitive).
+
+    Falls back to prepending when no <head> tag is present so even fragment
+    documents still receive the listener.
+    """
+    lower = html.lower()
+    idx = lower.find("<head>")
+    if idx != -1:
+        insert_at = idx + len("<head>")
+        return html[:insert_at] + _THEME_INJECTION + html[insert_at:]
+    # No literal <head> — try <head ...> with attributes.
+    match = re.search(r"<head\b[^>]*>", html, re.IGNORECASE)
+    if match:
+        insert_at = match.end()
+        return html[:insert_at] + _THEME_INJECTION + html[insert_at:]
+    return _THEME_INJECTION + html
+
+
+def _has_traversal(path: str) -> bool:
+    """Reject `..` segments before they reach path resolution."""
+    return ".." in (path or "").replace("\\", "/").split("/")
+
+
+async def _resolve_serve_bytes(
+    workspace: dict[str, Any], workspace_id: str, normalized_path: str
+) -> tuple[bytes, str] | None:
+    """Resolve raw bytes + content type for a file, sandbox-first with DB fallback.
+
+    Returns ``(content, content_type)`` or ``None`` when the file is missing.
+    Stopped/stopping/starting workspaces serve from the DB without waking the
+    sandbox; running workspaces read live bytes.
+    """
+    extension_mime = _guess_content_type(normalized_path)
+
+    status = workspace.get("status")
+    if status in ("stopped", "stopping", "starting"):
+        file_record = await FilePersistenceService.get_file_content(
+            workspace_id, normalized_path
+        )
+        if not file_record:
+            return None
+        if file_record.get("is_binary") and file_record.get("content_binary") is not None:
+            content = file_record["content_binary"]
+            if isinstance(content, memoryview):
+                content = bytes(content)
+        elif file_record.get("content_text") is not None:
+            content = file_record["content_text"].encode("utf-8")
+        else:
+            return None
+        # Extension is the authority for known web types; fall back to the
+        # DB-stored mime only when the extension is unrecognized.
+        if extension_mime == "application/octet-stream" and file_record.get("mime_type"):
+            return content, file_record["mime_type"]
+        return content, extension_mime
+
+    # Running workspace — read live bytes. Acquire without waking (status is
+    # running here; get_session_for_workspace reconnects an active sandbox).
+    sandbox = await _acquire_sandbox(workspace_id, workspace.get("user_id") or "")
+    candidate, error = sandbox.validate_and_normalize_path(normalized_path)
+    if error:
+        return None
+    try:
+        content = await sandbox.adownload_file_bytes(candidate)
+    except RuntimeError:
+        return None
+    if content is None:
+        return None
+    client_path = _to_client_path(sandbox, candidate)
+    if _is_always_hidden_path(client_path):
+        return None
+    return content, extension_mime
+
+
+async def serve_workspace_file(
+    workspace_id: str,
+    path: str,
+    *,
+    inject_theme: bool,
+    workspace: dict[str, Any] | None = None,
+) -> Response:
+    """Serve one workspace file inline with a sandboxed CSP and optional theming.
+
+    Resolves the file (running sandbox first, DB fallback for stopped
+    workspaces), picks the Content-Type, redacts vault secrets from text
+    bodies, and emits ``Content-Security-Policy: sandbox allow-scripts`` on
+    every response. When ``inject_theme`` is set and the body is HTML, a small
+    theme-sync ``<script>`` is spliced after ``<head>``; otherwise the bytes
+    are served faithfully. Missing/unknown/traversal inputs all raise a uniform
+    404 so the endpoint never reveals which check failed.
+
+    ``workspace`` may be passed pre-resolved (e.g. by a share-token route) to
+    reuse this core with a different credential resolver; otherwise the
+    workspace is looked up by UUID.
+    """
+    if _has_traversal(path):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if workspace is None:
+        try:
+            workspace = await db_get_workspace(workspace_id)
+        except Exception:
+            raise HTTPException(
+                status_code=404, detail="Not found"
+            ) from None
+    if not workspace or _is_flash_workspace(workspace):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    work_dir = _get_work_dir()
+    normalized_path = _normalize_requested_path(path, work_dir)
+    if not normalized_path or _is_always_hidden_path(normalized_path):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    resolved = await _resolve_serve_bytes(workspace, workspace_id, normalized_path)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    content, content_type = resolved
+
+    if _is_text_content_type(content_type):
+        vault_secrets = await get_vault_secrets_for_redaction(workspace_id)
+        content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
+
+    if inject_theme and _is_html_content_type(content_type):
+        text = content.decode("utf-8", errors="replace")
+        content = _inject_theme_into_html(text).encode("utf-8")
+
+    headers = {
+        "Content-Security-Policy": _WSFILES_CSP,
+        "Cache-Control": _WSFILES_CACHE_CONTROL,
+        "Content-Disposition": content_disposition(
+            normalized_path.rsplit("/", 1)[-1] or "file", disposition="inline"
+        ),
+        "X-Content-Type-Options": "nosniff",
+    }
+    _record_fs_bytes("serve", len(content))
+    return Response(content=content, media_type=content_type, headers=headers)
+
+
+@wsfiles_router.get("/wsfiles/{workspace_id}/{path:path}")
+async def serve_workspace_file_endpoint(
+    workspace_id: str,
+    path: str,
+    inject: str | None = Query(None, description="Set to 'theme' to splice theme-sync into HTML."),
+) -> Response:
+    """Serve a workspace file by path with sandboxed CSP (unauthenticated).
+
+    Workspace UUID is the credential; uniform 404 for unknown workspace,
+    missing file, or traversal. ``?inject=theme`` adds theme-sync to HTML only.
+    """
+    return await serve_workspace_file(
+        workspace_id, path, inject_theme=(inject == "theme")
+    )
