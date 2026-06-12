@@ -69,13 +69,14 @@ describe('InlineWidget — hover action bar + fullscreen', () => {
     vi.unstubAllGlobals();
   });
 
-  it('renders the overlay action bar (fullscreen, copy, download, open, PDF)', () => {
+  it('renders the overlay action bar (fullscreen, open, more menu)', () => {
     render(<InlineWidget html="<div>hi</div>" title="My widget" />);
     expect(screen.getByLabelText('filePanel.fullscreen')).toBeInTheDocument();
-    expect(screen.getByLabelText('filePanel.copySource')).toBeInTheDocument();
-    expect(screen.getByLabelText('filePanel.downloadAsHtml')).toBeInTheDocument();
     expect(screen.getByLabelText('filePanel.openInNewTab')).toBeInTheDocument();
-    expect(screen.getByLabelText('filePanel.saveAsPdf')).toBeInTheDocument();
+    // Download/PDF are consolidated into the secondary "more" menu.
+    expect(screen.getByLabelText('filePanel.moreActions')).toBeInTheDocument();
+    expect(screen.queryByLabelText('filePanel.copySource')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('filePanel.downloadAsHtml')).not.toBeInTheDocument();
   });
 
   it('opens the fullscreen modal with a widget-fullscreen srcDoc iframe', () => {

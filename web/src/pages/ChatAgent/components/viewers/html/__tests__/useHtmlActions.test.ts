@@ -145,16 +145,6 @@ describe('useHtmlActions — widget mode', () => {
     result.current.openInNewTab();
     expect(open).toHaveBeenCalledWith('blob:widget-url', '_blank', 'noopener,noreferrer');
   });
-
-  it('copies the srcDoc source to the clipboard', async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.assign(navigator, { clipboard: { writeText } });
-    const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'widget', srcDoc: WIDGET_SRCDOC }),
-    );
-    result.current.copySource();
-    expect(writeText).toHaveBeenCalledWith(WIDGET_SRCDOC);
-  });
 });
 
 describe('useHtmlActions — file mode', () => {
@@ -203,7 +193,7 @@ describe('useHtmlActions — file mode', () => {
 
   it('opens the served wsfiles URL (byte-faithful, no inject=theme)', () => {
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html', content: '<p>x</p>' }),
+      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
     );
     result.current.openInNewTab();
     expect(open).toHaveBeenCalledWith(
@@ -220,7 +210,6 @@ describe('useHtmlActions — file mode', () => {
         mode: 'file',
         workspaceId: 'ws-1',
         filePath: 'results/report.html',
-        content: '<p>x</p>',
         triggerDownload,
       }),
     );
@@ -231,7 +220,7 @@ describe('useHtmlActions — file mode', () => {
   it('fetches the server PDF and downloads it via an anchor named <stem>.pdf', async () => {
     fetchMock.mockResolvedValue(pdfResponse(true));
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html', content: '<p>x</p>' }),
+      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
     );
     await result.current.exportPdf();
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html?format=pdf');
@@ -252,7 +241,6 @@ describe('useHtmlActions — file mode', () => {
         mode: 'file',
         workspaceId: '',
         filePath: 'results/report.html',
-        content: '<p>x</p>',
         servedUrl: served,
       }),
     );
@@ -269,7 +257,6 @@ describe('useHtmlActions — file mode', () => {
         mode: 'file',
         workspaceId: '',
         filePath: 'results/report.html',
-        content: '<p>x</p>',
         servedUrl: served,
       }),
     );
@@ -285,7 +272,7 @@ describe('useHtmlActions — file mode', () => {
       },
     });
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html', content: '<p>x</p>' }),
+      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
     );
     await result.current.exportPdf();
     // Keep the handle: open with no third arg.
@@ -300,7 +287,7 @@ describe('useHtmlActions — file mode', () => {
     fetchMock.mockResolvedValue(pdfResponse(false, 501));
     open.mockReturnValue({ print });
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html', content: '<p>x</p>' }),
+      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
     );
     await result.current.exportPdf();
     expect(open).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html', '_blank');
@@ -316,7 +303,7 @@ describe('useHtmlActions — file mode', () => {
       },
     });
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html', content: '<p>x</p>' }),
+      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
     );
     await result.current.exportPdf();
     expect(open).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html', '_blank');
@@ -327,7 +314,7 @@ describe('useHtmlActions — file mode', () => {
     fetchMock.mockResolvedValue(pdfResponse(false, 504));
     open.mockReturnValue(null);
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html', content: '<p>x</p>' }),
+      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
     );
     await result.current.exportPdf();
     expect(toastMock).toHaveBeenCalledWith({ description: 'filePanel.pdfPrintHint' });
@@ -341,7 +328,7 @@ describe('useHtmlActions — file mode', () => {
       }),
     );
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html', content: '<p>x</p>' }),
+      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
     );
     const first = result.current.exportPdf();
     result.current.exportPdf(); // re-entry, should be ignored
@@ -354,16 +341,6 @@ describe('useHtmlActions — file mode', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('copies the file content to the clipboard', () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.assign(navigator, { clipboard: { writeText } });
-    const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html', content: '<p>source</p>' }),
-    );
-    result.current.copySource();
-    expect(writeText).toHaveBeenCalledWith('<p>source</p>');
-  });
-
   it('uses the servedUrl override (share page) for open-in-new-tab with noopener', () => {
     const served = '/api/v1/public/shared/tok-1/files/serve/results/report.html';
     const { result } = renderHook(() =>
@@ -371,7 +348,6 @@ describe('useHtmlActions — file mode', () => {
         mode: 'file',
         workspaceId: '',
         filePath: 'results/report.html',
-        content: '<p>x</p>',
         servedUrl: served,
       }),
     );

@@ -1,13 +1,15 @@
 import { useTranslation } from 'react-i18next';
-import { Maximize2, Minimize2, ExternalLink, Download, FileDown, Code, Link2 } from 'lucide-react';
+import { Maximize2, Minimize2, ExternalLink, Download, FileDown, Link2, MoreHorizontal } from 'lucide-react';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger, DropdownMenuItem } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
 import './HtmlActionBar.css';
 
 interface HtmlActionBarProps {
   onOpenInNewTab: () => void;
-  onDownload: () => void;
-  onExportPdf: () => void;
-  onCopySource: () => void;
+  /** Download/PDF live in a secondary "more" menu. Omit both on surfaces where
+   *  they're owned elsewhere (the file toolbar defers to the panel header menu). */
+  onDownload?: () => void;
+  onExportPdf?: () => void | Promise<void>;
   /** Copy a shareable link to this report. Omit to hide the link button. */
   onCopyLink?: () => void;
   /** Toggle fullscreen. Omit to hide the expand/exit button. */
@@ -23,7 +25,6 @@ export default function HtmlActionBar({
   onOpenInNewTab,
   onDownload,
   onExportPdf,
-  onCopySource,
   onCopyLink,
   onFullscreen,
   isFullscreen = false,
@@ -59,39 +60,40 @@ export default function HtmlActionBar({
       <button
         type="button"
         className="html-action-btn"
-        onClick={onCopySource}
-        title={t('filePanel.copySource')}
-        aria-label={t('filePanel.copySource')}
-      >
-        <Code className="h-4 w-4" />
-      </button>
-      <button
-        type="button"
-        className="html-action-btn"
-        onClick={onDownload}
-        title={t('filePanel.downloadAsHtml')}
-        aria-label={t('filePanel.downloadAsHtml')}
-      >
-        <Download className="h-4 w-4" />
-      </button>
-      <button
-        type="button"
-        className="html-action-btn"
         onClick={onOpenInNewTab}
         title={t('filePanel.openInNewTab')}
         aria-label={t('filePanel.openInNewTab')}
       >
         <ExternalLink className="h-4 w-4" />
       </button>
-      <button
-        type="button"
-        className="html-action-btn"
-        onClick={onExportPdf}
-        title={t('filePanel.saveAsPdf')}
-        aria-label={t('filePanel.saveAsPdf')}
-      >
-        <FileDown className="h-4 w-4" />
-      </button>
+      {(onDownload || onExportPdf) && (
+        <DropdownMenu modal={false}>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className="html-action-btn"
+              title={t('filePanel.moreActions')}
+              aria-label={t('filePanel.moreActions')}
+            >
+              <MoreHorizontal className="h-4 w-4" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" sideOffset={4}>
+            {onDownload && (
+              <DropdownMenuItem onSelect={() => onDownload()}>
+                <Download className="h-3.5 w-3.5" />
+                {t('filePanel.downloadAsHtml')}
+              </DropdownMenuItem>
+            )}
+            {onExportPdf && (
+              <DropdownMenuItem onSelect={() => void onExportPdf()}>
+                <FileDown className="h-3.5 w-3.5" />
+                {t('filePanel.saveAsPdf')}
+              </DropdownMenuItem>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
     </div>
   );
 }

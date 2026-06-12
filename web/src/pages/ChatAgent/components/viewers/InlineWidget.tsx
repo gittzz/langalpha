@@ -56,7 +56,6 @@ export default function InlineWidget({ html, title, onSendPrompt, data }: Inline
         onOpenInNewTab={actions.openInNewTab}
         onDownload={actions.downloadHtml}
         onExportPdf={actions.exportPdf}
-        onCopySource={actions.copySource}
       />
       {fullscreen && (
         <HtmlFullscreenModal

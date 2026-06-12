@@ -56,7 +56,6 @@ export default function HtmlViewer({
     mode: 'file',
     workspaceId,
     filePath,
-    content,
     triggerDownload: () => Promise.resolve(onTriggerDownload()),
     servedUrl: servedUrlPlain,
   });
@@ -82,12 +81,10 @@ export default function HtmlViewer({
             {t('filePanel.htmlSource')}
           </button>
         </div>
+        {/* Download/Save-as-PDF live in the file panel header's download menu. */}
         <HtmlActionBar
           onFullscreen={() => setFullscreen(true)}
           onOpenInNewTab={actions.openInNewTab}
-          onDownload={actions.downloadHtml}
-          onExportPdf={actions.exportPdf}
-          onCopySource={actions.copySource}
           onCopyLink={onCopyShareLink ? () => onCopyShareLink(filePath) : undefined}
         />
       </div>

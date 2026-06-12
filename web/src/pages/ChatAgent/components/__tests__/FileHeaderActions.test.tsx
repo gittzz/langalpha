@@ -19,6 +19,11 @@ vi.mock('@/components/ui/use-toast', () => ({
   toast: vi.fn(),
 }));
 
+const exportServedPdfMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('../viewers/html/useHtmlActions', () => ({
+  exportServedPdf: (...args: unknown[]) => exportServedPdfMock(...args),
+}));
+
 vi.mock('@/components/ui/dropdown-menu', () => ({
   DropdownMenu: ({ children }: any) => (
     <div data-testid="dropdown-menu">{children}</div>
@@ -222,7 +227,7 @@ describe('FileHeaderActions', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders only Download for HTML file (rich actions live in the viewer)', () => {
+  it('renders Download and Save as PDF for HTML file', () => {
     render(
       <FileHeaderActions
         {...defaultProps}
@@ -231,8 +236,30 @@ describe('FileHeaderActions', () => {
       />,
     );
     expect(screen.getByText('filePanel.download')).toBeInTheDocument();
+    expect(screen.getByText('filePanel.saveAsPdf')).toBeInTheDocument();
     expect(screen.queryByText('filePanel.copyToClipboard')).not.toBeInTheDocument();
     expect(screen.queryByText('filePanel.downloadAsPdf')).not.toBeInTheDocument();
+  });
+
+  it('exports the server PDF (with the served URL override) on Save as PDF', async () => {
+    exportServedPdfMock.mockClear();
+    render(
+      <FileHeaderActions
+        {...defaultProps}
+        selectedFile="results/report.html"
+        fileMime="text/html"
+        htmlServedUrl="/api/v1/public/shared/tok-1/files/serve/results/report.html"
+      />,
+    );
+    fireEvent.click(screen.getByText('filePanel.saveAsPdf'));
+    await waitFor(() => {
+      expect(exportServedPdfMock).toHaveBeenCalledWith({
+        workspaceId: 'ws-123',
+        filePath: 'results/report.html',
+        servedUrl: '/api/v1/public/shared/tok-1/files/serve/results/report.html',
+        printHint: 'filePanel.pdfPrintHint',
+      });
+    });
   });
 
   it('renders only Download for binary file', () => {

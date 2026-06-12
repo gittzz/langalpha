@@ -63,20 +63,14 @@ describe('HtmlViewer', () => {
     expect(highlighter).toHaveTextContent('<h1>Report</h1>');
   });
 
-  it('renders the HTML action bar (open-in-new-tab, download, PDF, copy, fullscreen)', () => {
+  it('renders only view actions in the toolbar (fullscreen, open-in-new-tab)', () => {
     render(<HtmlViewer {...defaultProps} />);
     expect(screen.getByLabelText('filePanel.fullscreen')).toBeInTheDocument();
     expect(screen.getByLabelText('filePanel.openInNewTab')).toBeInTheDocument();
-    expect(screen.getByLabelText('filePanel.downloadAsHtml')).toBeInTheDocument();
-    expect(screen.getByLabelText('filePanel.saveAsPdf')).toBeInTheDocument();
-    expect(screen.getByLabelText('filePanel.copySource')).toBeInTheDocument();
-  });
-
-  it('downloads server original bytes via onTriggerDownload', () => {
-    const onTriggerDownload = vi.fn();
-    render(<HtmlViewer {...defaultProps} onTriggerDownload={onTriggerDownload} />);
-    fireEvent.click(screen.getByLabelText('filePanel.downloadAsHtml'));
-    expect(onTriggerDownload).toHaveBeenCalledTimes(1);
+    // Download/PDF live in the file panel header's download menu, not here.
+    expect(screen.queryByLabelText('filePanel.moreActions')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('filePanel.downloadAsHtml')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('filePanel.saveAsPdf')).not.toBeInTheDocument();
   });
 
   it('opens the fullscreen dialog hosting a served iframe', () => {

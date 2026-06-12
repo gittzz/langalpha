@@ -63,7 +63,6 @@ export default function HtmlFullscreenModal(props: HtmlFullscreenModalProps) {
               onOpenInNewTab={actions.openInNewTab}
               onDownload={actions.downloadHtml}
               onExportPdf={actions.exportPdf}
-              onCopySource={actions.copySource}
             />
           </div>
           {props.variant === 'file' ? (

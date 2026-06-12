@@ -1516,6 +1516,7 @@ function FilePanel({
             onOpenExportModal={() => setExportModalOpen(true)}
             triggerDownloadFn={triggerDownloadFn}
             readFileFullFn={readFileFullFn}
+            htmlServedUrl={selectedFile ? apiAdapter?.buildServedUrl?.(selectedFile) : undefined}
             editorRef={editorRef}
             canUndo={canUndo}
             canRedo={canRedo}

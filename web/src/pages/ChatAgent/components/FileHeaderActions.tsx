@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
-import { Download, Pencil, Save, X, Undo2, Redo2, FileDiff, FileText, Check, Clipboard } from 'lucide-react';
+import React, { useRef, useState } from 'react';
+import { Download, FileDown, Pencil, Save, X, Undo2, Redo2, FileDiff, FileText, Check, Clipboard } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger, DropdownMenuItem } from '@/components/ui/dropdown-menu';
 import { toast } from '@/components/ui/use-toast';
 import { useTranslation } from 'react-i18next';
+import { exportServedPdf } from './viewers/html/useHtmlActions';
 
 // --- File type detection helpers ---
 
@@ -40,6 +41,9 @@ interface FileHeaderActionsProps {
   onOpenExportModal: () => void;
   triggerDownloadFn: (workspaceId: string, filePath: string) => Promise<void>;
   readFileFullFn: (workspaceId: string, filePath: string) => Promise<{ content: string }>;
+  /** Byte-faithful served URL for the selected HTML file (e.g. the public
+   *  share serve URL). Defaults to the wsfiles route when omitted. */
+  htmlServedUrl?: string;
   // Edit mode callbacks
   editorRef: React.RefObject<any>;
   canUndo: boolean;
@@ -66,6 +70,7 @@ function FileHeaderActions({
   onOpenExportModal,
   triggerDownloadFn,
   readFileFullFn,
+  htmlServedUrl,
   editorRef,
   canUndo,
   canRedo,
@@ -79,6 +84,23 @@ function FileHeaderActions({
 }: FileHeaderActionsProps) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
+  // Server PDF renders take seconds; ignore re-entry while one is in flight.
+  const pdfInFlight = useRef(false);
+
+  const handleExportHtmlPdf = async () => {
+    if (!selectedFile || pdfInFlight.current) return;
+    pdfInFlight.current = true;
+    try {
+      await exportServedPdf({
+        workspaceId,
+        filePath: selectedFile,
+        servedUrl: htmlServedUrl,
+        printHint: t('filePanel.pdfPrintHint'),
+      });
+    } finally {
+      pdfInFlight.current = false;
+    }
+  };
 
   const handleCopy = async () => {
     if (!selectedFile) return;
@@ -172,12 +194,19 @@ function FileHeaderActions({
     }
 
     if (isHtml) {
-      // HTML file: Download only — rich actions (open/PDF/copy) live in the HtmlViewer toolbar.
+      // HTML file: this menu owns Download + Save-as-PDF; the HtmlViewer
+      // toolbar keeps only view actions (link/fullscreen/new tab).
       return (
-        <DropdownMenuItem onSelect={() => triggerDownloadFn(workspaceId, selectedFile).catch((err: unknown) => console.error('[FileHeaderActions] Download failed:', err))}>
-          <Download className="h-3.5 w-3.5" />
-          {t('filePanel.download')}
-        </DropdownMenuItem>
+        <>
+          <DropdownMenuItem onSelect={() => triggerDownloadFn(workspaceId, selectedFile).catch((err: unknown) => console.error('[FileHeaderActions] Download failed:', err))}>
+            <Download className="h-3.5 w-3.5" />
+            {t('filePanel.download')}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void handleExportHtmlPdf()}>
+            <FileDown className="h-3.5 w-3.5" />
+            {t('filePanel.saveAsPdf')}
+          </DropdownMenuItem>
+        </>
       );
     }
 

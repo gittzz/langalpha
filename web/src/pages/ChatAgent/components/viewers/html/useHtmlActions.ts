@@ -7,8 +7,6 @@ interface WidgetModeOptions {
   mode: 'widget';
   /** Full srcDoc — opened/downloaded/printed via a blob URL. */
   srcDoc: string;
-  /** Source copied to clipboard (defaults to srcDoc). */
-  source?: string;
   fileName?: string;
 }
 
@@ -16,8 +14,6 @@ interface FileModeOptions {
   mode: 'file';
   workspaceId: string;
   filePath: string;
-  /** Full source content copied to clipboard. */
-  content: string;
   /** Server-side download of the original bytes. */
   triggerDownload?: (workspaceId: string, filePath: string) => Promise<void>;
   /** Override the served URL (e.g. the public share serve URL). Byte-faithful
@@ -31,7 +27,6 @@ export interface HtmlActions {
   openInNewTab: () => void;
   downloadHtml: () => void;
   exportPdf: () => void | Promise<void>;
-  copySource: () => void;
 }
 
 function fileNameFromPath(filePath: string): string {
@@ -49,8 +44,65 @@ function appendQueryParam(url: string, param: string): string {
   return `${url}${url.includes('?') ? '&' : '?'}${param}`;
 }
 
+export interface ExportServedPdfOptions {
+  workspaceId: string;
+  filePath: string;
+  /** Byte-faithful served URL override (e.g. public share). Defaults to wsfiles. */
+  servedUrl?: string;
+  /** Toast text shown when the print-dialog fallback can't auto-print. */
+  printHint: string;
+}
+
 /**
- * Open/download/print/copy actions for an HTML surface.
+ * Download the server-rendered PDF (?format=pdf) for a served HTML file,
+ * falling back to opening the served HTML and driving the browser print
+ * dialog on any non-OK response. Shared by the HTML surfaces' actions and
+ * the file panel's header download menu.
+ */
+export async function exportServedPdf({
+  workspaceId,
+  filePath,
+  servedUrl,
+  printHint,
+}: ExportServedPdfOptions): Promise<void> {
+  const servedHtmlUrl = servedUrl ?? buildWsfilesUrl(workspaceId, filePath);
+  const pdfUrl = servedUrl
+    ? appendQueryParam(servedUrl, 'format=pdf')
+    : buildWsfilesUrl(workspaceId, filePath, { format: 'pdf' });
+
+  const printFallback = () => {
+    // Keep the handle (no noopener) so we can drive print on the new tab.
+    const win = window.open(servedHtmlUrl, '_blank');
+    try {
+      if (!win) throw new Error('popup blocked');
+      win.print();
+    } catch {
+      toast({ description: printHint });
+    }
+  };
+
+  try {
+    const res = await fetch(pdfUrl);
+    if (!res.ok) {
+      printFallback();
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = pdfNameFromPath(filePath);
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch {
+    printFallback();
+  }
+}
+
+/**
+ * Open/download/print actions for an HTML surface.
  *
  * Widget mode operates on a blob built from the srcDoc; file mode points at the
  * served wsfiles URL (byte-faithful — no ?inject=theme so downloads match the
@@ -116,57 +168,21 @@ export function useHtmlActions(opts: UseHtmlActionsOptions): HtmlActions {
       return;
     }
 
-    // File mode: download the server-rendered PDF, falling back to browser print.
     if (pdfInFlight.current) return;
     pdfInFlight.current = true;
-
-    const servedHtmlUrl = opts.servedUrl ?? buildWsfilesUrl(opts.workspaceId, opts.filePath);
-    const pdfUrl = opts.servedUrl
-      ? appendQueryParam(opts.servedUrl, 'format=pdf')
-      : buildWsfilesUrl(opts.workspaceId, opts.filePath, { format: 'pdf' });
-
-    const printFallback = () => {
-      // Keep the handle (no noopener) so we can drive print on the new tab.
-      const win = window.open(servedHtmlUrl, '_blank');
-      try {
-        if (!win) throw new Error('popup blocked');
-        win.print();
-      } catch {
-        toast({ description: t('filePanel.pdfPrintHint') });
-      }
-    };
-
     try {
-      const res = await fetch(pdfUrl);
-      if (!res.ok) {
-        printFallback();
-        return;
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = pdfNameFromPath(opts.filePath);
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch {
-      printFallback();
+      await exportServedPdf({
+        workspaceId: opts.workspaceId,
+        filePath: opts.filePath,
+        servedUrl: opts.servedUrl,
+        printHint: t('filePanel.pdfPrintHint'),
+      });
     } finally {
       pdfInFlight.current = false;
     }
   }, [opts, t]);
 
-  const copySource = useCallback(() => {
-    const text = opts.mode === 'widget' ? (opts.source ?? opts.srcDoc) : opts.content;
-    navigator.clipboard
-      .writeText(text)
-      .then(() => toast({ description: t('filePanel.copiedToClipboard') }))
-      .catch(() => toast({ description: t('filePanel.copyFailed'), variant: 'destructive' }));
-  }, [opts, t]);
-
-  return { openInNewTab, downloadHtml, exportPdf, copySource };
+  return { openInNewTab, downloadHtml, exportPdf };
 }
 
 export { fileNameFromPath };

@@ -1261,7 +1261,7 @@
     "fullscreen": "全屏",
     "exitFullscreen": "退出全屏",
     "downloadAsHtml": "下载为 HTML",
-    "copySource": "复制源代码",
+    "moreActions": "更多操作",
     "htmlPreview": "预览",
     "htmlSource": "源代码",
     "pdfPrintHint": "按 Cmd/Ctrl-P 将页面保存为 PDF。",

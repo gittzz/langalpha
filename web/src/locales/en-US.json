@@ -1261,7 +1261,7 @@
     "fullscreen": "Fullscreen",
     "exitFullscreen": "Exit fullscreen",
     "downloadAsHtml": "Download as HTML",
-    "copySource": "Copy source",
+    "moreActions": "More actions",
     "htmlPreview": "Preview",
     "htmlSource": "Source",
     "pdfPrintHint": "Press Cmd/Ctrl-P to save the page as a PDF.",
