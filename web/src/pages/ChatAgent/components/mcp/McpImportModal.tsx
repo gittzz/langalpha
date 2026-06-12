@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useDeferredValue, useMemo, useState } from 'react';
 import { X, Loader2, Download, CheckCircle2, AlertTriangle, KeyRound } from 'lucide-react';
 import { parseMcpServersJson } from './mcpImport';
 import { formatApiErrorDetail, type McpImportResult, type McpImportResultRow } from '../../utils/api';
@@ -34,7 +34,10 @@ export function McpImportModal({ onClose, onImport, onImported }: McpImportModal
   const [result, setResult] = useState<McpImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const preview = useMemo(() => parseMcpServersJson(text), [text]);
+  // Defer the parse so a fast typer doesn't pay full JSON.parse + normalization
+  // on every keystroke; the count preview lags a frame behind the textarea.
+  const deferredText = useDeferredValue(text);
+  const preview = useMemo(() => parseMcpServersJson(deferredText), [deferredText]);
   const parseableCount = preview.servers.filter((s) => !s.error).length;
   const canImport = !importing && parseableCount > 0;
 

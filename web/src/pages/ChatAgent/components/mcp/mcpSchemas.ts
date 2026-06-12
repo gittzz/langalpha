@@ -271,20 +271,6 @@ const SCHEMA_BY_TRANSPORT = {
   http: httpSchema,
 } as const;
 
-export type McpServerForm = {
-  name: string;
-  transport: (typeof TRANSPORTS)[number];
-  command: AllowedCommand | '';
-  args: string[];
-  url: string;
-  env: Record<string, string>;
-  headers: Record<string, string>;
-  description: string;
-  instruction: string;
-  tool_exposure_mode: (typeof EXPOSURE_MODES)[number];
-  discovery_uses_secrets: boolean;
-};
-
 /** Validate a raw form object, returning either ok or the list of errors. */
 export function validateMcpServer(input: unknown):
   | { ok: true }

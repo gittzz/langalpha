@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useDeferredValue, useMemo, useState } from 'react';
 import { X, Plus, Trash2, Loader2, Zap, ClipboardPaste } from 'lucide-react';
 import { VaultSecretPicker } from './VaultSecretPicker';
 import { McpDiscoverResult } from './McpDiscoverResult';
@@ -168,7 +168,14 @@ export function McpServerModal({
     return { ...base, url: url.trim(), headers: kvsToMap(headers) };
   }, [name, transport, command, args, url, env, headers, description, instruction, exposure, effectiveDiscoverySecrets]);
 
-  const validation = useMemo(() => validateMcpServer(buildPayload()), [buildPayload]);
+  // Defer the validated payload so a fast typer doesn't pay a full Zod safeParse
+  // + URL canonicalization on every keystroke; `validation` only gates the
+  // disabled state of the Add/Test buttons, and submit re-validates the CURRENT
+  // payload below — so a deferred (slightly-stale) gate can never let stale data
+  // through.
+  const payload = useMemo(buildPayload, [buildPayload]);
+  const deferredPayload = useDeferredValue(payload);
+  const validation = useMemo(() => validateMcpServer(deferredPayload), [deferredPayload]);
 
   async function handleSubmit() {
     const result = validateMcpServer(buildPayload());

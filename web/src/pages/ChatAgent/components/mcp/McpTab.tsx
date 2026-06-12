@@ -214,48 +214,83 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
     }
   }
 
-  async function handleToggle(server: EffectiveServer, enabled: boolean) {
-    setTogglingName(server.name);
-    try {
-      await toggleMutation.mutateAsync({ name: server.name, enabled });
-    } finally {
-      setTogglingName(null);
-    }
-  }
+  // Row handlers are stable `useCallback`s (and take the row's `server` at call
+  // time) so each row gets the SAME prop references every render — that's the
+  // referential stability `React.memo(McpServerRow)` needs to skip a re-render
+  // during the settling poll or when a sibling row toggles.
+  const toggleAsync = toggleMutation.mutateAsync;
+  const handleToggle = useCallback(
+    async (server: EffectiveServer, enabled: boolean) => {
+      setTogglingName(server.name);
+      try {
+        await toggleAsync({ name: server.name, enabled });
+      } finally {
+        setTogglingName(null);
+      }
+    },
+    [toggleAsync],
+  );
 
-  async function handleDelete(server: EffectiveServer) {
-    setDeletingName(server.name);
-    try {
-      await deleteMutation.mutateAsync(server.name);
-    } finally {
-      setDeletingName(null);
-    }
-  }
+  const deleteAsync = deleteMutation.mutateAsync;
+  const handleDelete = useCallback(
+    async (server: EffectiveServer) => {
+      setDeletingName(server.name);
+      try {
+        await deleteAsync(server.name);
+      } finally {
+        setDeletingName(null);
+      }
+    },
+    [deleteAsync],
+  );
 
-  async function doPromote(name: string, overwrite: boolean) {
-    try {
-      await promoteMutation.mutateAsync({ name, overwrite });
-      toast({
-        title: overwrite ? 'Template updated' : 'Saved as template',
-        description: `"${name}" is now in your Templates — add it to any workspace.`,
-      });
-    } catch (err) {
-      toast({
-        variant: 'destructive',
-        title: 'Could not save template',
-        description: formatApiErrorDetail(err),
-      });
-    }
-  }
+  const handleEdit = useCallback((server: EffectiveServer) => {
+    setEditing(server);
+    setSubmitError(null);
+    setModalOpen(true);
+  }, []);
 
-  function handlePromote(server: EffectiveServer) {
-    // Existing template → confirm overwrite; new name → promote straight away.
-    if (templateNames.has(server.name)) {
-      setPromoteConfirm(server.name);
-    } else {
-      void doPromote(server.name, false);
-    }
-  }
+  const handleDiscoverRow = useCallback(
+    (server: EffectiveServer) => runDiscover(server.name),
+    [runDiscover],
+  );
+
+  const handleSetupSecret = useCallback(
+    (name: string) => onOpenVaultTab?.(name),
+    [onOpenVaultTab],
+  );
+
+  const promoteAsync = promoteMutation.mutateAsync;
+  const doPromote = useCallback(
+    async (name: string, overwrite: boolean) => {
+      try {
+        await promoteAsync({ name, overwrite });
+        toast({
+          title: overwrite ? 'Template updated' : 'Saved as template',
+          description: `"${name}" is now in your Templates — add it to any workspace.`,
+        });
+      } catch (err) {
+        toast({
+          variant: 'destructive',
+          title: 'Could not save template',
+          description: formatApiErrorDetail(err),
+        });
+      }
+    },
+    [promoteAsync],
+  );
+
+  const handlePromote = useCallback(
+    (server: EffectiveServer) => {
+      // Existing template → confirm overwrite; new name → promote straight away.
+      if (templateNames.has(server.name)) {
+        setPromoteConfirm(server.name);
+      } else {
+        void doPromote(server.name, false);
+      }
+    },
+    [templateNames, doPromote],
+  );
 
   async function handleAddFromTemplate(templateName: string) {
     await addMutation.mutateAsync({ from_template: templateName });
@@ -405,12 +440,12 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
                     synced={synced}
                     sandboxRunning={sandboxRunning}
                     sandboxWarming={sandboxWarming}
-                    onToggle={(enabled) => handleToggle(server, enabled)}
-                    onEdit={() => { setEditing(server); setSubmitError(null); setModalOpen(true); }}
-                    onDiscover={() => runDiscover(server.name)}
-                    onDelete={() => handleDelete(server)}
-                    onPromoteToTemplate={server.origin === 'workspace' ? () => handlePromote(server) : undefined}
-                    onSetupSecret={(name) => onOpenVaultTab?.(name)}
+                    onToggle={handleToggle}
+                    onEdit={handleEdit}
+                    onDiscover={handleDiscoverRow}
+                    onDelete={handleDelete}
+                    onPromoteToTemplate={server.origin === 'workspace' ? handlePromote : undefined}
+                    onSetupSecret={handleSetupSecret}
                   />
                 ))}
               </AnimatePresence>

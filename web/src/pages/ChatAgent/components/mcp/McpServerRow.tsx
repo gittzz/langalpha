@@ -56,17 +56,22 @@ interface McpServerRowProps {
   sandboxRunning?: boolean;
   /** The sandbox is warming up toward running (a background apply kicked it). */
   sandboxWarming?: boolean;
-  onToggle: (enabled: boolean) => void;
-  onEdit: () => void;
-  onDiscover: () => void;
-  onDelete: () => void;
-  /** Save this workspace server's definition up into the user template catalog. */
-  onPromoteToTemplate?: () => void;
+  // Handlers receive the row's own `server` (and any extra arg) so the parent
+  // can pass ONE stable `useCallback` per action instead of a fresh inline
+  // closure per row — that referential stability is what makes `React.memo`
+  // below actually skip re-renders during the settling poll / sibling toggles.
+  onToggle: (server: EffectiveServer, enabled: boolean) => void;
+  onEdit: (server: EffectiveServer) => void;
+  onDiscover: (server: EffectiveServer) => void;
+  onDelete: (server: EffectiveServer) => void;
+  /** Save this workspace server's definition up into the user template catalog.
+   *  Builtins pass nothing here, which disables the menu item. */
+  onPromoteToTemplate?: (server: EffectiveServer) => void;
   /** Deep-link to the Vault tab, optionally prefilling a secret name. */
   onSetupSecret: (secretName: string) => void;
 }
 
-export function McpServerRow({
+function McpServerRowImpl({
   server,
   toggling = false,
   deleting = false,
@@ -169,7 +174,7 @@ export function McpServerRow({
           aria-checked={server.enabled}
           aria-label={`${server.enabled ? 'Disable' : 'Enable'} ${server.name}`}
           disabled={toggling || deleting}
-          onClick={() => onToggle(!server.enabled)}
+          onClick={() => onToggle(server, !server.enabled)}
           className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
           style={{
             backgroundColor: server.enabled ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
@@ -195,24 +200,24 @@ export function McpServerRow({
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            <DropdownMenuItem disabled={!server.editable} onSelect={() => onEdit()}>
+            <DropdownMenuItem disabled={!server.editable} onSelect={() => onEdit(server)}>
               <Pencil className="h-3.5 w-3.5 mr-2" />
               Edit
             </DropdownMenuItem>
-            <DropdownMenuItem disabled={isBuiltin || !server.enabled} onSelect={() => onDiscover()}>
+            <DropdownMenuItem disabled={isBuiltin || !server.enabled} onSelect={() => onDiscover(server)}>
               <Zap className="h-3.5 w-3.5 mr-2" />
               Test connection
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={isBuiltin || !onPromoteToTemplate}
-              onSelect={() => onPromoteToTemplate?.()}
+              onSelect={() => onPromoteToTemplate?.(server)}
             >
               <BookmarkPlus className="h-3.5 w-3.5 mr-2" />
               Save as template
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={!server.deletable}
-              onSelect={() => onDelete()}
+              onSelect={() => onDelete(server)}
               variant="destructive"
             >
               <Trash2 className="h-3.5 w-3.5 mr-2" />
@@ -224,3 +229,10 @@ export function McpServerRow({
     </motion.div>
   );
 }
+
+/**
+ * Memoized so a settling poll / a sibling row's toggle doesn't re-run this row's
+ * framer-motion layout work. Effective only because the parent passes a stable
+ * `server` object (frozen-order map lookup) and stable `useCallback` handlers.
+ */
+export const McpServerRow = React.memo(McpServerRowImpl);
