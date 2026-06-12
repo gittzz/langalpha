@@ -6,6 +6,7 @@ import {
   useUpdateMcpCatalogServer,
   useDeleteMcpCatalogServer,
 } from '@/hooks/useMcpServers';
+import { toast } from '@/components/ui/use-toast';
 import { McpServerModal } from './McpServerModal';
 import { formatApiErrorDetail, type CatalogServer, type McpServerInput, type EffectiveServer } from '../../utils/api';
 
@@ -86,8 +87,27 @@ export function TemplatesView({
     setAddingName(name);
     try {
       await onAddToWorkspace(name);
+    } catch (err) {
+      toast({
+        variant: 'destructive',
+        title: 'Could not add to workspace',
+        description: formatApiErrorDetail(err),
+      });
     } finally {
       setAddingName(null);
+    }
+  }
+
+  async function handleDelete(name: string) {
+    try {
+      await deleteMutation.mutateAsync(name);
+      setDeletingName(null);
+    } catch (err) {
+      toast({
+        variant: 'destructive',
+        title: 'Could not delete template',
+        description: formatApiErrorDetail(err),
+      });
     }
   }
 
@@ -185,7 +205,7 @@ export function TemplatesView({
                     <div className="flex items-center gap-1">
                       <button
                         type="button"
-                        onClick={async () => { await deleteMutation.mutateAsync(t.name); setDeletingName(null); }}
+                        onClick={() => handleDelete(t.name)}
                         disabled={deleteMutation.isPending}
                         className="px-2 py-1 text-[11px] rounded disabled:opacity-50"
                         style={{ color: 'var(--color-loss)' }}

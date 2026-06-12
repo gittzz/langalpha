@@ -1289,6 +1289,14 @@ export interface EffectiveServer {
   missing_secrets: string[];
   env_refs: string[];
   header_refs: string[];
+  /**
+   * The stored env/header reference maps for workspace-origin servers — keys are
+   * the real var/header names, values are the configured `${vault:NAME}` ref
+   * strings or plain literals (never resolved secrets). Empty/absent for builtin
+   * rows and on older backends that only return `env_refs`/`header_refs`.
+   */
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
   description: string;
   instruction: string;
   tool_exposure_mode: string | null;

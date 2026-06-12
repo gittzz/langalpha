@@ -56,6 +56,25 @@ export function isValidSecretValue(value: string): boolean {
   return true;
 }
 
+/**
+ * Validate a single stdio `arg` string. Embedded `${vault:NAME}` refs ARE legal
+ * here (bulk import writes `--flag=${vault:NAME}`). After stripping every
+ * well-formed vault ref, a leftover `${vault:` is a malformed ref, and a leftover
+ * bare `${VAR}`/`$VAR` is a host-env placeholder that would never resolve for a
+ * workspace server — both rejected (mirrors the backend Pydantic arg validator).
+ * Returns null when valid, else the reason string.
+ */
+export function validateArg(arg: string): string | null {
+  const stripped = (arg ?? '').replace(VAULT_REF_GLOBAL_RE, '');
+  if (stripped.includes('${vault:')) {
+    return 'malformed vault reference; use the exact form ${vault:NAME}';
+  }
+  if (BARE_ENV_RE.test(stripped)) {
+    return 'looks like a host-env placeholder; use ${vault:NAME} for secrets or a plain literal';
+  }
+  return null;
+}
+
 /** Collect the sorted, de-duplicated vault names referenced by a value map. */
 export function collectVaultRefs(mapping: Record<string, string> | undefined): string[] {
   const names = new Set<string>();
@@ -181,8 +200,9 @@ function isDisallowedIp(host: string): boolean {
   // IPv4 dotted-quad
   const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (v4) {
-    const [a, b] = v4.slice(1).map(Number);
-    if (v4.slice(1).map(Number).some((o) => o > 255)) return true; // malformed → reject
+    const octets = v4.slice(1).map(Number);
+    const [a, b] = octets;
+    if (octets.some((o) => o > 255)) return true; // malformed → reject
     if (a === 0) return true; // unspecified / "this host"
     if (a === 10) return true; // private
     if (a === 127) return true; // loopback
@@ -227,13 +247,25 @@ const urlField = z.string().superRefine((url, ctx) => {
   if (reason) ctx.addIssue({ code: 'custom', message: reason });
 });
 
+// stdio args: literals + embedded `${vault:NAME}` refs are fine; a malformed
+// vault ref or a bare host-env placeholder is rejected (mirrors env/header).
+const argsField = z
+  .array(z.string())
+  .default([])
+  .superRefine((args, ctx) => {
+    args.forEach((arg, i) => {
+      const reason = validateArg(arg);
+      if (reason) ctx.addIssue({ code: 'custom', message: reason, path: [i] });
+    });
+  });
+
 const stdioSchema = z.object({
   name: nameField,
   transport: z.literal('stdio'),
   command: z.enum(ALLOWED_COMMANDS, {
     message: `command must be one of: ${ALLOWED_COMMANDS.join(', ')}`,
   }),
-  args: z.array(z.string()).default([]),
+  args: argsField,
   env: secretMapSchema('env').default({}),
   description: descriptionField,
   instruction: instructionField,

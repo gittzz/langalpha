@@ -293,8 +293,16 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   );
 
   async function handleAddFromTemplate(templateName: string) {
-    await addMutation.mutateAsync({ from_template: templateName });
-    setView('workspace');
+    try {
+      await addMutation.mutateAsync({ from_template: templateName });
+      setView('workspace');
+    } catch (err) {
+      toast({
+        variant: 'destructive',
+        title: 'Could not add template',
+        description: formatApiErrorDetail(err),
+      });
+    }
   }
 
   async function handleDiscoverFromModal(body: McpServerInput) {

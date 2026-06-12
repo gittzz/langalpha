@@ -91,13 +91,17 @@ export function McpServerModal({
   const [command, setCommand] = useState(initial?.command ?? 'npx');
   const [args, setArgs] = useState<string[]>(initial?.args ?? []);
   const [url, setUrl] = useState(initial?.url ?? '');
-  // env/header values are masked on the wire (only refs returned), so on edit we
-  // pre-fill keys with their `${vault:NAME}` refs and leave literal values blank.
+  // On edit, prefer the stored env/header REFERENCE maps (real keys + their
+  // `${vault:NAME}` ref / literal values) so an unrelated edit re-saves the
+  // existing config intact. A PUT replaces the full config, and `kvsToMap` drops
+  // blank-key rows — so the legacy refs-only hydration (blank keys) silently
+  // erased every entry on save. Fall back to `refsToKVs` only when the maps are
+  // absent (older backend that returns just `env_refs`/`header_refs`).
   const [env, setEnv] = useState<KV[]>(
-    initial ? refsToKVs(initial.env_refs) : [],
+    initial ? initialKVs(initial.env, initial.env_refs) : [],
   );
   const [headers, setHeaders] = useState<KV[]>(
-    initial ? refsToKVs(initial.header_refs) : [],
+    initial ? initialKVs(initial.headers, initial.header_refs) : [],
   );
   const [description, setDescription] = useState(initial?.description ?? '');
   const [instruction, setInstruction] = useState(initial?.instruction ?? '');
@@ -531,6 +535,17 @@ export function McpServerModal({
       </div>
     </div>
   );
+}
+
+/**
+ * Hydrate the env/header editor on edit. Prefer the stored reference `map`
+ * (real keys + `${vault:NAME}`/literal values) — it round-trips the existing
+ * config so an unrelated edit doesn't drop entries on save. Fall back to the
+ * refs-only form for older backends that don't return the map.
+ */
+function initialKVs(map: Record<string, string> | undefined, refs: string[]): KV[] {
+  if (map && Object.keys(map).length > 0) return mapToKVs(map);
+  return refsToKVs(refs);
 }
 
 /** On edit the wire returns only masked vault names, so pre-fill keys with refs. */
