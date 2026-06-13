@@ -9,18 +9,22 @@ Author a styled, self-contained HTML **document** and write it to `results/` (e.
 
 This is the right output when the user wants a **deliverable they can keep, share, or print** — an equity research note, an earnings recap, a screen writeup — not a throwaway answer.
 
-> **Read `skills/ui-design/SKILL.md` before authoring.** It defines the typography, color, and composition standards that keep the report looking like a research desk artifact rather than a generic AI page. This skill covers the mechanics; that one covers the taste.
+> **Read `.agents/skills/ui-design/SKILL.md` before authoring.** It defines the typography, color, and composition standards that keep the report looking like a research desk artifact rather than a generic AI page. This skill covers the mechanics; that one covers the taste.
+
+> **User preferences override these defaults.** Anything the user has told you — in this conversation, in your long-term memory, or in their saved preferences/memos — outranks every rule in this skill. If they want a specific brand color, a particular font, no charts, a black-and-white print sheet, or a different structure, do that. Treat this skill as sensible defaults for when the user hasn't specified, not as constraints that override their stated taste.
 
 ## Decide: Which Output?
 
+A report from this skill **can be interactive** (sortable tables, tab/filter controls, hover- and zoomable charts — see **Interactivity**, below). So interactivity is *not* what separates it from a dashboard. The real divide is **self-contained snapshot file vs. live served app**:
+
 | Want | Use | Why |
 |---|---|---|
-| A document the user keeps, shares, or exports to PDF | **html-report** (this skill) — `.html` in `results/` | Lives on disk, served with real semantics, PDF-exportable via browser print |
+| A document the user keeps, shares, or exports to PDF — even one that's interactive within itself | **html-report** (this skill) — `.html` in `results/` | One file on disk, served with real semantics, PDF-exportable. Interactivity runs client-side over an embedded data snapshot. |
 | A quick visualization *inside the chat* (one chart, a metric row, a table) | **inline-widget** (`ShowWidget`) | Appears inline between text; no file, no panel |
-| A live, interactive app (filtering, drill-downs, live refresh, multi-page) | **interactive-dashboard** (`GetPreviewUrl`) | A served running app, not a static file |
+| A **live served app** — refreshing data, server-side compute, multi-page routing, or a dataset too large to embed | **interactive-dashboard** (`GetPreviewUrl`) | A running app with a backend, not a static file. Needed when the data must be fetched live, not embedded. |
 | A simple, short answer | **plain markdown** | A styled HTML document is overkill for a one-paragraph reply |
 
-**Rule of thumb:** substantial, durable deliverable → html-report. Ephemeral in-chat figure → inline-widget. Running app → interactive-dashboard. Trivial answer → markdown.
+**The deciding question:** can the data be captured as a snapshot and embedded in one file? If yes → **html-report** (interactive or not), because the user gets a keepable, printable, shareable artifact. Only if it genuinely needs a live server — refreshing prices, server-side filtering over a huge dataset, multi-page navigation → **interactive-dashboard**. Ephemeral in-chat figure → inline-widget. Trivial answer → markdown.
 
 ## Self-Contained by Default
 
@@ -161,7 +165,28 @@ Rules:
 - `responsive: true, maintainAspectRatio: false` always.
 - Resolve canvas colors with `getComputedStyle` + literal fallback (the `pick()` helper above) — never bare `var()` in canvas color strings.
 - Use UMD CDN builds (set the library global).
-- For categorical series, follow the restrained palette in `skills/ui-design/SKILL.md` — no rainbow defaults.
+- For categorical series, follow the restrained palette in `.agents/skills/ui-design/SKILL.md` — no rainbow defaults.
+
+## Interactivity (When It Helps)
+
+The served document runs JavaScript, so a report **can be interactive** — and should be when interactivity genuinely helps the reader explore the data, not as decoration. All of it runs **client-side over the embedded `DATA` snapshot**; there is no server and no live refresh (that's `interactive-dashboard`).
+
+Reach for interactivity when it earns its place:
+
+- **Sortable / filterable tables** — let the reader sort a holdings table by weight or P&L, or filter to a sector. Pays off most on tables past ~15 rows.
+- **Tabbed or accordion sections** — segment a long report (Summary / Financials / Valuation / Risks) so the reader isn't scrolling past everything.
+- **Interactive charts** — Chart.js/ECharts hover tooltips, series toggles (click a legend entry to hide a line), range zoom on a long price history.
+- **Collapsible detail / "show more"** — keep the default view tight; let the curious expand methodology, footnotes, or a raw-numbers table.
+- **In-page search / highlight** — for a long screen or a wide comparison.
+
+Rules:
+- **Wire events with `addEventListener`**, not inline `onclick=` / `on*=` attributes. It is the robust pattern across every surface and keeps logic out of the markup.
+- **Client-side only.** Operate on the embedded `DATA`; never `fetch()` a data API (the CDN allowlist blocks it). If the data must be live or is too big to embed, that's a dashboard, not a report.
+- **Default state must be meaningful.** The report has to read correctly before any click — a reader (or a PDF export) that never interacts must still see the substance. Never hide the headline finding behind a tab.
+- **Degrade for print.** Interactive controls (tab bars, filter inputs, sort buttons, "show more" toggles) are chrome — give them `.no-print`, and make collapsed content render expanded when printing so the PDF is complete. The `@media print` block below already hides `button` / `.no-print`.
+- **Keep it self-contained and lean.** Vanilla JS over the embedded data; no framework, no build step. A little event delegation goes a long way.
+
+Match the effort to the data: a one-number recap needs no interactivity; a 40-holding portfolio or a multi-section deep-dive benefits a lot.
 
 ## Print / PDF (Mandatory)
 
@@ -217,7 +242,7 @@ Aim for 10–11pt body text — the register of a printed research note. Keep ta
 ## Authoring Workflow
 
 1. **Fetch and validate data** first (check for empty/None results). Sample or aggregate to a sensible size.
-2. **Read `skills/ui-design/SKILL.md`** and commit to a typographic pairing + color direction.
+2. **Read `.agents/skills/ui-design/SKILL.md`** and commit to a typographic pairing + color direction.
 3. **Build the document**: full HTML, inline CSS/JS, embed `DATA` via `json.dumps(..., ensure_ascii=False)`, draw charts from `DATA`.
 4. **Theme-proof it**: every color in `var(--color-role, #fallback)` form.
 5. **Add the mandatory `@media print` block.**
@@ -233,5 +258,7 @@ Aim for 10–11pt body text — the register of a printed research note. Keep ta
 - [ ] Every color in `var(--color-role, #literalFallback)` form — no bare `var()`, no unvariabled hardcodes
 - [ ] Charts: wrapper-div heights, `maintainAspectRatio: false`, `getComputedStyle` + literal fallback for canvas colors
 - [ ] Mandatory `@media print` block present: hides chrome, `break-inside: avoid`, sane `@page` margins, animations/opacity neutralized
-- [ ] Design follows `skills/ui-design/SKILL.md` (typography, single accent, profit/loss color discipline, no AI slop)
+- [ ] Interactivity (if any): events via `addEventListener` (no inline `on*=`), runs on embedded `DATA` (no live `fetch`), default state is meaningful, controls `.no-print` and collapsed content expands when printing
+- [ ] User's stated preferences (this chat / long-term memory / saved prefs) honored wherever they differ from this skill's defaults
+- [ ] Design follows `.agents/skills/ui-design/SKILL.md` (typography, single accent, profit/loss color discipline, no AI slop)
 - [ ] Written to `results/`; numbers correctly formatted; opened and print-previewed; cited to the user as a link

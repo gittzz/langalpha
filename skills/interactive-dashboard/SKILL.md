@@ -9,12 +9,32 @@ Build interactive web dashboards inside the sandbox and expose them to the user 
 
 ## When to Use
 
-- User asks for a **dashboard**, **tracker**, **monitor**, or **interactive chart**
-- User wants a **web app** or **live visualization** rather than a static image
-- User requests something that benefits from interactivity: filtering, drill-downs, hover tooltips, tab switching
-- User explicitly says "preview", "web view", or "interactive"
+Use this skill for a **live, served web app** — one that needs a running server, not a single file:
 
-**Do NOT use if:** User wants a static chart image (use matplotlib/plotly `savefig` instead) or a document/report (use docx/pptx skills).
+- User asks for a **dashboard**, **tracker**, or **monitor** that **refreshes live data** (polling, auto-update)
+- The app needs **server-side logic** — filtering/screening over a large dataset, on-demand fetches, computed endpoints
+- **Multi-page / routed** apps, or anything that needs React-level component interactivity
+- The dataset is **too large to embed** in a single HTML file
+- User explicitly says "preview", "web view", "web app", or wants it running at a URL
+
+**Do NOT use if:**
+- User wants a **self-contained HTML report** — even an *interactive* one (sortable tables, tabs, hover/zoom charts) over a **data snapshot**. That's `.agents/skills/html-report/SKILL.md`: one file in `results/`, keepable, printable, PDF-exportable, share-linkable. Interactivity by itself does **not** require a dashboard.
+- User wants a **static chart image** → matplotlib/plotly `savefig`.
+- User wants an **in-chat figure** → `inline-widget` (`ShowWidget`).
+
+### Dashboard vs. HTML Report
+
+Both can be interactive, so the divide is **live served app vs. self-contained snapshot file**, not static vs. interactive:
+
+| | interactive-dashboard (this skill) | html-report |
+|---|---|---|
+| Delivery | A **running server**, exposed via `GetPreviewUrl` | One **`.html` file** in `results/` |
+| Data | **Live / refreshing**, fetched from a backend; large datasets OK | A **snapshot** embedded in the file |
+| Interactivity | Full app — routing, server-side filtering, live updates | Client-side over the snapshot — sort, filter, tabs, chart hover/zoom |
+| Keep / print / share | A URL, live only while the workspace runs | Downloadable, PDF-exportable, share-linkable as one artifact |
+| Pick when | Data must be live, or compute/scale needs a server | The answer is a deliverable the user keeps |
+
+**Deciding question:** if the data can be captured as a snapshot and embedded in one file, prefer **html-report** — the user gets a keepable, printable artifact. Choose a dashboard only when it genuinely needs a live server: refreshing data, server-side compute, multi-page routing, or a dataset too big to embed.
 
 ## Architecture
 
@@ -345,7 +365,7 @@ hist = ticker.history(period="1y")
 
 ## UI Design Rules
 
-Read `skills/ui-design/SKILL.md` for design quality (typography, color, avoiding generic AI aesthetics).
+Read `.agents/skills/ui-design/SKILL.md` for design quality (typography, color, avoiding generic AI aesthetics).
 
 ### Dark Theme (Default)
 

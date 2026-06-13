@@ -16,7 +16,7 @@ Render interactive HTML/SVG widgets directly inside the chat conversation using 
 
 **Use `interactive-dashboard` instead if:** User needs a multi-page web app, server-side data, live data refresh, or complex interactivity requiring React/FastAPI.
 
-Read `skills/ui-design/SKILL.md` for design quality (typography, color, avoiding generic AI aesthetics).
+Read `.agents/skills/ui-design/SKILL.md` for design quality (typography, color, avoiding generic AI aesthetics).
 
 ## ShowWidget API
 

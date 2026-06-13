@@ -11,7 +11,7 @@ import pytest
 from ptc_agent.agent.prompts import get_loader, reset_loader
 
 HTML_BLOCK_MARKER = "Output Format: Styled HTML"
-SKILL_REFS = ("skills/html-report/SKILL.md", "skills/ui-design/SKILL.md")
+SKILL_REFS = (".agents/skills/html-report/SKILL.md", ".agents/skills/ui-design/SKILL.md")
 
 
 def _render(agent_preference):

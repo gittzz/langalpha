@@ -7,7 +7,9 @@ description: "Design-quality reference for financial-research HTML output: typog
 
 A design-quality reference for the HTML you author — `html-report` documents, `inline-widget` fragments, and `interactive-dashboard` pages. It exists to make output look like it came from a research desk, not a marketing landing page or a generic AI template.
 
-Read this **before** authoring any styled HTML. The companion skill `skills/html-report/SKILL.md` covers the mechanics (file layout, theme vars, charts, print); this skill covers taste.
+Read this **before** authoring any styled HTML. The companion skill `.agents/skills/html-report/SKILL.md` covers the mechanics (file layout, theme vars, charts, print); this skill covers taste.
+
+> **User preferences override these defaults.** If the user has stated a taste — in this conversation, in your long-term memory, or in their saved preferences — it wins over any rule here. They want a specific brand color, a chosen font, a different accent, dark-only, no serif? Do that. These are strong defaults for when the user hasn't said; they are not a license to overrule the user's explicit taste.
 
 ## The Tone: Research Desk, Not Marketing Page
 
@@ -92,7 +94,7 @@ Commit to **one** direction: ink on paper with a single accent, plus the two sem
 Rules:
 - **WCAG AA**: body text ≥ 4.5:1 against its background; large text/UI ≥ 3:1. The values above meet AA on their paired backgrounds. Verify any custom pairing.
 - **Green/red are reserved** for profit/loss and beat/miss. Never use them as decorative categorical colors.
-- **Dark-aware via the fallback pattern**: author every color as `var(--color-role, #literalFallback)` so the document themes with the app yet still renders standalone and in print. (See `skills/html-report/SKILL.md` for the full theme-var table — reuse those variable names.)
+- **Dark-aware via the fallback pattern**: author every color as `var(--color-role, #literalFallback)` so the document themes with the app yet still renders standalone and in print. (See `.agents/skills/html-report/SKILL.md` for the full theme-var table — reuse those variable names.)
 - Categorical chart palette (when you genuinely need categories): derive 3-4 muted tints rather than full-saturation hues, e.g. the accent plus two desaturated neighbors. More than 4 series → switch to small multiples or a table.
 
 ## Composition
