@@ -6,7 +6,7 @@ import WorkspaceImage from '../WorkspaceImage';
 import { WorkspaceProvider } from '../../contexts/WorkspaceContext';
 
 // WorkspaceImage's only utils/api dependency is the authenticated downloader.
-const downloadWorkspaceFile = vi.fn(() => Promise.resolve('blob:authed'));
+const downloadWorkspaceFile = vi.fn((..._args: unknown[]) => Promise.resolve('blob:authed'));
 vi.mock('../../utils/api', () => ({
   downloadWorkspaceFile: (...args: unknown[]) => downloadWorkspaceFile(...args),
 }));

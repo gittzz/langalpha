@@ -11,6 +11,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { updateCurrentUser } from '../../Dashboard/utils/api';
 import { softInterruptWorkflow, getWorkspace, summarizeThread, offloadThread, getPreviewUrl, getThreadShareStatus, updateThreadSharing } from '../utils/api';
+import { buildSharedServeUrl } from './viewers/html/wsfilesUrl';
 import { toast } from '@/components/ui/use-toast';
 import { mergeWarmingDisplay } from '../utils/warmWorkspace';
 import { useChatMessages } from '../hooks/useChatMessages';
@@ -724,7 +725,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   resolvedThreadIdRef.current = currentThreadId || threadId;
 
   // Copy a shareable link to an HTML report. Enables thread sharing (with file
-  // browsing) on first use, then copies `${origin}/s/{token}?file=<path>`.
+  // browsing) on first use, then copies a direct link to the file served as its
+  // own full-tab page — `${origin}/api/v1/public/shared/{token}/files/serve/<path>`,
+  // not a deep link into the conversation view. The share token (not the
+  // workspace UUID) scopes access and stays revocable.
   const handleCopyShareLink = useCallback(async (filePath: string) => {
     const tid = currentThreadIdRef.current;
     if (!tid) return;
@@ -743,7 +747,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       }
       const token = status?.share_token;
       if (!token) throw new Error('No share token');
-      const url = `${window.location.origin}/s/${token}?file=${encodeURIComponent(filePath)}`;
+      // buildSharedServeUrl encodes each path segment but preserves slashes, so
+      // relative subresources still resolve. It's relative when the API base is
+      // same-origin (the nginx case); make it absolute for a copyable link.
+      const served = buildSharedServeUrl(token, filePath);
+      const url = /^https?:\/\//i.test(served) ? served : `${window.location.origin}${served}`;
       await navigator.clipboard.writeText(url);
       toast({ description: t('filePanel.shareLinkCopied') });
     } catch (e) {

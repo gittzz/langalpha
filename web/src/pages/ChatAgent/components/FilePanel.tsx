@@ -602,7 +602,8 @@ interface FilePanelProps {
   hideClose?: boolean;
   onSwitchToMemoTab?: (() => void) | null;
   /** Copy a shareable link to an HTML report (authenticated app only). Enables
-   *  sharing if needed, then copies `${origin}/s/{token}?file=<path>`. */
+   *  sharing if needed, then copies a direct full-tab link to the served file
+   *  (`${origin}/api/v1/public/shared/{token}/files/serve/<path>`). */
   onCopyShareLink?: ((filePath: string) => void) | null;
 }
 
