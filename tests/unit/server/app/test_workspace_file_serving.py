@@ -34,8 +34,16 @@ _DBWS_PATCH = "src.server.app.workspace_files.db_get_workspace"
 _FP_PATCH = "src.server.app.workspace_files.FilePersistenceService"
 _WD_PATCH = "src.server.app.workspace_files._get_work_dir"
 _SANDBOX_PATCH = "src.server.app.workspace_files._acquire_sandbox"
+_WSMGR_PATCH = "src.server.app.workspace_files.WorkspaceManager"
 _RENDER_PATCH = "src.server.services.pdf_render.render_workspace_pdf"
 _PDF_INTERNAL_BASE = "http://127.0.0.1:8000"
+
+
+def _warm_manager() -> MagicMock:
+    """A WorkspaceManager whose cached session reports ready (live-read path)."""
+    mgr = MagicMock()
+    mgr.get_instance.return_value.has_ready_session.return_value = True
+    return mgr
 
 
 def _workspace(status: str) -> dict:
@@ -114,6 +122,38 @@ async def test_traversal_returns_uniform_404():
     assert exc.value.status_code == 404
     assert exc.value.detail == "Not found"
     mock_ws.assert_not_called()
+
+
+# --- System / hidden agent-infra dirs are never served --------------------
+
+
+@pytest.mark.asyncio
+@patch(_FP_PATCH)
+@patch(_WD_PATCH, return_value="/home/workspace")
+@patch(_DBWS_PATCH, new_callable=AsyncMock)
+@pytest.mark.parametrize(
+    "blocked_path",
+    [
+        ".agents/user/memory/memory.md",
+        "tools/generated_wrapper.py",
+        "mcp_servers/server.py",
+        ".system/config.json",
+        "_internal/secret.txt",
+    ],
+)
+async def test_system_and_hidden_paths_return_404(
+    mock_ws, _wd, mock_fp, blocked_path
+):
+    # The serve core must mirror the read/download/list gate so the
+    # unauthenticated route never exposes agent-infrastructure dirs, even
+    # when a record exists in the DB fallback.
+    mock_ws.return_value = _workspace("stopped")
+    mock_fp.get_file_content = AsyncMock(return_value=_db_text_record("secret"))
+    with pytest.raises(HTTPException) as exc:
+        await serve_workspace_file(WS_ID, blocked_path, inject_theme=False)
+    assert exc.value.status_code == 404
+    # Blocked before the DB is ever consulted.
+    mock_fp.get_file_content.assert_not_called()
 
 
 # --- Unknown / flash workspace → uniform 404 ------------------------------
@@ -222,6 +262,7 @@ async def test_db_fallback_unknown_extension_uses_db_mime(mock_ws, mock_fp, _wd,
 
 
 @pytest.mark.asyncio
+@patch(_WSMGR_PATCH, new=_warm_manager())
 @patch(_VAULT_PATCH, new_callable=AsyncMock, return_value={})
 @patch(_WD_PATCH, return_value="/home/workspace")
 @patch(_SANDBOX_PATCH, new_callable=AsyncMock)
@@ -235,6 +276,7 @@ async def test_running_workspace_serves_live_bytes(mock_ws, mock_sb, _wd, _vault
 
 
 @pytest.mark.asyncio
+@patch(_WSMGR_PATCH, new=_warm_manager())
 @patch(_VAULT_PATCH, new_callable=AsyncMock, return_value={})
 @patch(_WD_PATCH, return_value="/home/workspace")
 @patch(_SANDBOX_PATCH, new_callable=AsyncMock)
@@ -245,6 +287,28 @@ async def test_running_workspace_missing_file_returns_404(mock_ws, mock_sb, _wd,
     with pytest.raises(HTTPException) as exc:
         await serve_workspace_file(WS_ID, "results/x.html", inject_theme=False)
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+@patch(_WSMGR_PATCH)
+@patch(_FP_PATCH)
+@patch(_VAULT_PATCH, new_callable=AsyncMock, return_value={})
+@patch(_WD_PATCH, return_value="/home/workspace")
+@patch(_SANDBOX_PATCH, new_callable=AsyncMock)
+@patch(_DBWS_PATCH, new_callable=AsyncMock)
+async def test_running_db_row_but_cold_sandbox_uses_db_not_wake(
+    mock_ws, mock_sb, _wd, _vault, mock_fp, mock_mgr
+):
+    # DB says 'running' but no warm session (Daytona auto-stopped). The serve
+    # route must read from the DB and never call _acquire_sandbox (which would
+    # trigger a paid Daytona start) — denial-of-wallet guard.
+    mock_ws.return_value = _workspace("running")
+    mock_mgr.get_instance.return_value.has_ready_session.return_value = False
+    mock_fp.get_file_content = AsyncMock(return_value=_db_text_record("from-db"))
+    resp = await serve_workspace_file(WS_ID, "results/x.html", inject_theme=False)
+    assert resp.status_code == 200
+    assert b"from-db" in resp.body
+    mock_sb.assert_not_called()
 
 
 # --- CSP + cache headers present on every response ------------------------

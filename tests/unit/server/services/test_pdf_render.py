@@ -77,6 +77,22 @@ def test_lookalike_domains_blocked():
     assert not _is_request_allowed("https://cdnjs.cloudflare.com.evil.io/x.js", _PREFIX)
 
 
+def test_recursive_format_pdf_subresource_blocked():
+    # A rendered document must not re-invoke the renderer via a subresource.
+    assert not _is_request_allowed(_PREFIX + "results/report.html?format=pdf", _PREFIX)
+    assert not _is_request_allowed(_PREFIX + "results/report.html?x=1&format=pdf", _PREFIX)
+    # Other query strings on workspace assets remain allowed.
+    assert _is_request_allowed(_PREFIX + "results/report.html?v=2", _PREFIX)
+
+
+def test_websocket_targets_blocked():
+    # WebSockets need a separate route guard; no ws/wss URL satisfies the
+    # https-only allowlist, so the WS handler closes every connection.
+    assert not _is_request_allowed("ws://127.0.0.1:6379/", _PREFIX)
+    assert not _is_request_allowed("ws://169.254.169.254/latest/meta-data/", _PREFIX)
+    assert not _is_request_allowed("wss://cdnjs.cloudflare.com/socket", _PREFIX)
+
+
 # --- @page size → viewport ---------------------------------------------------
 
 

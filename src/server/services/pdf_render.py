@@ -58,10 +58,12 @@ def _is_request_allowed(url: str, workspace_serve_prefix: str) -> bool:
 
     Allowed when the URL starts with this workspace's serve prefix, or when its
     host is an exact match in the https CDN allowlist. Exact host equality (not
-    suffix) blocks lookalikes like ``unpkg.com.evil.io``.
+    suffix) blocks lookalikes like ``unpkg.com.evil.io``. A workspace-prefix URL
+    carrying ``format=pdf`` is rejected so a rendered document cannot embed a
+    subresource that recursively re-invokes the renderer.
     """
     if url.startswith(workspace_serve_prefix):
-        return True
+        return "format=pdf" not in (urlparse(url).query or "")
     parsed = urlparse(url)
     if parsed.scheme != "https":
         return False
@@ -330,8 +332,20 @@ async def render_workspace_pdf(
                 else:
                     await route.abort()
 
+            async def _ws_route_handler(ws_route):
+                # WebSockets are not covered by page.route, so gate them
+                # separately. No ws:// URL passes _is_request_allowed (it
+                # requires the https serve prefix or an https CDN host), so
+                # this blocks every WS — closing the one egress channel the
+                # HTTP guard misses (e.g. ws://169.254.169.254, ws://127.0.0.1).
+                if _is_request_allowed(ws_route.url, workspace_serve_prefix):
+                    ws_route.connect_to_server()
+                else:
+                    await ws_route.close()
+
             page = await context.new_page()
             await page.route("**/*", _route_handler)
+            await page.route_web_socket("**/*", _ws_route_handler)
             # Lay out with print CSS from the first paint so charts size for
             # paper instead of re-rendering during the print reflow.
             await page.emulate_media(media="print")

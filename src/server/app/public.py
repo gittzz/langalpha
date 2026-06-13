@@ -479,6 +479,11 @@ async def serve_shared_file(
     workspace UUID is resolved server-side and never appears in the URL.
     ``?format=pdf`` renders HTML files via server-side Chromium over the same
     internal wsfiles URL (the public URL never matters internally).
+
+    Gated on ``allow_files`` only, matching ``read_shared_file``: in this share
+    model ``allow_files`` already grants byte access to file content, and
+    ``allow_download`` gates the explicit download affordance, not raw content
+    reachability. So serving (and PDF export) need only ``allow_files``.
     """
     thread, workspace_id = await _get_shared_workspace_id(share_token, require_files=True)
 

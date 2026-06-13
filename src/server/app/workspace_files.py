@@ -284,6 +284,22 @@ def _is_always_hidden_path(client_path: str) -> bool:
     return False
 
 
+def _is_serve_blocked_path(client_path: str) -> bool:
+    """True if a path must never be served by the file-serving core.
+
+    Mirrors the hidden/system/always-hidden gate the read/download/list
+    endpoints apply, so the unauthenticated wsfiles route and the share-token
+    serve route never expose agent-infrastructure dirs (``.agents``, ``tools``,
+    ``mcp_servers``, ``_internal``, ...) that those endpoints deliberately hide.
+    The user-profile carve-out lives inside ``_is_system_path``.
+    """
+    return (
+        _is_always_hidden_path(client_path)
+        or _is_hidden_path(client_path)
+        or _is_system_path(client_path)
+    )
+
+
 def _get_work_dir() -> str:
     """Return the configured working directory from WorkspaceManager config."""
     manager = WorkspaceManager.get_instance()
@@ -1141,16 +1157,22 @@ _EXPLICIT_MIME_TYPES: dict[str, str] = {
 }
 
 # Theme-sync script spliced after <head> when `?inject=theme` is set. Listens
-# for `widget:themeUpdate` postMessages and applies `--color-*` custom
-# properties to :root, matching the inline-widget theme protocol.
+# for `widget:themeUpdate` postMessages and applies the `--color-*` custom
+# properties to :root via a dedicated style element. The payload field (`css`,
+# a `--color-x: value;` block) and message type match the inline-widget theme
+# protocol the parent already speaks (useHtmlSandbox.pushTheme).
 _THEME_INJECTION = (
     '<meta name="color-scheme" content="light dark">'
-    "<script>(function(){window.addEventListener('message',function(e){"
+    "<script>(function(){"
+    "function apply(css){"
+    "var id='__wsfiles_theme__';var s=document.getElementById(id);"
+    "if(!s){s=document.createElement('style');s.id=id;"
+    "(document.head||document.documentElement).appendChild(s);}"
+    "s.textContent=':root{\\n'+css+'\\n}';}"
+    "window.addEventListener('message',function(e){"
     "var d=e&&e.data;"
-    "if(!d||d.type!=='widget:themeUpdate'||!d.vars)return;"
-    "var r=document.documentElement;"
-    "for(var k in d.vars){if(k.indexOf('--color-')===0){"
-    "r.style.setProperty(k,d.vars[k]);}}});})();</script>"
+    "if(!d||d.type!=='widget:themeUpdate'||!d.css)return;"
+    "apply(d.css);});})();</script>"
 )
 
 
@@ -1204,40 +1226,56 @@ def _has_traversal(path: str) -> bool:
     return ".." in (path or "").replace("\\", "/").split("/")
 
 
+async def _db_fallback_bytes(
+    workspace_id: str, normalized_path: str, extension_mime: str
+) -> tuple[bytes, str] | None:
+    """Read a file's bytes from the persisted DB record (no sandbox I/O)."""
+    file_record = await FilePersistenceService.get_file_content(
+        workspace_id, normalized_path
+    )
+    if not file_record:
+        return None
+    if file_record.get("is_binary") and file_record.get("content_binary") is not None:
+        content = file_record["content_binary"]
+        if isinstance(content, memoryview):
+            content = bytes(content)
+    elif file_record.get("content_text") is not None:
+        content = file_record["content_text"].encode("utf-8")
+    else:
+        return None
+    # Extension is the authority for known web types; fall back to the
+    # DB-stored mime only when the extension is unrecognized.
+    if extension_mime == "application/octet-stream" and file_record.get("mime_type"):
+        return content, file_record["mime_type"]
+    return content, extension_mime
+
+
 async def _resolve_serve_bytes(
     workspace: dict[str, Any], workspace_id: str, normalized_path: str
 ) -> tuple[bytes, str] | None:
     """Resolve raw bytes + content type for a file, sandbox-first with DB fallback.
 
     Returns ``(content, content_type)`` or ``None`` when the file is missing.
-    Stopped/stopping/starting workspaces serve from the DB without waking the
-    sandbox; running workspaces read live bytes.
+    Live bytes are read only when the sandbox is already warm in this worker
+    (``has_ready_session``); otherwise — including a stale ``running`` DB row
+    whose Daytona sandbox has auto-stopped — this falls back to the persisted
+    DB record. This keeps the unauthenticated route from ever waking or
+    recovering a sandbox (denial-of-wallet) from a UUID-only request.
     """
     extension_mime = _guess_content_type(normalized_path)
 
+    # Live read only from an already-warm sandbox; short-circuit so the manager
+    # singleton is consulted only on the running path. A stale 'running' DB row
+    # whose Daytona sandbox auto-stopped has no warm session → DB fallback.
     status = workspace.get("status")
-    if status in ("stopped", "stopping", "starting"):
-        file_record = await FilePersistenceService.get_file_content(
-            workspace_id, normalized_path
-        )
-        if not file_record:
-            return None
-        if file_record.get("is_binary") and file_record.get("content_binary") is not None:
-            content = file_record["content_binary"]
-            if isinstance(content, memoryview):
-                content = bytes(content)
-        elif file_record.get("content_text") is not None:
-            content = file_record["content_text"].encode("utf-8")
-        else:
-            return None
-        # Extension is the authority for known web types; fall back to the
-        # DB-stored mime only when the extension is unrecognized.
-        if extension_mime == "application/octet-stream" and file_record.get("mime_type"):
-            return content, file_record["mime_type"]
-        return content, extension_mime
+    warm = (
+        status == "running"
+        and WorkspaceManager.get_instance().has_ready_session(workspace_id)
+    )
+    if not warm:
+        return await _db_fallback_bytes(workspace_id, normalized_path, extension_mime)
 
-    # Running workspace — read live bytes. Acquire without waking (status is
-    # running here; get_session_for_workspace reconnects an active sandbox).
+    # Warm sandbox — read live bytes without any Daytona start/reconnect.
     sandbox = await _acquire_sandbox(workspace_id, workspace.get("user_id") or "")
     candidate, error = sandbox.validate_and_normalize_path(normalized_path)
     if error:
@@ -1249,7 +1287,7 @@ async def _resolve_serve_bytes(
     if content is None:
         return None
     client_path = _to_client_path(sandbox, candidate)
-    if _is_always_hidden_path(client_path):
+    if _is_serve_blocked_path(client_path):
         return None
     return content, extension_mime
 
@@ -1290,7 +1328,7 @@ async def serve_workspace_file(
 
     work_dir = _get_work_dir()
     normalized_path = _normalize_requested_path(path, work_dir)
-    if not normalized_path or _is_always_hidden_path(normalized_path):
+    if not normalized_path or _is_serve_blocked_path(normalized_path):
         raise HTTPException(status_code=404, detail="Not found")
 
     resolved = await _resolve_serve_bytes(workspace, workspace_id, normalized_path)
@@ -1348,7 +1386,7 @@ async def render_workspace_file_pdf(
 
     work_dir = _get_work_dir()
     normalized_path = _normalize_requested_path(path, work_dir)
-    if not normalized_path or _is_always_hidden_path(normalized_path):
+    if not normalized_path or _is_serve_blocked_path(normalized_path):
         raise HTTPException(status_code=404, detail="Not found")
 
     # Cheap pre-validation: resolve bytes + content type and require HTML.
@@ -1385,7 +1423,7 @@ async def render_workspace_file_pdf(
         "Content-Disposition": content_disposition(
             f"{stem}.pdf", disposition="attachment"
         ),
-        "Cache-Control": "private, max-age=60",
+        "Cache-Control": _WSFILES_CACHE_CONTROL,
     }
     _record_fs_bytes("pdf", len(pdf_bytes))
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
