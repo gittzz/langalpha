@@ -9,7 +9,11 @@ vi.mock('react-i18next', () => ({
 }));
 
 const toastDismiss = vi.fn();
-const toastMock = vi.fn(() => ({ id: '1', dismiss: toastDismiss, update: vi.fn() }));
+const toastMock = vi.fn((..._args: unknown[]) => ({
+  id: '1',
+  dismiss: toastDismiss,
+  update: vi.fn(),
+}));
 vi.mock('@/components/ui/use-toast', () => ({
   toast: (...args: unknown[]) => toastMock(...args),
 }));
