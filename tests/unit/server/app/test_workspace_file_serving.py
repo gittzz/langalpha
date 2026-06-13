@@ -380,6 +380,27 @@ async def test_redaction_not_applied_to_binary(mock_ws, mock_fp, _wd, mock_vault
     assert resp.body == raw
 
 
+@pytest.mark.asyncio
+@patch(_VAULT_PATCH, new_callable=AsyncMock)
+@patch(_WD_PATCH, return_value="/home/workspace")
+@patch(_FP_PATCH)
+@patch(_DBWS_PATCH, new_callable=AsyncMock)
+async def test_redaction_applied_to_misnamed_text(mock_ws, mock_fp, _wd, mock_vault):
+    # A UTF-8 text body served under a binary extension (e.g. secret.png) is
+    # still redacted — the extension-derived MIME must not gate redaction, or a
+    # secret in a mis-named file would leak on this unauthenticated route.
+    secret = "SUPERSECRETVALUE123"
+    mock_vault.return_value = {"API_KEY": secret}
+    mock_ws.return_value = _workspace("stopped")
+    mock_fp.get_file_content = AsyncMock(
+        return_value=_db_text_record(f"leaked key={secret}")
+    )
+    resp = await serve_workspace_file(WS_ID, "results/secret.png", inject_theme=False)
+    assert resp.media_type == "image/png"
+    assert secret.encode() not in resp.body
+    assert b"[REDACTED:API_KEY]" in resp.body
+
+
 # --- ?inject=theme splices for HTML only ----------------------------------
 
 

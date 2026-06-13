@@ -1202,6 +1202,15 @@ def _is_html_content_type(content_type: str) -> bool:
     return content_type.split(";", 1)[0].strip().lower() in ("text/html", "text/htm")
 
 
+def _is_utf8(data: bytes) -> bool:
+    """True when bytes decode cleanly as UTF-8 (i.e. text, whatever the MIME)."""
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def _inject_theme_into_html(html: str) -> str:
     """Splice the theme-sync snippet immediately after <head> (case-insensitive).
 
@@ -1336,7 +1345,12 @@ async def serve_workspace_file(
         raise HTTPException(status_code=404, detail="Not found")
     content, content_type = resolved
 
-    if _is_text_content_type(content_type):
+    # Redact vault secrets from any UTF-8-decodable body, not just declared
+    # text MIME types — otherwise a secret written to a mis-named file (e.g.
+    # secret.png) would bypass redaction on this unauthenticated, shareable
+    # route. Genuine binary fails to decode and is served verbatim, so we also
+    # skip the per-asset vault fetch for it.
+    if _is_text_content_type(content_type) or _is_utf8(content):
         vault_secrets = await get_vault_secrets_for_redaction(workspace_id)
         content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
