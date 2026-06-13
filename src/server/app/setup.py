@@ -72,9 +72,11 @@ llm_service = None  # Generic one-shot LLM call wrapper (BYOK/OAuth-aware)
 
 # PID 1 process names that correctly reap orphaned subprocesses.
 # `docker-init` is Docker's bundled tini wrapper (what `init: true` in compose
-# launches when no explicit entrypoint uses tini). Must be in the allowlist or
-# the reaper safety guard refuses to run in every standard Docker deployment.
-_ACCEPTABLE_INIT_COMMS = ("tini", "docker-init", "catatonit", "dumb-init")
+# launches when no explicit entrypoint uses tini); `podman-init` is the
+# equivalent shim rootless podman injects for `init: true` (catatonit under the
+# hood). Must be in the allowlist or this diagnostic logs a false "init: true
+# failed" warning on every startup of an otherwise-correctly-hardened container.
+_ACCEPTABLE_INIT_COMMS = ("tini", "docker-init", "catatonit", "dumb-init", "podman-init")
 
 
 def _log_container_hardening() -> None:

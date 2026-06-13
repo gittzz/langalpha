@@ -43,7 +43,7 @@ _STAT_STARTTIME_IDX = 19  # /proc/[pid]/stat field 22, 0-indexed after comm
 # means "orphan reaped to init" when init actually reaps. If PID 1 is our python
 # worker (init: true silently failed), ppid==1 matches direct children including
 # LIVE browsers of in-flight workflows — the reaper would then SIGKILL healthy crawls.
-_SAFE_INIT_PROCESSES = ("tini", "docker-init", "catatonit", "dumb-init")
+_SAFE_INIT_PROCESSES = ("tini", "docker-init", "catatonit", "dumb-init", "podman-init")
 
 # Three-layer health model tunables.
 _BLOCKED_TTL_SECONDS = 900.0       # 15-min blocked-host cache entry

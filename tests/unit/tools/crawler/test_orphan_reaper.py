@@ -208,14 +208,17 @@ class TestOrphanReaper:
         assert kills == []  # safety guard engaged — no kills
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("init_comm", ["tini", "docker-init", "catatonit", "dumb-init"])
+    @pytest.mark.parametrize(
+        "init_comm", ["tini", "docker-init", "catatonit", "dumb-init", "podman-init"]
+    )
     async def test_accepts_all_supported_init_processes(self, patched_proc, init_comm):
-        """REGRESSION: docker-init is what `init: true` actually launches.
+        """REGRESSION: the init shim varies by runtime; all must be accepted.
 
         Observed in staging: Docker Desktop and Docker CE set PID 1 to
-        `docker-init` (their bundled tini wrapper), not bare `tini`. The
-        allowlist must include it or the reaper refuses to run on every
-        standard Docker deployment.
+        `docker-init` (their bundled tini wrapper), not bare `tini`. In
+        production under rootless podman, `init: true` injects `podman-init`
+        (catatonit under the hood). The allowlist must include each or the
+        reaper refuses to run on that deployment and orphan browsers leak.
         """
         (patched_proc / "1" / "comm").write_text(f"{init_comm}\n")
         _write_stat(patched_proc, pid=6000, comm="chrome", ppid=1, start_ticks=5000)
