@@ -1,6 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import { SlidersHorizontal } from 'lucide-react';
-import { Popover, PopoverTrigger, PopoverContent } from '../../../components/ui/popover';
+import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { useNavPrefs, setNavPrefs, type NavOrderBy } from '../utils/navPrefs';
 
 const WORKSPACE_CHOICES: readonly (number | 'all')[] = [5, 10, 'all'];
@@ -27,6 +27,7 @@ function ChoiceGroup<T extends string | number>({ label, choices, value, format,
       >
         {choices.map((choice) => (
           <button
+            type="button"
             key={String(choice)}
             onClick={() => onSelect(choice)}
             aria-pressed={value === choice}

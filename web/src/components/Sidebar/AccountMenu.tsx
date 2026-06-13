@@ -181,7 +181,10 @@ const AccountMenu: React.FC = () => {
             </DropdownMenuItem>
           )}
 
-          <DropdownMenuSeparator />
+          {/* Only divide when the Usage & Plan item above actually rendered;
+              OSS mode hides it (accountUrl === null) and an unconditional
+              separator would stack against the profile divider. */}
+          {accountUrl && <DropdownMenuSeparator />}
 
           <DropdownMenuItem onSelect={() => navigate('/settings')}>
             <Settings className="h-4 w-4" />

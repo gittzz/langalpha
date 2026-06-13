@@ -9,6 +9,10 @@ export default defineConfig(({ mode }) => {
   // process.env entries, so `VITE_FOO=bar pnpm dev` keeps working too.
   const env = loadEnv(mode, process.cwd())
   const backendTarget = env.VITE_PROXY_BACKEND || 'http://localhost:8000'
+  // Only honor a well-formed port; a non-numeric VITE_HMR_CLIENT_PORT would
+  // otherwise yield NaN and silently break the HMR socket.
+  const hmrClientPort = Number(env.VITE_HMR_CLIENT_PORT)
+  const hasHmrClientPort = Number.isFinite(hmrClientPort) && hmrClientPort > 0
 
   return {
     base: env.VITE_CDN_BASE || '/',
@@ -47,8 +51,8 @@ export default defineConfig(({ mode }) => {
       // proxy's `location = /` session redirect (/ → /home|/app), which would
       // 302 the upgrade and surface as "WebSocket closed without opened". The
       // non-root path falls through nginx's `location /` to this Vite server.
-      hmr: env.VITE_HMR_CLIENT_PORT
-        ? { clientPort: Number(env.VITE_HMR_CLIENT_PORT), path: '/vite-hmr' }
+      hmr: hasHmrClientPort
+        ? { clientPort: hmrClientPort, path: '/vite-hmr' }
         : undefined,
       proxy: {
         '/api/v1': {

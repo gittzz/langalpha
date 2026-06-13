@@ -318,7 +318,10 @@ export function useNavigationData(currentWorkspaceId: string) {
   }, [showAll, workspaceLimit, allFetched.length, totalCount]);
 
   const { data: currentWsThreadData, isLoading: currentWsThreadsLoading } = useQuery({
-    queryKey: queryKeys.threads.byWorkspace(currentWorkspaceId),
+    // Page size is part of the key (mirrors the dashboard widgets' thread keys):
+    // the queryFn fetches `threadPageSize` rows, so changing that pref must miss
+    // the cache and refetch instead of replaying the previous page size.
+    queryKey: [...queryKeys.threads.byWorkspace(currentWorkspaceId), threadPageSize, 0],
     queryFn: () => getWorkspaceThreads(currentWorkspaceId, threadPageSize, 0),
     enabled: !!currentWorkspaceId,
     staleTime: 30_000,
@@ -371,7 +374,7 @@ export function useNavigationData(currentWorkspaceId: string) {
       });
     };
 
-    const cached = queryClient.getQueryData(queryKeys.threads.byWorkspace(wsId)) as ThreadsResponse | undefined;
+    const cached = queryClient.getQueryData([...queryKeys.threads.byWorkspace(wsId), threadPageSize, 0]) as ThreadsResponse | undefined;
     if (cached) {
       mergeFetched(cached);
       return;
@@ -383,7 +386,7 @@ export function useNavigationData(currentWorkspaceId: string) {
     }));
 
     queryClient.fetchQuery({
-      queryKey: queryKeys.threads.byWorkspace(wsId),
+      queryKey: [...queryKeys.threads.byWorkspace(wsId), threadPageSize, 0],
       queryFn: () => getWorkspaceThreads(wsId, threadPageSize, 0),
       staleTime: 30_000,
     }).then((data: unknown) => {

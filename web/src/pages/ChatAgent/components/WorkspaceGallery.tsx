@@ -194,13 +194,17 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRena
   const renameInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (!isRenaming) return;
+    // Seed the draft once on entry only. Re-running on workspace.name would let a
+    // background refetch (e.g. another session's rename) clobber the in-progress
+    // input mid-edit, so it's intentionally absent from the deps.
     setRenameDraft(workspace.name);
     const raf = requestAnimationFrame(() => {
       renameInputRef.current?.focus();
       renameInputRef.current?.select();
     });
     return () => cancelAnimationFrame(raf);
-  }, [isRenaming, workspace.name]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRenaming]);
   const commitRename = () => {
     const name = renameDraft.trim();
     if (name && name !== workspace.name) onRenameSubmit(workspace.workspace_id, name);
