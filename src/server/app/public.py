@@ -34,9 +34,12 @@ from src.server.database.conversation import (
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.app.workspace_files import (
     _get_work_dir,
+    _has_traversal,
     _is_always_hidden_path,
     _is_hidden_path,
     _is_system_path,
+    _is_text_content_type,
+    _is_utf8,
     _normalize_requested_path,
     _is_binary,
     render_workspace_file_pdf,
@@ -211,6 +214,13 @@ async def list_shared_files(
     """List files in a shared thread's workspace. Requires allow_files permission."""
     thread, workspace_id = await _get_shared_workspace_id(share_token, require_files=True)
 
+    # Reject `..` before it reaches the sandbox path validator, which only
+    # prefix-checks the work dir and does not resolve `..` — so an unresolved
+    # `../../etc/passwd` would otherwise read outside the workspace on a live
+    # sandbox. Mirrors the serve-core guard (workspace_files._has_traversal).
+    if _has_traversal(path):
+        raise HTTPException(status_code=404, detail="File not found")
+
     from src.server.database.workspace import get_workspace as db_get_workspace
     from src.server.services.persistence.file import FilePersistenceService
     from src.server.services.workspace_manager import WorkspaceManager
@@ -278,6 +288,11 @@ async def read_shared_file(
 ):
     """Read a text file from a shared thread's workspace. Requires allow_files permission."""
     thread, workspace_id = await _get_shared_workspace_id(share_token, require_files=True)
+
+    # See list_shared_files: reject `..` before the sandbox validator, which
+    # does not resolve it.
+    if _has_traversal(path):
+        raise HTTPException(status_code=404, detail="File not found")
 
     from src.server.database.workspace import get_workspace as db_get_workspace
     from src.server.services.persistence.file import FilePersistenceService
@@ -374,6 +389,11 @@ async def download_shared_file(
     """Download a raw file from a shared thread's workspace. Requires allow_download permission."""
     thread, workspace_id = await _get_shared_workspace_id(share_token, require_download=True)
 
+    # See list_shared_files: reject `..` before the sandbox validator, which
+    # does not resolve it.
+    if _has_traversal(path):
+        raise HTTPException(status_code=404, detail="File not found")
+
     from src.server.database.workspace import get_workspace as db_get_workspace
     from src.server.services.persistence.file import FilePersistenceService
     from src.server.services.workspace_manager import WorkspaceManager
@@ -407,7 +427,7 @@ async def download_shared_file(
         filename = file_record.get("file_name", "download")
         mime = file_record.get("mime_type") or "application/octet-stream"
 
-        if mime and mime.startswith("text/"):
+        if _is_text_content_type(mime) or _is_utf8(content):
             content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
         return StreamingResponse(
@@ -439,7 +459,7 @@ async def download_shared_file(
                 filename = client_path.split("/")[-1] if client_path else "download"
                 mime, _ = mimetypes.guess_type(filename)
 
-                if mime and mime.startswith("text/"):
+                if _is_text_content_type(mime or "") or _is_utf8(content):
                     content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
                 return StreamingResponse(
