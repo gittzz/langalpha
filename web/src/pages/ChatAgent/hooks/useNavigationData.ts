@@ -155,6 +155,9 @@ export function useNavigationData(currentWorkspaceId: string) {
   // Each completed page grows allFetched, re-running the effect until total is
   // reached. A failure stops the loop for the session (avoids a retry storm).
   const wsFetchRef = useRef({ inflight: false, failed: false });
+  // Per-workspace single-flight for "Show more": the page offset is snapshotted
+  // before the await, so two rapid taps would otherwise fetch the same page.
+  const loadMoreInflightRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!showAll || isLoading) return;
     if (!totalCount || allFetched.length >= totalCount) return;
@@ -402,6 +405,8 @@ export function useNavigationData(currentWorkspaceId: string) {
   // Fetch the next page of threads for a workspace and append it below the
   // already-shown ones (the stable order keeps paginated-in ids at the bottom).
   const loadMoreThreads = useCallback(async (wsId: string) => {
+    if (loadMoreInflightRef.current.has(wsId)) return;
+    loadMoreInflightRef.current.add(wsId);
     const shown = mergedThreads[wsId]?.threads || [];
     setWorkspaceThreads(prev => ({
       ...prev,
@@ -436,6 +441,8 @@ export function useNavigationData(currentWorkspaceId: string) {
           total: prev[wsId]?.total,
         },
       }));
+    } finally {
+      loadMoreInflightRef.current.delete(wsId);
     }
   }, [mergedThreads, threadPageSize, orderThreads]);
 

@@ -18,6 +18,7 @@ import { queryKeys } from '../../../lib/queryKeys';
 import { createWorkspace, deleteWorkspace, getFlashWorkspace, updateWorkspace, reorderWorkspaces } from '../utils/api';
 import { removeStoredThreadId } from '../hooks/useChatMessages';
 import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
+import { forgetNavPanelExpansion } from './NavigationPanel';
 import { clearChatSession } from '../hooks/utils/chatSessionRestore';
 
 const DEFAULT_PAGE_SIZE = 8;
@@ -559,6 +560,9 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
       // (workspace, symbol) pair).
       removeStoredThreadId(workspaceId);
       clearAllMarketThreadsForWorkspace(workspaceId);
+      // Drop the nav panel's remembered expansion so a later remount doesn't
+      // re-expand the now-deleted workspace and fire a spurious threads 404.
+      forgetNavPanelExpansion(workspaceId);
 
       // Invalidate workspace list cache
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });

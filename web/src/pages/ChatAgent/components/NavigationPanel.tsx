@@ -125,6 +125,14 @@ export function resetNavPanelExpansion() {
   _expandedThreads.clear();
 }
 
+// Forget a deleted workspace so the mount-effect doesn't re-expand it (and fire
+// a spurious threads 404) on the next panel remount. Only deletion is a safe
+// prune signal — `workspaces` is a paged/limited slice, so absence there can
+// mean "scrolled out", not "gone".
+export function forgetNavPanelExpansion(workspaceId: string) {
+  _expandedWorkspaces.delete(workspaceId);
+}
+
 function NavigationPanel({
   workspaces,
   workspaceThreads,
