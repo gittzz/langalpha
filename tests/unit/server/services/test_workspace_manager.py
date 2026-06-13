@@ -1794,17 +1794,16 @@ class TestStatusRoutesToDbFallback:
 
     def test_public_routes_gate_on_ready_session(self):
         """The unauthenticated shared file routes must read only a warm
-        in-memory session (``has_ready_session`` → cached session), never
-        ``get_session_for_workspace`` which would attach/restart a Daytona
+        in-memory session via the no-wake ``get_session_if_ready`` accessor,
+        never ``get_session_for_workspace`` which would attach/restart a Daytona
         sandbox for a share-token request (denial-of-wallet)."""
         from src.server.app import public
         import inspect
 
         source = inspect.getsource(public)
-        # list/read/download each gate on the pure in-memory readiness check
-        # and read the cached session directly rather than acquiring one.
-        assert source.count("has_ready_session(workspace_id)") >= 3
-        assert source.count("manager._sessions.get(workspace_id)") >= 3
+        # list/read/download each read the cached session through the single
+        # no-wake accessor rather than acquiring (or waking) one.
+        assert source.count("get_session_if_ready(workspace_id)") >= 3
 
 
 # ---------------------------------------------------------------------------

@@ -366,7 +366,7 @@ async def list_shared_files(
     if workspace.get("status") == "running":
         try:
             manager = WorkspaceManager.get_instance()
-            session = manager._sessions.get(workspace_id) if manager.has_ready_session(workspace_id) else None
+            session = manager.get_session_if_ready(workspace_id)
             sandbox = getattr(session, "sandbox", None) if session else None
             if sandbox:
                 absolute_paths = await sandbox.aglob_files("**/*", path=path)
@@ -445,7 +445,7 @@ async def read_shared_file(
     if workspace.get("status") == "running":
         try:
             manager = WorkspaceManager.get_instance()
-            session = manager._sessions.get(workspace_id) if manager.has_ready_session(workspace_id) else None
+            session = manager.get_session_if_ready(workspace_id)
             sandbox = getattr(session, "sandbox", None) if session else None
             if sandbox:
                 norm, error = sandbox.validate_and_normalize_path(path)
@@ -550,7 +550,7 @@ async def download_shared_file(
     if workspace.get("status") == "running":
         try:
             manager = WorkspaceManager.get_instance()
-            session = manager._sessions.get(workspace_id) if manager.has_ready_session(workspace_id) else None
+            session = manager.get_session_if_ready(workspace_id)
             sandbox = getattr(session, "sandbox", None) if session else None
             if sandbox:
                 norm, error = sandbox.validate_and_normalize_path(path)

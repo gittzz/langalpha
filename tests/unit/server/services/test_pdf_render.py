@@ -137,6 +137,15 @@ def test_explicit_lengths():
     assert _viewport_from_page_size("1056px 816px") == {"width": 1056, "height": 816}
 
 
+def test_explicit_lengths_honor_orientation_keyword():
+    # The tokenizer accepts an orientation keyword alongside explicit lengths;
+    # honor it instead of silently dropping it. 8.5in=816px, 11in=1056px.
+    assert _viewport_from_page_size("8.5in 11in landscape") == {"width": 1056, "height": 816}
+    assert _viewport_from_page_size("11in 8.5in portrait") == {"width": 816, "height": 1056}
+    # A keyword that agrees with the given length order is a no-op.
+    assert _viewport_from_page_size("11in 8.5in landscape") == {"width": 1056, "height": 816}
+
+
 def test_single_length_is_square():
     assert _viewport_from_page_size("8.5in") == {"width": 816, "height": 816}
 

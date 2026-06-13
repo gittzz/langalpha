@@ -1040,6 +1040,20 @@ class WorkspaceManager:
             return False
         return session.sandbox.is_ready()
 
+    def get_session_if_ready(self, workspace_id: str) -> "Session | None":
+        """Return the cached session iff it's ready, else None (no I/O, no wake).
+
+        One-shot replacement for the ``has_ready_session()`` + ``_sessions.get()``
+        pair so callers (e.g. the unauthenticated public serve routes) avoid the
+        TOCTOU window between the two and don't reach into the private map.
+        """
+        session = self._sessions.get(workspace_id)
+        if session is None or not session._initialized or not session.sandbox:
+            return None
+        if not session.sandbox.is_ready():
+            return None
+        return session
+
     def get_applied_mcp_config_version(self, workspace_id: str) -> int | None:
         """The MCP config version the warm session has applied (no I/O, no lock).
 

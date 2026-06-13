@@ -180,6 +180,13 @@ def _viewport_from_page_size(size_decl: str) -> dict | None:
     if lengths:
         width = lengths[0]
         height = lengths[1] if len(lengths) > 1 else lengths[0]
+        # The tokenizer accepts an orientation keyword alongside explicit
+        # lengths (a lenient superset of the CSS grammar); honor it rather than
+        # silently dropping it, so "8.5in 11in landscape" lands in landscape.
+        if orientation == "landscape" and width < height:
+            width, height = height, width
+        elif orientation == "portrait" and width > height:
+            width, height = height, width
     elif name:
         width, height = _PAGE_SIZE_NAMES[name]
         if orientation == "landscape" and width < height:
@@ -416,8 +423,10 @@ async def render_workspace_pdf(
                         timeout=_GOTO_TIMEOUT_MS,
                     )
                 except PlaywrightTimeoutError:
-                    # Networkidle never settled (long-polling asset, etc.) —
-                    # fall back to a plain load and render what we have.
+                    # Networkidle never settled (a long-polling asset, etc.).
+                    # Re-navigate with wait_until="load": the second goto often
+                    # completes where the first stalled, now that CDN assets are
+                    # warm in the browser cache.
                     await page.goto(internal_url, wait_until="load", timeout=_GOTO_FALLBACK_TIMEOUT_MS)
                 declared_size = await page.evaluate(_PAGE_SIZE_PROBE_JS)
                 viewport = _viewport_from_page_size(declared_size) if declared_size else None

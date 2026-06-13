@@ -593,13 +593,13 @@ _PUB_VAULT = "src.server.app.public.get_vault_secrets_for_redaction"
 
 
 def _no_warm_manager():
-    """A WorkspaceManager whose has_ready_session is False and whose
-    get_session_for_workspace would explode if ever called (it must not be)."""
+    """A WorkspaceManager whose get_session_if_ready returns None (no warm
+    session) and whose get_session_for_workspace would explode if ever called
+    (it must not be)."""
     from unittest.mock import MagicMock
 
     mgr = MagicMock()
-    mgr.has_ready_session.return_value = False
-    mgr._sessions = {}
+    mgr.get_session_if_ready.return_value = None
     mgr.get_session_for_workspace = AsyncMock(
         side_effect=AssertionError("must not wake a sandbox from a public route")
     )
@@ -630,7 +630,7 @@ class TestPublicNoSandboxWake:
         assert resp.status_code == 200
         assert resp.json()["files"] == []
         mgr.get_session_for_workspace.assert_not_awaited()
-        mgr.has_ready_session.assert_called_once()
+        mgr.get_session_if_ready.assert_called_once()
 
     async def test_read_running_cold_sandbox_uses_db_not_wake(self, public_client):
         holder, mgr = _no_warm_manager()
