@@ -10,10 +10,12 @@ let mockLoading = false;
 const markPageIntroSeen = vi.fn();
 const markTaskDone = vi.fn();
 const dismissGettingStarted = vi.fn();
-const replayGuides = vi.fn();
+// replayGuides/resetAll return whether the persist write was issued (true) or
+// refused on a cold cache (false); the provider only clears local state on true.
+const replayGuides = vi.fn(() => true);
 const setLastSeenReleaseVersion = vi.fn();
 const ensureFirstRun = vi.fn();
-const resetAll = vi.fn();
+const resetAll = vi.fn(() => true);
 vi.mock('../useOnboardingPrefs', () => ({
   useOnboardingPrefs: () => ({
     prefs: mockPrefs,
@@ -307,6 +309,38 @@ describe('OnboardingProvider', () => {
       </QueryClientProvider>
     );
     expect(intro()).toBe('chat');
+  });
+
+  it('replayGuides leaves tips suppressed when the persist write is refused', () => {
+    // Cold-cache refusal: the prefs write returns false, so the provider must
+    // NOT clear local state — otherwise tips would re-show this session while
+    // the server kept them seen, then snap back on the next login (and Settings
+    // would have toasted "done" for a change that never persisted).
+    replayGuides.mockReturnValueOnce(false);
+    localStorage.setItem(
+      'langalpha-onboarding-v1:u1',
+      JSON.stringify({ pageIntrosSeen: { chat: 5 }, lastSeenReleaseVersion: null, firstRunAt: 1 })
+    );
+    mockPrefs = { ...emptyOnboardingPrefs(), pageIntrosSeen: { chat: 5 }, firstRunAt: 1 };
+    const { rerender } = renderAt('/chat');
+    expect(phase()).toBe('idle');
+
+    fireEvent.click(screen.getByText('replay'));
+    expect(replayGuides).toHaveBeenCalledTimes(1);
+
+    // Even with server prefs cleared, the un-cleared mirror still suppresses:
+    // the refusal left local state intact, so the intro must NOT re-show.
+    mockPrefs = { ...emptyOnboardingPrefs(), firstRunAt: 1 };
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={['/chat']}>
+          <OnboardingProvider>
+            <Harness />
+          </OnboardingProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    expect(intro()).toBe('none');
   });
 
   it('resetOnboarding clears everything via resetAll', () => {

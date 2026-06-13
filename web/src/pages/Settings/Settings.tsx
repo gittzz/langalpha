@@ -938,8 +938,7 @@ function Settings() {
                   <button
                     type="button"
                     onClick={() => {
-                      resetOnboarding();
-                      toast({ description: t('onboarding.settings.resetDone') });
+                      if (resetOnboarding()) toast({ description: t('onboarding.settings.resetDone') });
                     }}
                     className="shrink-0 rounded text-xs font-medium transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
                     style={{ color: 'var(--color-text-tertiary)' }}
@@ -951,8 +950,7 @@ function Settings() {
                   <button
                     type="button"
                     onClick={() => {
-                      replayGuides();
-                      toast({ description: t('onboarding.settings.replayDone') });
+                      if (replayGuides()) toast({ description: t('onboarding.settings.replayDone') });
                     }}
                     className="px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
                     style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-secondary)' }}

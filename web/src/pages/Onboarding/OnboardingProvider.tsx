@@ -69,9 +69,10 @@ interface OnboardingContextValue {
   gettingStarted: GettingStartedState;
   // What's-New
   acknowledgeWhatsNew: () => void;
-  // settings affordances
-  replayGuides: () => void;
-  resetOnboarding: () => void;
+  // settings affordances — return false when the persist write was refused
+  // (cold cache), so Settings can skip a "done" toast it can't honor.
+  replayGuides: () => boolean;
+  resetOnboarding: () => boolean;
 }
 
 const OnboardingContext = createContext<OnboardingContextValue | null>(null);
@@ -198,7 +199,11 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   }, [phase, unseen.length]);
 
   /** Re-show every page tip + the getting-started card (Settings affordance). */
-  const replayGuides = useCallback(() => {
+  const replayGuides = useCallback((): boolean => {
+    // Persist first: a refused write (cold cache) makes this a no-op rather
+    // than clearing local state for a change the server never recorded — the
+    // caller then skips the toast and the user can retry once prefs settle.
+    if (!replayGuidesPrefs()) return false;
     // Eligibility checks the mount-time mirror snapshot and the session guard
     // before prefs, so without clearing both the replay would silently
     // suppress the very tips it just cleared until reload.
@@ -206,10 +211,11 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     mirrorRef.current = null;
     setActiveIntroId(null);
     setPhase('idle');
-    replayGuidesPrefs();
+    return true;
   }, [replayGuidesPrefs]);
 
-  const resetOnboarding = useCallback(() => {
+  const resetOnboarding = useCallback((): boolean => {
+    if (!resetAll()) return false;
     shownIntrosRef.current.clear();
     mirrorRef.current = null;
     // Re-arm the first-run stamp so a reset behaves like a fresh user in this
@@ -217,7 +223,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     firstRunStampedRef.current = false;
     setActiveIntroId(null);
     setPhase('idle');
-    resetAll();
+    return true;
   }, [resetAll]);
 
   // The interview thread starts as /chat/t/__default__ but is renamed to a

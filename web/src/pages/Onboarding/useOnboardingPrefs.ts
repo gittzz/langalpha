@@ -77,10 +77,14 @@ export function useOnboardingPrefs() {
     );
   }, [writeOnboardingPrefs, fallbackOther, isLoading]);
 
-  /** Re-show all page tips and the getting-started card (Settings affordance). */
-  const replayGuides = useCallback(() => {
-    if (isLoading) return;
-    writeOnboardingPrefs(
+  /**
+   * Re-show all page tips and the getting-started card (Settings affordance).
+   * Returns false if the write was refused (cold cache) so the caller can skip
+   * a "done" toast it can't honor — the server state would be unchanged.
+   */
+  const replayGuides = useCallback((): boolean => {
+    if (isLoading) return false;
+    return writeOnboardingPrefs(
       (cur) => ({ ...cur, pageIntrosSeen: {}, gettingStartedDismissedAt: null }),
       { fallbackOther, clearMirror: true }
     );
@@ -119,10 +123,11 @@ export function useOnboardingPrefs() {
     [writeOnboardingPrefs, fallbackOther, isLoading]
   );
 
-  /** Clear all onboarding state ("reset onboarding"). */
-  const resetAll = useCallback(() => {
-    if (isLoading) return;
-    writeOnboardingPrefs(emptyOnboardingPrefs(), { fallbackOther, clearMirror: true });
+  /** Clear all onboarding state ("reset onboarding"). Returns false if the
+   * write was refused (cold cache), so the caller can skip an empty toast. */
+  const resetAll = useCallback((): boolean => {
+    if (isLoading) return false;
+    return writeOnboardingPrefs(emptyOnboardingPrefs(), { fallbackOther, clearMirror: true });
   }, [writeOnboardingPrefs, fallbackOther, isLoading]);
 
   return {
