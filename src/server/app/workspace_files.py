@@ -785,7 +785,7 @@ async def download_workspace_file(
         filename = file_record.get("file_name", "download")
         mime = file_record.get("mime_type") or "application/octet-stream"
 
-        if mime and mime.startswith("text/"):
+        if _is_text_content_type(mime) or _is_utf8(content):
             content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
         return _build_download_response(content, filename, mime, request)
@@ -810,7 +810,7 @@ async def download_workspace_file(
     filename = client_path.split("/")[-1] if client_path else "download"
     mime, _enc = mimetypes.guess_type(filename)
 
-    if mime and mime.startswith("text/"):
+    if _is_text_content_type(mime or "") or _is_utf8(content):
         vault_secrets = await get_vault_secrets_for_redaction(workspace_id)
         content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 

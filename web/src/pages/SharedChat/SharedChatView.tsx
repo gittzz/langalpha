@@ -60,7 +60,6 @@ export default function SharedChatView() {
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [_replayDone, setReplayDone] = useState(false);
 
   // File panel (right side, matching ChatView's rightPanelType === 'file')
   const [showFilePanel, setShowFilePanel] = useState(false);
@@ -122,7 +121,6 @@ export default function SharedChatView() {
           }
 
           if (eventType === 'replay_done') {
-            setReplayDone(true);
             setLoading(false);
             return;
           }
@@ -295,7 +293,6 @@ export default function SharedChatView() {
         // Mark all messages as done streaming
         setMessages((prev) => prev.map((m) => ({ ...m, isStreaming: false })));
         setLoading(false);
-        setReplayDone(true);
       } catch (e: unknown) {
         if (!cancelled) {
           setError((e as Error).message);

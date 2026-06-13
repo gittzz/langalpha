@@ -72,8 +72,9 @@ export async function replaySharedThread(
 ): Promise<void> {
   const res = await fetch(`${baseURL}/api/v1/public/shared/${shareToken}/replay`);
   if (!res.ok) throw new Error(`Failed to replay shared thread (${res.status})`);
+  if (!res.body) throw new Error('Replay stream returned no body');
 
-  const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+  const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let ev: { id?: string; event?: string } = {};
