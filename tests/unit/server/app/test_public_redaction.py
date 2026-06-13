@@ -579,3 +579,212 @@ class TestServeSharedFilePdf:
                     params={"format": "pdf"},
                 )
             assert resp.status_code == status, exc
+
+
+# ---------------------------------------------------------------------------
+# TestPublicNoSandboxWake — unauthenticated routes must never wake a sandbox
+# ---------------------------------------------------------------------------
+
+# list/read/download lazily import WorkspaceManager + FilePersistenceService
+# inside the handler, so patch them at their source modules.
+_FP_TREE = "src.server.services.persistence.file.FilePersistenceService.get_file_tree"
+_WSMGR = "src.server.services.workspace_manager.WorkspaceManager"
+_PUB_VAULT = "src.server.app.public.get_vault_secrets_for_redaction"
+
+
+def _no_warm_manager():
+    """A WorkspaceManager whose has_ready_session is False and whose
+    get_session_for_workspace would explode if ever called (it must not be)."""
+    from unittest.mock import MagicMock
+
+    mgr = MagicMock()
+    mgr.has_ready_session.return_value = False
+    mgr._sessions = {}
+    mgr.get_session_for_workspace = AsyncMock(
+        side_effect=AssertionError("must not wake a sandbox from a public route")
+    )
+    holder = MagicMock()
+    holder.get_instance.return_value = mgr
+    return holder, mgr
+
+
+class TestPublicNoSandboxWake:
+    """A 'running' DB row with no warm session must fall back to DB-only and
+    never call get_session_for_workspace() (which does a Daytona attach/restart).
+    Denial-of-wallet guard mirroring workspace_files._resolve_serve_bytes."""
+
+    async def test_list_running_cold_sandbox_uses_db_not_wake(self, public_client):
+        holder, mgr = _no_warm_manager()
+        with (
+            patch(_THREAD_BY_TOKEN, AsyncMock(return_value=_make_thread())),
+            patch(_DB_GET_WS, AsyncMock(return_value=_make_workspace(status="running"))),
+            patch(_WORK_DIR, return_value="/home/workspace"),
+            patch(_NORM_PATH, return_value=""),
+            patch(_FP_TREE, AsyncMock(return_value=[])),
+            patch(_WSMGR, holder),
+        ):
+            resp = await public_client.get(
+                f"/api/v1/public/shared/{_SHARE_TOKEN}/files",
+                params={"path": "."},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["files"] == []
+        mgr.get_session_for_workspace.assert_not_awaited()
+        mgr.has_ready_session.assert_called_once()
+
+    async def test_read_running_cold_sandbox_uses_db_not_wake(self, public_client):
+        holder, mgr = _no_warm_manager()
+        with (
+            patch(_THREAD_BY_TOKEN, AsyncMock(return_value=_make_thread())),
+            patch(_DB_GET_WS, AsyncMock(return_value=_make_workspace(status="running"))),
+            patch(_WORK_DIR, return_value="/home/workspace"),
+            patch(_NORM_PATH, return_value="data/x.txt"),
+            patch(_PUB_VAULT, AsyncMock(return_value={})),
+            patch(_FILE_SVC, AsyncMock(return_value=None)),
+            patch(_WSMGR, holder),
+        ):
+            resp = await public_client.get(
+                f"/api/v1/public/shared/{_SHARE_TOKEN}/files/read",
+                params={"path": "data/x.txt"},
+            )
+        assert resp.status_code == 404
+        mgr.get_session_for_workspace.assert_not_awaited()
+
+    async def test_download_running_cold_sandbox_uses_db_not_wake(self, public_client):
+        holder, mgr = _no_warm_manager()
+        with (
+            patch(_THREAD_BY_TOKEN, AsyncMock(return_value=_make_thread())),
+            patch(_DB_GET_WS, AsyncMock(return_value=_make_workspace(status="running"))),
+            patch(_WORK_DIR, return_value="/home/workspace"),
+            patch(_NORM_PATH, return_value="data/x.txt"),
+            patch(_PUB_VAULT, AsyncMock(return_value={})),
+            patch(_FILE_SVC, AsyncMock(return_value=None)),
+            patch(_WSMGR, holder),
+        ):
+            resp = await public_client.get(
+                f"/api/v1/public/shared/{_SHARE_TOKEN}/files/download",
+                params={"path": "data/x.txt"},
+            )
+        assert resp.status_code == 404
+        mgr.get_session_for_workspace.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# TestPublicReadTruncation — DB-fallback read reports real truncation state
+# ---------------------------------------------------------------------------
+
+
+class TestPublicReadTruncation:
+    """read_shared_file's DB path must compute `truncated` from the line range,
+    not hardcode False, so the UI can offer 'load more'."""
+
+    async def test_truncated_true_when_more_lines(self, public_client):
+        content = "\n".join(f"line{i}" for i in range(10))
+        empty = SecretRedactor.__new__(SecretRedactor)
+        empty._secrets = []
+        with (
+            patch(_THREAD_BY_TOKEN, AsyncMock(return_value=_make_thread())),
+            patch(_DB_GET_WS, AsyncMock(return_value=_make_workspace())),
+            patch(_WORK_DIR, return_value="/home/workspace"),
+            patch(_NORM_PATH, return_value="data/big.txt"),
+            patch(_FILE_SVC, AsyncMock(return_value=_make_file_record(content))),
+            patch(_GET_REDACTOR, return_value=empty),
+        ):
+            resp = await public_client.get(
+                f"/api/v1/public/shared/{_SHARE_TOKEN}/files/read",
+                params={"path": "data/big.txt", "offset": 0, "limit": 3},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["truncated"] is True
+
+    async def test_truncated_false_when_fully_read(self, public_client):
+        content = "\n".join(f"line{i}" for i in range(3))
+        empty = SecretRedactor.__new__(SecretRedactor)
+        empty._secrets = []
+        with (
+            patch(_THREAD_BY_TOKEN, AsyncMock(return_value=_make_thread())),
+            patch(_DB_GET_WS, AsyncMock(return_value=_make_workspace())),
+            patch(_WORK_DIR, return_value="/home/workspace"),
+            patch(_NORM_PATH, return_value="data/small.txt"),
+            patch(_FILE_SVC, AsyncMock(return_value=_make_file_record(content))),
+            patch(_GET_REDACTOR, return_value=empty),
+        ):
+            resp = await public_client.get(
+                f"/api/v1/public/shared/{_SHARE_TOKEN}/files/read",
+                params={"path": "data/small.txt", "offset": 0, "limit": 100},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# TestReplayStripsWorkspaceId — workspace_id is a bearer credential
+# ---------------------------------------------------------------------------
+
+_QUERIES = "src.server.app.public.get_queries_for_thread"
+_RESPONSES = "src.server.app.public.get_responses_for_thread"
+
+
+def _parse_sse_events(body: str):
+    """Parse an SSE text body into a list of (event, data-dict) tuples."""
+    out = []
+    for block in body.split("\n\n"):
+        event = None
+        data = None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event = line[len("event: ") :]
+            elif line.startswith("data: "):
+                import json as _json
+
+                data = _json.loads(line[len("data: ") :])
+        if event and data is not None:
+            out.append((event, data))
+    return out
+
+
+class TestReplayStripsWorkspaceId:
+    """The public replay must not leak workspace_id (the bearer credential for
+    /api/v1/wsfiles/{workspace_id}/{path}) from stored workspace_status events."""
+
+    async def test_replay_strips_workspace_id_from_stored_events(self, public_client):
+        stored = {
+            "turn_index": 0,
+            "conversation_response_id": "resp-1",
+            "sse_events": [
+                {
+                    "event": "workspace_status",
+                    "data": {
+                        "status": "ready",
+                        "workspace_id": _WORKSPACE_ID,
+                        "sandbox_state": "archived",
+                    },
+                },
+                {
+                    "event": "message_chunk",
+                    "data": {"content": "hello"},
+                },
+            ],
+        }
+        # A deep copy guards the assertion that we never mutate the stored object.
+        import copy
+
+        original = copy.deepcopy(stored)
+        query = {"turn_index": 0, "content": "hi", "created_at": "2026-01-01T00:00:00Z"}
+        with (
+            patch(_THREAD_BY_TOKEN, AsyncMock(return_value=_make_thread())),
+            patch(_QUERIES, AsyncMock(return_value=([query], 1))),
+            patch(_RESPONSES, AsyncMock(return_value=([stored], 1))),
+        ):
+            resp = await public_client.get(
+                f"/api/v1/public/shared/{_SHARE_TOKEN}/replay"
+            )
+        assert resp.status_code == 200
+        events = _parse_sse_events(resp.text)
+        ws_status = [d for e, d in events if e == "workspace_status"]
+        assert ws_status, "expected a replayed workspace_status event"
+        for d in ws_status:
+            assert "workspace_id" not in d
+            assert "sandbox_state" not in d
+        # The stored event object must be untouched (no in-place mutation).
+        assert stored == original

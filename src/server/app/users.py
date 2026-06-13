@@ -1,5 +1,6 @@
 """User Management API Router — user profile and preferences endpoints."""
 
+import asyncio
 import logging
 import re
 from datetime import datetime
@@ -538,7 +539,9 @@ async def upload_avatar(
     ext = file.filename.split(".")[-1] if file.filename and "." in file.filename else "png"
     key = f"avatars/{user_id}.{ext}"
 
-    success = upload_bytes(key, content, content_type=file.content_type)
+    # upload_bytes is a synchronous boto3 call; offload it so it doesn't block
+    # the event loop during the network round-trip to object storage.
+    success = await asyncio.to_thread(upload_bytes, key, content, content_type=file.content_type)
     if not success:
         from fastapi import HTTPException
         raise HTTPException(status_code=500, detail="Failed to upload avatar")

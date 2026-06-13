@@ -558,9 +558,11 @@ async def read_workspace_file(
         text_content = get_redactor().redact(text_content, vault_secrets=vault_secrets)
         if unlimited:
             content = text_content
+            truncated = False
         else:
             lines = text_content.splitlines()
             content = "\n".join(lines[offset : offset + limit])
+            truncated = len(lines) > offset + limit
         mime = file_record.get("mime_type") or "text/plain"
 
         return {
@@ -570,7 +572,7 @@ async def read_workspace_file(
             "limit": limit,
             "content": content,
             "mime": mime,
-            "truncated": False,
+            "truncated": truncated,
             "source": "database",
         }
 

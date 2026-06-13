@@ -259,7 +259,15 @@ async def replay_shared_thread(share_token: str):
                     continue
 
                 seq += 1
+                # Shallow-copy so we never mutate the stored/cached event dict.
                 replay_data = dict(data)
+                # workspace_id is the bearer credential for GET /api/v1/wsfiles/
+                # {workspace_id}/{path}; stored workspace_status events carry it
+                # (see handlers/chat/ptc_workflow.py). Leaking it to a public,
+                # unauthenticated viewer would grant access to ALL workspace
+                # files, so strip it (plus the server-internal sandbox_state).
+                replay_data.pop("workspace_id", None)
+                replay_data.pop("sandbox_state", None)
                 replay_data.setdefault("thread_id", thread_id)
                 replay_data["turn_index"] = turn_index
                 replay_data["response_id"] = str(response.get("conversation_response_id"))
@@ -349,12 +357,17 @@ async def list_shared_files(
     if files:
         return {"path": path, "files": files, "source": "database"}
 
-    # Try live sandbox if DB has no files
-    if workspace.get("status") not in ("stopped", "stopping", "starting"):
+    # Try live sandbox only when it's ALREADY warm in this worker. Mirrors the
+    # serve-core safe pattern (workspace_files._resolve_serve_bytes): gate on the
+    # pure in-memory has_ready_session() check and read from the cached session
+    # only — never call get_session_for_workspace(), which would do a Daytona
+    # attach/restart and let an unauthenticated UUID-only request wake a sandbox
+    # (denial-of-wallet). A stale 'running' DB row with no warm session → DB-only.
+    if workspace.get("status") == "running":
         try:
             manager = WorkspaceManager.get_instance()
-            session = await manager.get_session_for_workspace(workspace_id)
-            sandbox = getattr(session, "sandbox", None)
+            session = manager._sessions.get(workspace_id) if manager.has_ready_session(workspace_id) else None
+            sandbox = getattr(session, "sandbox", None) if session else None
             if sandbox:
                 absolute_paths = await sandbox.aglob_files("**/*", path=path)
                 from src.server.app.workspace_files import _to_client_path
@@ -421,16 +434,19 @@ async def read_shared_file(
             "limit": limit,
             "content": content,
             "mime": mime,
-            "truncated": False,
+            "truncated": len(lines) > offset + limit,
             "source": "database",
         }
 
-    # Try live sandbox — vault secrets from session cache (instant)
-    if workspace.get("status") not in ("stopped", "stopping", "starting"):
+    # Try live sandbox only when it's ALREADY warm in this worker — see
+    # list_shared_files: gate on the in-memory has_ready_session() and read the
+    # cached session only, never get_session_for_workspace() (which would do a
+    # Daytona attach/restart from an unauthenticated request → denial-of-wallet).
+    if workspace.get("status") == "running":
         try:
             manager = WorkspaceManager.get_instance()
-            session = await manager.get_session_for_workspace(workspace_id)
-            sandbox = getattr(session, "sandbox", None)
+            session = manager._sessions.get(workspace_id) if manager.has_ready_session(workspace_id) else None
+            sandbox = getattr(session, "sandbox", None) if session else None
             if sandbox:
                 norm, error = sandbox.validate_and_normalize_path(path)
                 if error:
@@ -461,7 +477,7 @@ async def read_shared_file(
                     "limit": limit,
                     "content": content,
                     "mime": mime_type or "text/plain",
-                    "truncated": False,
+                    "truncated": len(lines) > offset + limit,
                     "source": "sandbox",
                 }
         except HTTPException:
@@ -527,12 +543,15 @@ async def download_shared_file(
             headers={"Content-Disposition": content_disposition(filename)},
         )
 
-    # Try live sandbox — vault secrets from session cache (instant)
-    if workspace.get("status") not in ("stopped", "stopping", "starting"):
+    # Try live sandbox only when it's ALREADY warm in this worker — see
+    # list_shared_files: gate on the in-memory has_ready_session() and read the
+    # cached session only, never get_session_for_workspace() (which would do a
+    # Daytona attach/restart from an unauthenticated request → denial-of-wallet).
+    if workspace.get("status") == "running":
         try:
             manager = WorkspaceManager.get_instance()
-            session = await manager.get_session_for_workspace(workspace_id)
-            sandbox = getattr(session, "sandbox", None)
+            session = manager._sessions.get(workspace_id) if manager.has_ready_session(workspace_id) else None
+            sandbox = getattr(session, "sandbox", None) if session else None
             if sandbox:
                 norm, error = sandbox.validate_and_normalize_path(path)
                 if error:
