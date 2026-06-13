@@ -11,7 +11,7 @@ This is the right output when the user wants a **deliverable they can keep, shar
 
 > **Read `.agents/skills/ui-design/SKILL.md` before authoring.** It defines the typography, color, and composition standards that keep the report looking like a research desk artifact rather than a generic AI page. This skill covers the mechanics; that one covers the taste.
 
-> **User preferences override these defaults.** Anything the user has told you — in this conversation, in your long-term memory, or in their saved preferences/memos — outranks every rule in this skill. If they want a specific brand color, a particular font, no charts, a black-and-white print sheet, or a different structure, do that. Treat this skill as sensible defaults for when the user hasn't specified, not as constraints that override their stated taste.
+> **User preferences override these defaults.** Anything the user has told you — in this conversation, in your long-term memory, or in their saved preferences/memos — outranks every rule in this skill. If they want a different structure, no charts, a specific set of sections, or a particular file layout, do that. (Visual taste — fonts, color, accent, light/dark — is `.agents/skills/ui-design/SKILL.md`'s domain; that skill defers to the user's stated style.) Treat the rules here as sensible defaults for when the user hasn't specified.
 
 ## Decide: Which Output?
 
@@ -23,8 +23,6 @@ A report from this skill **can be interactive** (sortable tables, tab/filter con
 | A quick visualization *inside the chat* (one chart, a metric row, a table) | **inline-widget** (`ShowWidget`) | Appears inline between text; no file, no panel |
 | A **live served app** — refreshing data, server-side compute, multi-page routing, or a dataset too large to embed | **interactive-dashboard** (`GetPreviewUrl`) | A running app with a backend, not a static file. Needed when the data must be fetched live, not embedded. |
 | A simple, short answer | **plain markdown** | A styled HTML document is overkill for a one-paragraph reply |
-
-**The deciding question:** can the data be captured as a snapshot and embedded in one file? If yes → **html-report** (interactive or not), because the user gets a keepable, printable, shareable artifact. Only if it genuinely needs a live server — refreshing prices, server-side filtering over a huge dataset, multi-page navigation → **interactive-dashboard**. Ephemeral in-chat figure → inline-widget. Trivial answer → markdown.
 
 ## Self-Contained by Default
 
@@ -59,8 +57,6 @@ Rules:
 - **All CSS in a `<style>` block, all JS in `<script>` blocks** — nothing external except allowlisted CDN libraries.
 - **Embed data via `<script>const DATA = {json.dumps(data, ensure_ascii=False)};</script>`** — never inline raw Python dicts, never `fetch()` a local file. `ensure_ascii=False` keeps non-ASCII (names, currencies, CJK) readable and correctly encoded.
 - **Sample or aggregate large datasets** before embedding. A report doesn't need every tick — downsample to a sensible resolution, aggregate to the reporting period. Keep the embedded payload lean (target well under ~1MB).
-
-Rationale: a single file means download / share / PDF / "open in new tab" all just work, with nothing to break.
 
 ## Multi-File When Warranted
 
@@ -152,7 +148,7 @@ Load Chart.js or ECharts from CDN. Canvas pixels cannot read CSS variables, so r
     data: { labels: DATA.labels, datasets: [{ data: DATA.revenue, borderColor: accent, backgroundColor: accent + '22', tension: 0.3, fill: true }] },
     options: {
       responsive: true,
-      maintainAspectRatio: false,          // REQUIRED
+      maintainAspectRatio: false,
       animation: { duration: 400 },
       scales: { y: { grid: { color: border } }, x: { grid: { display: false } } }
     }
@@ -188,9 +184,9 @@ Rules:
 
 Match the effort to the data: a one-number recap needs no interactivity; a 40-holding portfolio or a multi-section deep-dive benefits a lot.
 
-## Print / PDF (Mandatory)
+## Print / PDF
 
-PDF export = the browser's print-to-PDF. Every report **must** include an `@media print` block that:
+PDF export = the browser's print-to-PDF. Include an `@media print` block — without it, PDFs come out degraded. It should:
 
 ```css
 @media print {
@@ -241,14 +237,13 @@ Aim for 10–11pt body text — the register of a printed research note. Keep ta
 
 ## Authoring Workflow
 
-1. **Fetch and validate data** first (check for empty/None results). Sample or aggregate to a sensible size.
+1. **Fetch and validate data** first (check for empty/None); sample or aggregate to a sensible size.
 2. **Read `.agents/skills/ui-design/SKILL.md`** and commit to a typographic pairing + color direction.
-3. **Build the document**: full HTML, inline CSS/JS, embed `DATA` via `json.dumps(..., ensure_ascii=False)`, draw charts from `DATA`.
-4. **Theme-proof it**: every color in `var(--color-role, #fallback)` form.
-5. **Add the mandatory `@media print` block.**
-6. **Write to `results/report.html`** (UTF-8). For image-heavy reports, write assets to `results/charts/*.png` and reference them relatively.
-7. **Sanity-check**: open the path; confirm charts draw, numbers are formatted, layout holds, and the print preview is clean (no blank charts, no clipped sections).
-8. **Cite the report** to the user as a clickable link to the file.
+3. **Build** the full document — inline CSS/JS, embed `DATA`, draw charts from it; add the `@media print` block.
+4. **Write to `results/report.html`** (UTF-8). Image-heavy → write assets to `results/charts/*.png` and reference them relatively.
+5. **Open it and print-preview**, then cite the report to the user as a clickable link.
+
+Use the Quality Checklist below to verify before delivering.
 
 ## Quality Checklist
 
@@ -257,7 +252,7 @@ Aim for 10–11pt body text — the register of a printed research note. Keep ta
 - [ ] Multi-file (if used): all asset paths relative, all assets under `results/`
 - [ ] Every color in `var(--color-role, #literalFallback)` form — no bare `var()`, no unvariabled hardcodes
 - [ ] Charts: wrapper-div heights, `maintainAspectRatio: false`, `getComputedStyle` + literal fallback for canvas colors
-- [ ] Mandatory `@media print` block present: hides chrome, `break-inside: avoid`, sane `@page` margins, animations/opacity neutralized
+- [ ] `@media print` block present: hides chrome, `break-inside: avoid`, sane `@page` margins, animations/opacity neutralized
 - [ ] Interactivity (if any): events via `addEventListener` (no inline `on*=`), runs on embedded `DATA` (no live `fetch`), default state is meaningful, controls `.no-print` and collapsed content expands when printing
 - [ ] User's stated preferences (this chat / long-term memory / saved prefs) honored wherever they differ from this skill's defaults
 - [ ] Design follows `.agents/skills/ui-design/SKILL.md` (typography, single accent, profit/loss color discipline, no AI slop)

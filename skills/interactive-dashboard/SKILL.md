@@ -34,15 +34,13 @@ Both can be interactive, so the divide is **live served app vs. self-contained s
 | Keep / print / share | A URL, live only while the workspace runs | Downloadable, PDF-exportable, share-linkable as one artifact |
 | Pick when | Data must be live, or compute/scale needs a server | The answer is a deliverable the user keeps |
 
-**Deciding question:** if the data can be captured as a snapshot and embedded in one file, prefer **html-report** — the user gets a keepable, printable artifact. Choose a dashboard only when it genuinely needs a live server: refreshing data, server-side compute, multi-page routing, or a dataset too big to embed.
-
 ## Architecture
 
 Choose the tier based on complexity:
 
 | Tier | When | Stack | Serve command |
 |------|------|-------|---------------|
-| **Simple** | Static snapshot, few charts, no server-side logic | Self-contained HTML + CDN libs | `python -m http.server 8050 --bind 0.0.0.0` |
+| **Simple** | Snapshot-at-load data, few charts, no backend logic (still served via preview URL) | Self-contained HTML + CDN libs | `python -m http.server 8050 --bind 0.0.0.0` |
 | **FastAPI + HTML** | Live data refresh, server-side logic, no React needed | FastAPI serves `static/` + `fetch()` polling | `bash start.sh` |
 | **Complex** | Filtering, routing, component interactivity, multi-page | FastAPI backend + Vite/React frontend | `bash start.sh` |
 
