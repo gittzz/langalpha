@@ -11,8 +11,9 @@
 import React from 'react';
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
-import NavigationPanel from '../NavigationPanel';
+import NavigationPanel, { resetNavPanelExpansion } from '../NavigationPanel';
 
 // `t()` identity mock — we don't depend on bundled English copy here, but
 // the component reads i18n keys for some labels and we want the fallback
@@ -159,5 +160,163 @@ describe('NavigationPanel — hierarchy markers', () => {
     const glyph = Array.from(subRow.children).find((c) => c.textContent === '└─');
     expect(glyph).toBeTruthy();
     expect(glyph!.getAttribute('aria-hidden')).toBe('true');
+  });
+});
+
+describe('NavigationPanel — workspace render order', () => {
+  it('renders workspaces in prop order without hoisting the current one', () => {
+    render(
+      <NavigationPanel
+        workspaces={[
+          { workspace_id: 'ws-a', name: 'Workspace A' },
+          { workspace_id: 'ws-b', name: 'Workspace B' },
+          { workspace_id: 'ws-c', name: 'Workspace C' },
+        ]}
+        workspaceThreads={{}}
+        currentWorkspaceId="ws-c"
+        currentThreadId={null}
+        agents={[]}
+        activeAgentId={null}
+        expandWorkspace={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onRemoveAgent={vi.fn()}
+        onNavigateThread={vi.fn()}
+      />,
+    );
+
+    const names = screen.getAllByText(/^Workspace [ABC]$/).map((el) => el.textContent);
+    expect(names).toEqual(['Workspace A', 'Workspace B', 'Workspace C']);
+  });
+});
+
+describe('NavigationPanel — show more threads', () => {
+  function renderWithThreads(threadsData: { threads: { thread_id: string; title: string }[]; loading: boolean; total?: number }, onLoadMoreThreads = vi.fn()) {
+    resetNavPanelExpansion();
+    render(
+      <NavigationPanel
+        workspaces={[{ workspace_id: WS_ID, name: 'Test workspace' }]}
+        workspaceThreads={{ [WS_ID]: threadsData }}
+        currentWorkspaceId={WS_ID}
+        currentThreadId={null}
+        agents={[]}
+        activeAgentId={null}
+        expandWorkspace={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onRemoveAgent={vi.fn()}
+        onNavigateThread={vi.fn()}
+        onLoadMoreThreads={onLoadMoreThreads}
+      />,
+    );
+    return onLoadMoreThreads;
+  }
+
+  it('renders a show-more row when more threads exist server-side and pages on click', async () => {
+    const user = userEvent.setup();
+    const onLoadMoreThreads = renderWithThreads({
+      threads: [
+        { thread_id: 't-1', title: 'Thread one' },
+        { thread_id: 't-2', title: 'Thread two' },
+      ],
+      loading: false,
+      total: 5,
+    });
+
+    const row = screen.getByText('nav.showMore');
+    await user.click(row);
+    expect(onLoadMoreThreads).toHaveBeenCalledWith(WS_ID);
+  });
+
+  it('hides the show-more row when every thread is already shown or total is unknown', () => {
+    renderWithThreads({
+      threads: [{ thread_id: 't-1', title: 'Thread one' }],
+      loading: false,
+      total: 1,
+    });
+    expect(screen.queryByText('nav.showMore')).toBeNull();
+
+    renderWithThreads({
+      threads: [{ thread_id: 't-1', title: 'Thread one' }],
+      loading: false,
+    });
+    expect(screen.queryByText('nav.showMore')).toBeNull();
+  });
+});
+
+describe('NavigationPanel — workspace drag-reorder affordances', () => {
+  function renderReorderPanel(onReorderWorkspace?: (a: string, b: string) => void) {
+    return render(
+      <NavigationPanel
+        workspaces={[
+          { workspace_id: 'ws-flash', name: 'Flash workspace', status: 'flash' },
+          { workspace_id: 'ws-a', name: 'Workspace A' },
+        ]}
+        workspaceThreads={{}}
+        currentWorkspaceId="ws-a"
+        currentThreadId={null}
+        agents={[]}
+        activeAgentId={null}
+        expandWorkspace={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onRemoveAgent={vi.fn()}
+        onNavigateThread={vi.fn()}
+        onReorderWorkspace={onReorderWorkspace}
+      />,
+    );
+  }
+
+  it('marks workspace header rows sortable, but never the flash workspace', () => {
+    renderReorderPanel(vi.fn());
+
+    const sortable = screen.getByText('Workspace A').closest('[aria-roledescription="sortable"]');
+    expect(sortable).not.toBeNull();
+    expect(screen.getByText('Flash workspace').closest('[aria-roledescription="sortable"]')).toBeNull();
+  });
+
+  it('renders plain rows when no reorder handler is provided', () => {
+    renderReorderPanel(undefined);
+
+    expect(screen.getByText('Workspace A').closest('[aria-roledescription="sortable"]')).toBeNull();
+  });
+});
+
+describe('NavigationPanel — expansion survives remounts', () => {
+  function renderOrderPanel(currentWorkspaceId: string) {
+    return render(
+      <NavigationPanel
+        workspaces={[
+          { workspace_id: 'ws-a', name: 'Workspace A' },
+          { workspace_id: 'ws-b', name: 'Workspace B' },
+        ]}
+        workspaceThreads={{
+          'ws-a': { threads: [{ thread_id: 'ta-1', title: 'Thread A1' }], loading: false },
+          'ws-b': { threads: [{ thread_id: 'tb-1', title: 'Thread B1' }], loading: false },
+        }}
+        currentWorkspaceId={currentWorkspaceId}
+        currentThreadId={null}
+        agents={[]}
+        activeAgentId={null}
+        expandWorkspace={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onRemoveAgent={vi.fn()}
+        onNavigateThread={vi.fn()}
+      />,
+    );
+  }
+
+  it('keeps a manually opened folder expanded after the panel remounts', async () => {
+    resetNavPanelExpansion();
+    const user = userEvent.setup();
+    const first = renderOrderPanel('ws-a');
+
+    // ws-b starts collapsed; open it manually.
+    expect(screen.queryByText('Thread B1')).toBeNull();
+    await user.click(screen.getByText('Workspace B'));
+    expect(screen.getByText('Thread B1')).toBeInTheDocument();
+
+    // Thread switch remounts the panel (fresh ChatView instance) — the folder
+    // the user opened must not auto-collapse.
+    first.unmount();
+    renderOrderPanel('ws-a');
+    expect(screen.getByText('Thread B1')).toBeInTheDocument();
   });
 });
