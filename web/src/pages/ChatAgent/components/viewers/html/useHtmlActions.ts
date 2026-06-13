@@ -44,6 +44,11 @@ function appendQueryParam(url: string, param: string): string {
   return `${url}${url.includes('?') ? '&' : '?'}${param}`;
 }
 
+// Cap the PDF fetch above the server's 30s render budget so a transport-level
+// hang (server never responds) can't leave the request in flight forever —
+// without it the in-flight guard never clears and the user can't retry.
+const PDF_FETCH_TIMEOUT_MS = 120_000;
+
 export interface ExportServedPdfOptions {
   workspaceId: string;
   filePath: string;
@@ -95,8 +100,10 @@ export async function exportServedPdf({
     }
   };
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PDF_FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(pdfUrl);
+    const res = await fetch(pdfUrl, { signal: controller.signal });
     if (!res.ok) {
       printFallback();
       return;
@@ -111,7 +118,10 @@ export async function exportServedPdf({
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   } catch {
+    // Includes the AbortError from the timeout above — fall back to print.
     printFallback();
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

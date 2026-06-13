@@ -303,6 +303,16 @@ def _browser_alive(browser) -> bool:
         return False
 
 
+async def close_browser() -> None:
+    """Close the cached headless Chromium and stop its Playwright driver.
+
+    Called from the application lifespan on shutdown so an idle render browser
+    doesn't outlive the server. No-op when nothing was ever launched.
+    """
+    async with _browser_lock:
+        await _reset_browser()
+
+
 async def _get_browser():
     """Return the singleton headless Chromium, launching it once.
 

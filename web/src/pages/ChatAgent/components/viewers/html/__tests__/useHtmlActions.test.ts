@@ -211,6 +211,7 @@ describe('useHtmlActions — file mode', () => {
   afterEach(() => {
     createSpy.mockRestore();
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it('opens the served wsfiles URL (byte-faithful, no inject=theme)', () => {
@@ -245,7 +246,10 @@ describe('useHtmlActions — file mode', () => {
       useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
     );
     await result.current.exportPdf();
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html?format=pdf');
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/wsfiles/ws-1/results/report.html?format=pdf',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(createObjectURL).toHaveBeenCalled();
     expect(lastAnchor?.download).toBe('report.pdf');
     expect(anchorClick).toHaveBeenCalledTimes(1);
@@ -267,7 +271,10 @@ describe('useHtmlActions — file mode', () => {
       }),
     );
     await result.current.exportPdf();
-    expect(fetchMock).toHaveBeenCalledWith(`${served}?format=pdf`);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${served}?format=pdf`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(lastAnchor?.download).toBe('report.pdf');
   });
 
@@ -285,6 +292,7 @@ describe('useHtmlActions — file mode', () => {
     });
     expect(fetchMock).toHaveBeenCalledWith(
       `${served}?format=pdf&scale=0.8&page_numbers=true&branding=false`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(lastAnchor?.download).toBe('report.pdf');
   });
@@ -301,7 +309,10 @@ describe('useHtmlActions — file mode', () => {
       }),
     );
     await result.current.exportPdf();
-    expect(fetchMock).toHaveBeenCalledWith(`${served}&format=pdf`);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${served}&format=pdf`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it('falls back to print (no noopener) + hint toast on a non-OK response (501)', async () => {
@@ -348,6 +359,29 @@ describe('useHtmlActions — file mode', () => {
     await result.current.exportPdf();
     expect(open).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html', '_blank');
     expect(toastMock).toHaveBeenCalledWith({ description: 'filePanel.pdfPrintHint' });
+  });
+
+  it('aborts a hung fetch after the timeout and falls back to print', async () => {
+    vi.useFakeTimers();
+    open.mockReturnValue({ print: vi.fn() });
+    // Never resolves on its own; rejects only when its signal aborts (mirrors
+    // the browser's AbortError) so the timeout is what drives the fallback.
+    fetchMock.mockImplementation(
+      (_url: string, init: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () =>
+            reject(new DOMException('Aborted', 'AbortError')),
+          );
+        }),
+    );
+    const { result } = renderHook(() =>
+      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+    );
+    const pending = result.current.exportPdf();
+    // 120s client cap — advance past it to trip the AbortController.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await pending;
+    expect(open).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html', '_blank');
   });
 
   it('shows the hint toast when the print popup is blocked (no window)', async () => {

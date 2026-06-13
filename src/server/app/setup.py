@@ -535,6 +535,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing usage limits HTTP client: {e}")
 
+    # 9.5. Close the PDF render browser singleton (headless Chromium), if one
+    # was launched to serve ?format=pdf. No-op when the pdf extra is unused.
+    try:
+        from src.server.services.pdf_render import close_browser
+
+        await close_browser()
+    except Exception as e:
+        logger.warning(f"Error closing PDF render browser: {e}")
+
     # 10. Flush + shut down OTel providers last, so spans/metrics emitted by
     # the earlier shutdown steps reach the collector before the daemon threads
     # exit. No-op when OTel is disabled. Run on a worker thread because

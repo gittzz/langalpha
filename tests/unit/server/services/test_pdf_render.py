@@ -239,6 +239,35 @@ async def test_get_browser_reuses_live_handle(_isolated_browser_globals):
         assert pdf_render._browser is live
 
 
+# --- shutdown hook (Finding 3) ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_browser_tears_down_singleton(_isolated_browser_globals):
+    # Lifespan shutdown must close the cached Chromium and stop its driver,
+    # then null the globals so a later render relaunches cleanly.
+    browser = MagicMock()
+    browser.close = AsyncMock()
+    cm = MagicMock()
+    cm.stop = AsyncMock()
+    pdf_render._browser = browser
+    pdf_render._playwright_cm = cm
+
+    await pdf_render.close_browser()
+
+    browser.close.assert_awaited_once()
+    cm.stop.assert_awaited_once()
+    assert pdf_render._browser is None
+    assert pdf_render._playwright_cm is None
+
+
+@pytest.mark.asyncio
+async def test_close_browser_noop_when_never_launched(_isolated_browser_globals):
+    # No browser was ever launched (the pdf extra unused) — shutdown is a no-op.
+    await pdf_render.close_browser()
+    assert pdf_render._browser is None
+
+
 # --- new_context error taxonomy (Finding 1b) -------------------------------
 
 
