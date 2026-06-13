@@ -19,15 +19,10 @@ export interface SharedThreadMetadata {
   permissions: Record<string, unknown>;
 }
 
-export interface SharedFileEntry {
-  name: string;
-  type: 'file' | 'directory';
-  size?: number;
-}
-
 export interface SharedFileListResponse {
   path: string;
-  files: SharedFileEntry[];
+  // The backend returns a flat array of workspace-relative file paths.
+  files: string[];
   source: string;
 }
 

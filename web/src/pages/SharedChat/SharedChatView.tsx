@@ -18,7 +18,7 @@ import {
   handleHistoryTodoUpdate,
 } from '../ChatAgent/hooks/utils/historyEventHandlers';
 import { getSharedThread, replaySharedThread, getSharedFiles, readSharedFile, downloadSharedFileAs } from './api';
-import type { SharedThreadMetadata, SharedFileEntry, SSEEvent } from './api';
+import type { SharedThreadMetadata, SSEEvent } from './api';
 import { buildSharedServeUrl } from '../ChatAgent/components/viewers/html/wsfilesUrl';
 
 // Message record type compatible with historyEventHandlers
@@ -56,7 +56,7 @@ export default function SharedChatView() {
 
   // File panel (right side, matching ChatView's rightPanelType === 'file')
   const [showFilePanel, setShowFilePanel] = useState(false);
-  const [files, setFiles] = useState<SharedFileEntry[]>([]);
+  const [files, setFiles] = useState<string[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [filePanelTargetFile, setFilePanelTargetFile] = useState<string | null>(null);
   const [rightPanelWidth, setRightPanelWidth] = useState(750);
@@ -559,7 +559,7 @@ export default function SharedChatView() {
               workspaceId=""
               apiAdapter={fileApiAdapter}
               onClose={() => setShowFilePanel(false)}
-              files={files.map(f => f.name)}
+              files={files}
               filesLoading={filesLoading}
               targetFile={filePanelTargetFile}
               onTargetFileHandled={() => setFilePanelTargetFile(null)}
