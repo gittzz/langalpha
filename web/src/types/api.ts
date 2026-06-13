@@ -13,6 +13,10 @@ export interface User {
   has_oauth_token?: boolean;
   access_tier?: number;
   plan_display_name?: string | null;
+  /** Completed the personalization flow (i.e. configured a BYOK key). */
+  personalization_completed?: boolean;
+  /** Completed the legacy first-run onboarding flow. */
+  onboarding_completed?: boolean;
   created_at?: string;
   updated_at?: string;
   [key: string]: unknown;
