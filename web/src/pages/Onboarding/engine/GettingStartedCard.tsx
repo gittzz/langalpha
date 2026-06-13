@@ -10,6 +10,7 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
+import { cn } from '@/lib/utils';
 import { useOnboarding as usePersonalizationNav } from '@/pages/Dashboard/hooks/useOnboarding';
 import { useOnboarding } from '../OnboardingProvider';
 
@@ -129,7 +130,7 @@ export function GettingStartedCard() {
               </span>
               <span className="min-w-0">
                 <span
-                  className={`block text-sm font-medium ${done ? 'line-through' : ''}`}
+                  className={cn('block text-sm font-medium', done && 'line-through')}
                   style={{
                     color: done ? 'var(--color-text-tertiary)' : 'var(--color-text-primary)',
                   }}

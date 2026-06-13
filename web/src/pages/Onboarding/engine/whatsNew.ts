@@ -3,10 +3,9 @@ import type { OnboardingPrefs } from '../types';
 
 /** Parse CalVer 'YYYY.MM.DD[.N]' into a numeric tuple for total ordering. */
 function parseVersion(v: string): number[] {
-  return v.split('.').map((part) => {
-    const n = parseInt(part, 10);
-    return Number.isFinite(n) ? n : 0;
-  });
+  // Only pure-digit segments count — a malformed part like '04beta' is treated
+  // as 0, not silently parsed to 4 (parseInt would stop at the first letter).
+  return v.split('.').map((part) => (/^\d+$/.test(part) ? parseInt(part, 10) : 0));
 }
 
 /** Total order over calendar-ish release strings. <0, 0, >0 like a comparator. */

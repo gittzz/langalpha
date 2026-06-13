@@ -60,6 +60,10 @@ export function useOnboardingOrchestrator(p: OrchestratorParams): void {
       p.showWhatsNew();
       return;
     }
+    // showPageIntro / showWhatsNew are intentionally omitted: the provider
+    // recreates them every render in lockstep with eligibleIntroId / phase
+    // (both deps below), so the effect always re-runs with a fresh closure.
+    // Listing them would just re-fire on every render with no behavior change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [p.isLoading, p.phase, p.eligibleIntroId, p.hasUnseenWhatsNew, p.suppress, p.pathname]);
 }

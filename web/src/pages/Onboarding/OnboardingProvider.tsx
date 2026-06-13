@@ -253,9 +253,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   // "Personalize" navigates to /chat/t/__default__ and no intro must pop over
   // it (snooze is irrelevant mid-flow).
   const personalizationCompleted =
-    (user as { personalization_completed?: boolean; onboarding_completed?: boolean } | null)
-      ?.personalization_completed === true ||
-    (user as { onboarding_completed?: boolean } | null)?.onboarding_completed === true;
+    user?.personalization_completed === true || user?.onboarding_completed === true;
   const suppress =
     inInterview ||
     (!personalizationCompleted &&

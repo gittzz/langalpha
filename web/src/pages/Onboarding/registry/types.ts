@@ -56,7 +56,8 @@ export interface PageIntroDef {
   id: string;
   /** Which pages this intro belongs to. */
   matchRoute: (pathname: string) => boolean;
-  steps: PageIntroStepDef[];
+  /** At least one step — the modal indexes steps[0], so empty would crash. */
+  steps: [PageIntroStepDef, ...PageIntroStepDef[]];
 }
 
 /** A task on the getting-started checklist card. Copy is i18n keys. */

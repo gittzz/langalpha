@@ -92,15 +92,23 @@ export function useOnboardingPrefsWriter() {
           onSuccess: () => {
             writeMirror(currentUserId(), resolved);
             bcRef.current?.postMessage({ type: 'updated' });
-            for (const cb of batch.onSuccess) cb();
-            settle();
+            // settle() in finally: a throwing callback must not strand the
+            // queue with inFlightRef stuck true (no further write would send).
+            try {
+              for (const cb of batch.onSuccess) cb();
+            } finally {
+              settle();
+            }
           },
           onError: (err) => {
             // No mirror write, no broadcast — and `settle` drops the rejected
             // payload once idle, so a failed write can't be silently re-sent
             // on top of fresh server state by a later unrelated write.
-            for (const cb of batch.onError) cb(err);
-            settle();
+            try {
+              for (const cb of batch.onError) cb(err);
+            } finally {
+              settle();
+            }
           },
         }
       );

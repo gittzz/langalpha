@@ -1,5 +1,5 @@
 import { safeLocalStorage } from '@/lib/utils';
-import type { OnboardingPrefs } from './types';
+import { ONBOARDING_PREFS_VERSION, type OnboardingPrefs } from './types';
 
 /**
  * Non-authoritative localStorage projection of the server prefs, read
@@ -12,7 +12,10 @@ import type { OnboardingPrefs } from './types';
  * userId is a no-op/null read — suppress-only means that's always safe.
  */
 
-const MIRROR_KEY_PREFIX = 'langalpha-onboarding-v1';
+// Versioned with the prefs shape: bumping ONBOARDING_PREFS_VERSION changes the
+// key, so a stale mirror from an older shape is silently ignored (read as null)
+// rather than mis-suppressing — safe because the mirror is suppress-only.
+const MIRROR_KEY_PREFIX = `langalpha-onboarding-v${ONBOARDING_PREFS_VERSION}`;
 
 function mirrorKey(userId: string): string {
   return `${MIRROR_KEY_PREFIX}:${userId}`;
