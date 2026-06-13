@@ -1,9 +1,9 @@
 """Tests for output_format steering in the user_profile prompt component.
 
 Renders ``components/user_profile.md.j2`` exactly as RuntimeContextMiddleware
-does and asserts the HTML-steering block appears iff
-``agent_preference.output_format == "html"`` and never double-renders the
-``output_format`` key in the generic preference loop.
+does and asserts the HTML-steering block appears iff ``sandbox_enabled`` (PTC,
+not Flash) and ``agent_preference.output_format == "html"``, and never
+double-renders the ``output_format`` key in the generic preference loop.
 """
 
 import pytest
@@ -14,8 +14,13 @@ HTML_BLOCK_MARKER = "Output Format: Styled HTML"
 SKILL_REFS = (".agents/skills/html-report/SKILL.md", ".agents/skills/ui-design/SKILL.md")
 
 
-def _render(agent_preference):
-    """Render the user_profile component with the given agent_preference dict."""
+def _render(agent_preference, sandbox_enabled=True):
+    """Render the user_profile component with the given agent_preference dict.
+
+    ``sandbox_enabled`` mirrors RuntimeContextMiddleware: True for PTC (has a
+    sandbox/filesystem), False for Flash. Defaults to True so the PTC path is
+    the baseline.
+    """
     reset_loader()
     loader = get_loader()
     profile = {"name": "Demo", "timezone": "UTC", "locale": "en-US"}
@@ -25,6 +30,7 @@ def _render(agent_preference):
         "components/user_profile.md.j2",
         user_profile=profile,
         user_data_counts=None,
+        sandbox_enabled=sandbox_enabled,
     )
 
 
@@ -60,6 +66,24 @@ class TestHtmlSteeringBlock:
         out = _render(None)
         assert HTML_BLOCK_MARKER not in out
         assert "## Agent Preferences" not in out
+
+    def test_html_no_block_without_sandbox(self):
+        # Flash has no sandbox: HTML steering must not fire even when the user
+        # set output_format=html — there is no filesystem to write results/ to.
+        out = _render({"output_format": "html"}, sandbox_enabled=False)
+        assert HTML_BLOCK_MARKER not in out
+        for ref in SKILL_REFS:
+            assert ref not in out
+
+    def test_other_prefs_still_render_without_sandbox(self):
+        # Only the filesystem-dependent HTML block is gated; other preferences
+        # still apply in Flash, and output_format never double-renders.
+        out = _render(
+            {"output_format": "html", "tone": "concise"}, sandbox_enabled=False
+        )
+        assert HTML_BLOCK_MARKER not in out
+        assert "- **tone**: concise" in out
+        assert "- **output_format**:" not in out
 
 
 class TestGenericLoop:

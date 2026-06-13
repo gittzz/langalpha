@@ -23,6 +23,11 @@ defaults:
   # MemoAwarenessMiddleware, static prompt component describes the feature)
   memo_enabled: true
 
+  # Sandbox/filesystem availability. Gates filesystem-dependent steering in the
+  # shared user_profile component (e.g. HTML-report output) so it never fires
+  # for Flash, which has no sandbox. PTC overrides to true at render time.
+  sandbox_enabled: false
+
 # System prompt template metadata (for documentation)
 system:
   description: Main system prompt for task coordination and sub-agent delegation

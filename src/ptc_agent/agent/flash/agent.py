@@ -298,6 +298,7 @@ class FlashAgent:
         runtime_context_middleware = RuntimeContextMiddleware(
             current_time=current_time,
             user_profile=user_profile,
+            sandbox_enabled=False,  # Flash has no sandbox/filesystem.
         )
 
         # Build final middleware stack

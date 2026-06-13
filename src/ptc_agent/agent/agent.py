@@ -697,6 +697,7 @@ class PTCAgent:
                 current_time=current_time,
                 user_profile=user_profile,
                 user_data_counts=user_data_counts,
+                sandbox_enabled=True,
             )
         ]
 

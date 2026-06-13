@@ -17,7 +17,7 @@ You MUST follow these user preferences when responding:
 {% for key, value in user_profile.agent_preference.items() if key != "output_format" %}
 - **{{ key }}**: {{ value }}
 {% endfor %}
-{% if user_profile.agent_preference.output_format == "html" %}
+{% if sandbox_enabled and user_profile.agent_preference.output_format == "html" %}
 
 ### Output Format: Styled HTML
 
