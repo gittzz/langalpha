@@ -966,8 +966,8 @@ interface MessageContentSegmentsProps {
   flashContext?: { threadId: string; workspaceId: string } | null;
 }
 
-const MIN_LIVE_EXPOSURE_MS = 5000; // minimum time an item stays in the live zone
-const MAX_IN_PROGRESS_MS = 15000; // max time a tool call can stay in-progress in live view before archiving
+const MIN_LIVE_EXPOSURE_MS = 1800; // minimum time a just-completed item stays in the live zone before folding
+const MAX_IN_PROGRESS_MS = 15000; // max time a tool call can stay in-progress in live view before archiving (independent of MIN_LIVE_EXPOSURE_MS)
 /** Tools that should stay in the live zone for their entire duration (no MAX_IN_PROGRESS_MS cap) */
 const ALWAYS_LIVE_TOOLS = new Set(['TaskOutput', 'WebFetch']);
 /** Tool calls that are never rendered as visible activity items — they have dedicated UI or are internal */
@@ -1172,6 +1172,13 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
       let computedNextExpiry: number | null = null;
 
       const now = Date.now();
+      // Stream end folds just-COMPLETED items into the accordion immediately
+      // instead of waiting out the cooldown. It does NOT evict in-progress work:
+      // always-live tools (TaskOutput) are kept live by the active branch below
+      // regardless of isStreaming, so a running subagent stays visible after the
+      // main stream ends. History/replay items (isStreaming always false) land
+      // directly in the accordion regardless of timestamps.
+      const streamEnded = !isStreaming;
 
       const flushActivity = () => {
         if (pendingItems.length > 0) {
@@ -1203,7 +1210,7 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
             const completedAt = proc._completedAt as number | undefined;
             const completedAge = completedAt ? now - completedAt : Infinity;
 
-            if (completedAge < MIN_LIVE_EXPOSURE_MS) {
+            if (!streamEnded && completedAge < MIN_LIVE_EXPOSURE_MS) {
               pendingItems.push({
                 type: 'reasoning',
                 id: seg.reasoningId,
@@ -1239,7 +1246,14 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
 
           const isAlwaysLive = ALWAYS_LIVE_TOOLS.has(proc.toolName as string);
 
-          if ((proc.isInProgress as boolean) && isStreaming && (isAlwaysLive || age < MAX_IN_PROGRESS_MS)) {
+          // Always-live tools (TaskOutput / WebFetch) stay pinned in the live zone
+          // for their entire in-progress duration — including after the main stream
+          // ends (isStreaming false) while a background subagent keeps running, so
+          // the "waiting on a subagent" indicator never disappears. Safe on history/
+          // replay: reconstructed tool calls are always isInProgress=false, so this
+          // branch can't fire there. Regular in-progress tools still require a live
+          // stream and fold once age passes MAX_IN_PROGRESS_MS.
+          if ((proc.isInProgress as boolean) && (isAlwaysLive || (isStreaming && age < MAX_IN_PROGRESS_MS))) {
             pendingItems.push({
               type: 'tool_call',
               id: seg.toolCallId,
@@ -1261,7 +1275,7 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
               toolCallId: seg.toolCallId!,
               proc,
             });
-          } else if (age < MIN_LIVE_EXPOSURE_MS && !INLINE_ARTIFACT_TOOLS.has(proc.toolName as string)) {
+          } else if (!streamEnded && age < MIN_LIVE_EXPOSURE_MS && !INLINE_ARTIFACT_TOOLS.has(proc.toolName as string)) {
             pendingItems.push({
               type: 'tool_call',
               id: seg.toolCallId,

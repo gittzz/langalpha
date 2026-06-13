@@ -47,6 +47,19 @@
   "account": {
     "menuLabel": "账号菜单"
   },
+  "nav": {
+    "pin": "固定面板",
+    "unpin": "取消固定",
+    "minimize": "最小化面板",
+    "displayOptions": "显示选项",
+    "newThread": "新建对话",
+    "orderBy": "排序方式",
+    "workspacesShown": "显示的工作区数量",
+    "threadsPerWorkspace": "每个工作区显示的对话数",
+    "all": "全部",
+    "showMore": "显示更多",
+    "loadAll": "加载全部"
+  },
   "settings": {
     "title": "用户设置",
     "userInfo": "用户信息",
@@ -55,6 +68,7 @@
     "theme": "主题",
     "dark": "深色",
     "light": "浅色",
+    "auto": "自动",
     "locale": "语言",
     "voiceInput": "语音输入",
     "voiceInputDesc": "在聊天栏中启用麦克风图标以进行语音转文字。",
@@ -1015,6 +1029,8 @@
     "dragToReorder": "拖拽排序",
     "pinToTop": "置顶",
     "unpin": "取消置顶",
+    "rename": "重命名",
+    "options": "选项",
     "noWorkspacesFound": "未找到工作区",
     "welcomeTitle": "欢迎使用 LangAlpha",
     "welcomeDesc": "开始设置您的偏好或创建工作区。",

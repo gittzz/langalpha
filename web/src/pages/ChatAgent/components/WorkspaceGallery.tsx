@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Plus, Loader2, Search, ArrowDownUp, MoreHorizontal, Zap, MessageSquareText, Pin, Trash2, GripVertical, Check } from 'lucide-react';
+import { Plus, Loader2, Search, ArrowDownUp, MoreHorizontal, Zap, MessageSquareText, Pin, Trash2, GripVertical, Check, Pencil } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -18,6 +18,8 @@ import { queryKeys } from '../../../lib/queryKeys';
 import { createWorkspace, deleteWorkspace, getFlashWorkspace, updateWorkspace, reorderWorkspaces } from '../utils/api';
 import { removeStoredThreadId } from '../hooks/useChatMessages';
 import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
+import { forgetNavPanelExpansion } from './NavigationPanel';
+import { forgetStableNavOrder } from '../hooks/useNavigationData';
 import { clearChatSession } from '../hooks/utils/chatSessionRestore';
 
 const DEFAULT_PAGE_SIZE = 8;
@@ -30,6 +32,12 @@ interface WorkspaceRecord {
   is_pinned?: boolean;
   sort_order?: number;
   updated_at?: string;
+  [key: string]: unknown;
+}
+
+// Shape of a cached workspace-list query entry (queryKeys.workspaces.lists()).
+interface CachedWorkspaceList {
+  workspaces: WorkspaceRecord[];
   [key: string]: unknown;
 }
 
@@ -65,10 +73,11 @@ const slideTransition = {
 interface CardMenuProps {
   workspace: WorkspaceRecord;
   onTogglePin: (workspace: WorkspaceRecord) => void;
+  onRename: (workspace: WorkspaceRecord) => void;
   onDelete: (workspace: WorkspaceRecord) => void;
 }
 
-function CardMenu({ workspace, onTogglePin, onDelete }: CardMenuProps) {
+function CardMenu({ workspace, onTogglePin, onRename, onDelete }: CardMenuProps) {
   const { t } = useTranslation();
 
   return (
@@ -86,6 +95,10 @@ function CardMenu({ workspace, onTogglePin, onDelete }: CardMenuProps) {
         <DropdownMenuItem onSelect={() => onTogglePin(workspace)}>
           <Pin className="h-4 w-4" />
           {workspace.is_pinned ? t('workspace.unpin') : t('workspace.pinToTop')}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onRename(workspace)}>
+          <Pencil className="h-4 w-4" />
+          {t('workspace.rename')}
         </DropdownMenuItem>
         <DropdownMenuItem variant="destructive" onSelect={() => onDelete(workspace)}>
           <Trash2 className="h-4 w-4" />
@@ -169,15 +182,42 @@ interface WorkspaceCardProps {
   workspace: WorkspaceRecord;
   onSelect: (wsId: string, name?: string, status?: string) => void;
   onTogglePin: (workspace: WorkspaceRecord) => void;
+  onRenameStart: (workspace: WorkspaceRecord) => void;
+  onRenameSubmit: (wsId: string, name: string) => void;
+  onRenameCancel: () => void;
   onDelete: (workspace: WorkspaceRecord) => void;
+  isRenaming?: boolean;
   prefetchThreads?: (wsId: string) => void;
   index?: number;
 }
 
-function WorkspaceCard({ workspace, onSelect, onTogglePin, onDelete, prefetchThreads, index }: WorkspaceCardProps) {
+function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRenameSubmit, onRenameCancel, onDelete, isRenaming, prefetchThreads, index }: WorkspaceCardProps) {
   const { t, i18n } = useTranslation();
   const isMobile = useIsMobile();
   const isFlash = workspace.status === 'flash';
+
+  // Inline rename — the title becomes a text input while editing. Commit on
+  // Enter/blur, cancel on Escape; the parent guards the trailing blur-after-Enter.
+  const [renameDraft, setRenameDraft] = useState(workspace.name);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!isRenaming) return;
+    // Seed the draft once on entry only. Re-running on workspace.name would let a
+    // background refetch (e.g. another session's rename) clobber the in-progress
+    // input mid-edit, so it's intentionally absent from the deps.
+    setRenameDraft(workspace.name);
+    const raf = requestAnimationFrame(() => {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRenaming]);
+  const commitRename = () => {
+    const name = renameDraft.trim();
+    if (name && name !== workspace.name) onRenameSubmit(workspace.workspace_id, name);
+    else onRenameCancel();
+  };
 
   return (
     <div
@@ -189,7 +229,7 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onDelete, prefetchThr
         onMouseEnter={!isMobile ? () => prefetchThreads?.(workspace.workspace_id) : undefined}
       >
         <div
-          onClick={() => onSelect(workspace.workspace_id, workspace.name, workspace.status)}
+          onClick={() => { if (!isRenaming) onSelect(workspace.workspace_id, workspace.name, workspace.status); }}
           className="relative flex cursor-pointer flex-col overflow-hidden rounded-xl py-4 pl-5 pr-4 transition-all ease-in-out hover:shadow-sm active:scale-[0.98] h-full w-full"
           style={{
             background: isFlash
@@ -210,9 +250,26 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onDelete, prefetchThr
               {!isFlash && workspace.is_pinned && (
                 <Pin className="h-3.5 w-3.5 flex-shrink-0 rotate-45" style={{ color: 'var(--color-text-tertiary)' }} />
               )}
-              <div className="font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-                {workspace.name}
-              </div>
+              {isRenaming ? (
+                <input
+                  ref={renameInputRef}
+                  className="font-medium bg-transparent outline-none border-b min-w-0 flex-1"
+                  style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-muted)' }}
+                  value={renameDraft}
+                  onChange={(e) => setRenameDraft(e.target.value)}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
+                    else if (e.key === 'Escape') { e.preventDefault(); onRenameCancel(); }
+                  }}
+                  onBlur={commitRename}
+                  aria-label={t('workspace.rename')}
+                />
+              ) : (
+                <div className="font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
+                  {workspace.name}
+                </div>
+              )}
             </div>
             <div className="text-sm line-clamp-2 flex-grow" style={{ color: 'var(--color-text-tertiary)' }}>
               {workspace.description || ''}
@@ -228,7 +285,7 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onDelete, prefetchThr
         {/* Menu (no drag handle in normal mode) */}
         {!isFlash && (
           <div className={`absolute top-3 right-3 z-10 transition-opacity ${isMobile ? 'opacity-60' : 'opacity-0 group-focus-within:opacity-100 group-hover:opacity-100'}`}>
-            <CardMenu workspace={workspace} onTogglePin={onTogglePin} onDelete={onDelete} />
+            <CardMenu workspace={workspace} onTogglePin={onTogglePin} onRename={onRenameStart} onDelete={onDelete} />
           </div>
         )}
       </div>
@@ -256,10 +313,17 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
-  const [sortBy, setSortBy] = useState<'activity' | 'name' | 'custom'>('activity');
+  // Default to the manual ('custom') order so the gallery matches the in-chat
+  // nav panel, which always shows the user's drag order. With no manual reorder
+  // the server's custom sort falls back to updated_at DESC, so this looks
+  // identical to 'activity' until the user actually reorders. Activity/Name
+  // remain available via the Sort-by toggle.
+  const [sortBy, setSortBy] = useState<'activity' | 'name' | 'custom'>('custom');
   const [currentPage, setCurrentPage] = useState(0);
   const [isReorderMode, setIsReorderMode] = useState(false);
   const [allWorkspaces, setAllWorkspaces] = useState<WorkspaceRecord[]>([]);
+  const [renamingWsId, setRenamingWsId] = useState<string | null>(null);
+  const renamingWsIdRef = useRef<string | null>(null); // shadows state so the trailing blur-after-Enter no-ops
   const navigate = useNavigate();
   const { workspaceId: currentWorkspaceId } = useParams();
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -503,6 +567,11 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
       // (workspace, symbol) pair).
       removeStoredThreadId(workspaceId);
       clearAllMarketThreadsForWorkspace(workspaceId);
+      // Drop the nav panel's remembered expansion so a later remount doesn't
+      // re-expand the now-deleted workspace and fire a spurious threads 404,
+      // and clear its frozen-order entries so they don't linger all session.
+      forgetNavPanelExpansion(workspaceId);
+      forgetStableNavOrder(workspaceId);
 
       // Invalidate workspace list cache
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
@@ -548,15 +617,15 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
 
     // Snapshot + optimistic flip across all cached workspace lists
     const previous = queryClient.getQueriesData({ queryKey: queryKeys.workspaces.lists() });
-    previous.forEach(([key, data]: [unknown, any]) => {
-      if (data?.workspaces) {
-        queryClient.setQueryData(key as any, {
-          ...data,
-          workspaces: data.workspaces.map((ws: WorkspaceRecord) =>
-            ws.workspace_id === wsId ? { ...ws, is_pinned: newPinned } : ws
-          ),
-        });
-      }
+    previous.forEach(([key, data]: [unknown, unknown]) => {
+      const d = data as CachedWorkspaceList | undefined;
+      if (!d?.workspaces) return;
+      queryClient.setQueryData(key as readonly unknown[], {
+        ...d,
+        workspaces: d.workspaces.map((ws) =>
+          ws.workspace_id === wsId ? { ...ws, is_pinned: newPinned } : ws
+        ),
+      });
     });
 
     try {
@@ -570,8 +639,55 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
     } catch (err) {
       // Rollback optimistic update
-      previous.forEach(([key, data]: [unknown, any]) => queryClient.setQueryData(key as any, data));
+      previous.forEach(([key, data]: [unknown, unknown]) => queryClient.setQueryData(key as readonly unknown[], data));
       console.error('Error toggling pin:', err);
+    }
+  };
+
+  /**
+   * Start an inline rename on a card (opens the title input).
+   */
+  const handleRenameStart = (workspace: WorkspaceRecord) => {
+    renamingWsIdRef.current = workspace.workspace_id;
+    setRenamingWsId(workspace.workspace_id);
+  };
+
+  const handleRenameCancel = () => {
+    renamingWsIdRef.current = null;
+    setRenamingWsId(null);
+  };
+
+  /**
+   * Commit a rename: optimistic update across cached lists, persist, then
+   * invalidate the list + detail caches so every surface (gallery, nav panel,
+   * FilePanel header) reflects the new name. Rolls back on error.
+   */
+  const handleRenameSubmit = async (wsId: string, name: string) => {
+    if (renamingWsIdRef.current !== wsId) return; // idempotent: trailing blur after Enter no-ops
+    renamingWsIdRef.current = null;
+    setRenamingWsId(null);
+    const trimmed = name.trim();
+    if (!trimmed) return;
+
+    const previous = queryClient.getQueriesData({ queryKey: queryKeys.workspaces.lists() });
+    previous.forEach(([key, data]: [unknown, unknown]) => {
+      const d = data as CachedWorkspaceList | undefined;
+      if (!d?.workspaces) return;
+      queryClient.setQueryData(key as readonly unknown[], {
+        ...d,
+        workspaces: d.workspaces.map((ws) =>
+          ws.workspace_id === wsId ? { ...ws, name: trimmed } : ws
+        ),
+      });
+    });
+
+    try {
+      await updateWorkspace(wsId, { name: trimmed });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.detail(wsId) });
+    } catch (err) {
+      previous.forEach(([key, data]: [unknown, unknown]) => queryClient.setQueryData(key as readonly unknown[], data));
+      console.error('Error renaming workspace:', err);
     }
   };
 
@@ -635,7 +751,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
     setAllWorkspaces(updated);
 
     try {
-      await reorderWorkspaces(items.map(it => ({ workspace_id: it.workspace_id, position: it.sort_order })));
+      await reorderWorkspaces(items);
       didReorderRef.current = true;
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
     } catch (err) {
@@ -810,6 +926,10 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               index={index}
               onSelect={onWorkspaceSelect}
               onTogglePin={handleTogglePin}
+              onRenameStart={handleRenameStart}
+              onRenameSubmit={handleRenameSubmit}
+              onRenameCancel={handleRenameCancel}
+              isRenaming={renamingWsId === workspace.workspace_id}
               onDelete={handleDeleteClick}
               prefetchThreads={prefetchThreads}
             />

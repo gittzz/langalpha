@@ -71,6 +71,10 @@ const INLINE_ARTIFACT_MAP: Record<string, React.ComponentType<{ artifact: Record
 /** Spring config matching radix-accordion feel */
 const SPRING = { type: 'spring' as const, stiffness: 150, damping: 17 };
 const SPRING_SNAPPY = { type: 'spring' as const, stiffness: 200, damping: 22 };
+/** Higher damping for height settles (accordion fold) — no overshoot on multi-row batches. */
+const SPRING_FOLD = { type: 'spring' as const, stiffness: 260, damping: 30 };
+/** Quick tween for live rows clearing out — exits shouldn't draw the eye. */
+const EXIT_TWEEN = { duration: 0.18, ease: 'easeIn' as const };
 
 type LiveState = 'active' | 'completing' | 'completed' | 'failed';
 
@@ -324,7 +328,7 @@ const ActivityBlock = memo(function ActivityBlock({ items, preparingToolCall, is
             className="-mt-2"
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
-            transition={SPRING_SNAPPY}
+            transition={SPRING_FOLD}
             style={{ overflow: 'hidden' }}
           >
             <button
@@ -382,7 +386,7 @@ const ActivityBlock = memo(function ActivityBlock({ items, preparingToolCall, is
                             key={itemKey}
                             initial={{ opacity: 0, height: 0 }}
                             animate={{ opacity: 1, height: 'auto' }}
-                            transition={SPRING_SNAPPY}
+                            transition={SPRING_FOLD}
                             style={{ overflow: 'hidden', listStyle: 'none' }}
                           >
                             {content}
@@ -424,8 +428,8 @@ const ActivityBlock = memo(function ActivityBlock({ items, preparingToolCall, is
                     <motion.div
                       key={`live-r-${item.id}`}
                       initial={{ opacity: 0, height: 0 }}
-                      animate={{ opacity: item._liveState === 'completing' ? 0.6 : 1, height: 'auto' }}
-                      exit={{ opacity: 0, height: 0, paddingTop: 0, paddingBottom: 0 }}
+                      animate={{ opacity: item._liveState === 'completing' ? 0.7 : 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0, paddingTop: 0, paddingBottom: 0, transition: EXIT_TWEEN }}
                       transition={SPRING_SNAPPY}
                       style={{ overflow: 'hidden', paddingTop: '8px', paddingBottom: '8px' }}
                       className="px-3"
@@ -463,7 +467,7 @@ const ActivityBlock = memo(function ActivityBlock({ items, preparingToolCall, is
                       key={`live-t-${item.id || item.toolCallId}`}
                       initial={{ opacity: 0, height: 0 }}
                       animate={{ opacity: 1, height: 'auto' }}
-                      exit={{ opacity: 0, height: 0 }}
+                      exit={{ opacity: 0, height: 0, transition: EXIT_TWEEN }}
                       transition={SPRING_SNAPPY}
                       style={{ overflow: 'hidden' }}
                     >
@@ -589,14 +593,14 @@ const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: ToolCal
   return (
     <motion.div
       className={`nrow ${stateClass} flex items-center gap-2 pl-3 pr-3 py-1.5`}
-      animate={{ opacity: isInProgress ? 1 : 0.7 }}
-      transition={{ duration: 0.3, ease: 'easeOut' }}
+      animate={{ opacity: isInProgress ? 1 : 0.7, y: isInProgress ? 0 : 1 }}
+      transition={{ duration: 0.25, ease: 'easeOut' }}
       style={{ fontSize: '13px', color: 'var(--Labels-Secondary)' }}
     >
       <div className="relative flex-shrink-0 flex items-center justify-center h-5 w-5">
         <motion.span
-          animate={isInProgress ? { opacity: [0.7, 1, 0.7] } : { opacity: 1 }}
-          transition={isInProgress ? { duration: 1.4, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.2 }}
+          animate={isInProgress ? { opacity: [0.85, 1, 0.85] } : { opacity: 1 }}
+          transition={isInProgress ? { duration: 1.5, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.2 }}
           style={{ display: 'inline-flex' }}
         >
           <IconComponent className="h-4 w-4" />

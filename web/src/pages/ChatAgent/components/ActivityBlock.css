@@ -32,6 +32,9 @@
   background: var(--color-bg-page);
   border-radius: 999px;
   padding: 1px;
+  /* Hairline ring masks the icon underneath so the ✕ reads as a deliberate
+   * status chip rather than a stray glyph. Monochrome by design. */
+  box-shadow: 0 0 0 1px var(--color-bg-page);
 }
 
 /* --- Accordion timeline --------------------------------------------------- */

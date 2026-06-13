@@ -1,7 +1,7 @@
 import React, { Suspense, useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, FolderOpen, StopCircle, ScrollText, CheckCircle2, Circle, Loader2, TextSelect, Minus, PanelLeftOpen, Menu, Info } from 'lucide-react';
+import { ArrowLeft, FolderOpen, StopCircle, ScrollText, CheckCircle2, Circle, Loader2, TextSelect, Minus, PanelLeftOpen, Menu, Info, Pin, PinOff } from 'lucide-react';
 import { HoverCard, HoverCardTrigger, HoverCardContent } from '@/components/ui/hover-card';
 import { useIsMobile, getIsMobileSnapshot } from '@/hooks/useIsMobile';
 import { useNarrowContainer } from '@/hooks/useNarrowContainer';
@@ -35,6 +35,7 @@ import MessageList, { normalizeSubagentText } from './MessageList';
 import { SubagentTelemetryContext } from './SubagentTelemetryContext';
 import Markdown from './Markdown';
 import NavigationPanel from './NavigationPanel';
+import NavDisplayOptions from './NavDisplayOptions';
 import ChatMinimap from './ChatMinimap';
 import { useNavigationData } from '../hooks/useNavigationData';
 import ShareButton from './ShareButton';
@@ -213,7 +214,18 @@ interface SubagentStatusIndicatorProps {
 
 // Shared nav panel state across ChatView instances — when switching threads,
 // the newly active instance inherits this so the panel stays open.
-const _sharedNav = { visible: false, locked: false };
+// `pinned` is persisted and read synchronously at module load so a reload
+// mounts the panel docked without a flash. Pinning is desktop-only; mobile
+// keeps the hamburger/drawer flow and ignores `pinned`.
+const NAV_PIN_KEY = 'nav.pinned';
+function readNavPinned(): boolean {
+  try {
+    return localStorage.getItem(NAV_PIN_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+const _sharedNav = { visible: false, locked: false, pinned: readNavPinned() };
 
 // Static main agent object — never changes, so defined once at module level
 const MAIN_AGENT: AgentInfo = {
@@ -358,16 +370,23 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const [activeAgentId, setActiveAgentId] = useState(
     initialTaskId ? `task:${initialTaskId}` : 'main'
   );
-  // Navigation panel visibility (hover-triggered overlay)
+  // Navigation panel visibility (hover-triggered overlay, or docked when pinned)
   // Initialize from shared state so thread switches inherit the panel's open/closed state.
-  const [navPanelVisible, setNavPanelVisible] = useState(_sharedNav.visible);
-  const navPanelVisibleRef = useRef(_sharedNav.visible);
+  // Pinned (desktop only) forces the panel visible from first paint.
+  const initialNavOpen = _sharedNav.visible || (_sharedNav.pinned && !isMobile);
+  const [navPanelVisible, setNavPanelVisible] = useState(initialNavOpen);
+  const navPanelVisibleRef = useRef(initialNavOpen);
+  const [navPinned, setNavPinned] = useState(_sharedNav.pinned);
+  const navPinnedRef = useRef(_sharedNav.pinned);
   const navHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const navLockedRef = useRef(_sharedNav.locked);
   const contentAreaRef = useRef<HTMLDivElement>(null);
   const contentAreaWidthRef = useRef<number>(0);
-  // Skip nav panel slide-in on mount if already open (inherited from previous thread).
-  const skipNavAnimRef = useRef(_sharedNav.visible);
+  // True when the content area is too narrow for the docked push layout; a
+  // pinned panel then stays visible but overlays without pushing content.
+  const [contentNarrow, setContentNarrow] = useState(false);
+  // Skip nav panel slide-in on mount if already open (inherited from previous thread or pinned).
+  const skipNavAnimRef = useRef(initialNavOpen);
   useEffect(() => { skipNavAnimRef.current = false; return () => { if (navHideTimerRef.current) clearTimeout(navHideTimerRef.current); }; }, []);
   // Auto-close nav panel when content area shrinks below threshold (e.g., right panel opens)
   useEffect(() => {
@@ -381,7 +400,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       // Skip when view is hidden (display:none reports width 0) to avoid
       // corrupting _sharedNav for the incoming active view.
       if (!isActiveRef.current) return;
-      if (width < 1100 && navPanelVisibleRef.current) {
+      setContentNarrow(width < 1100);
+      // Pinned panels never auto-collapse — they fall back to overlay-without-push instead.
+      if (width < 1100 && navPanelVisibleRef.current && !navPinnedRef.current) {
         if (navHideTimerRef.current) clearTimeout(navHideTimerRef.current);
         navPanelVisibleRef.current = false;
         _sharedNav.visible = false;
@@ -576,6 +597,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     expandWorkspace: navExpandWorkspace,
     hasMore: navHasMore,
     loadAll: navLoadAll,
+    loadMoreThreads: navLoadMoreThreads,
+    reorderWorkspace: navReorderWorkspace,
+    canReorderWorkspaces: navCanReorderWorkspaces,
+    pinWorkspace: navPinWorkspace,
+    renameWorkspace: navRenameWorkspace,
   } = useNavigationData(workspaceId);
 
   // Navigate to a different thread from the navigation panel
@@ -591,6 +617,23 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       },
     });
   }, [navigate, navWorkspaces, workspaceName]);
+
+  // Open a fresh thread in a workspace from the nav panel. `__default__` + a
+  // workspaceId in route state resolves to a brand-new thread (ChatAgent only
+  // restores a stored session for the bare /chat route), mirroring the new-
+  // workspace navigation path.
+  const handleNewThread = useCallback((wsId: string) => {
+    const ws = (navWorkspaces as Record<string, unknown>[]).find((w) => (w as Record<string, unknown>).workspace_id === wsId) as Record<string, unknown> | undefined;
+    const status = (ws?.status as string) || null;
+    navigate('/chat/t/__default__', {
+      state: {
+        workspaceId: wsId,
+        workspaceName: (ws?.name as string) || '',
+        workspaceStatus: status,
+        agentMode: status === 'flash' ? 'flash' : 'ptc',
+      },
+    });
+  }, [navigate, navWorkspaces]);
 
   // Stable ref-based callback for opening preview URLs from SSE events.
   // Defined here so it can be passed to useChatMessages; assigned after
@@ -1361,6 +1404,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   // Navigation panel hover handlers with 30s hide delay
   const handleNavEnter = useCallback(() => {
+    if (navPinnedRef.current) return; // pinned panel ignores the hover dance
     if (navLockedRef.current) return; // locked after explicit minimize
     // Don't open if content area is too narrow (e.g., right panel consuming space)
     if ((contentAreaRef.current?.offsetWidth ?? Infinity) < 1100) return;
@@ -1371,6 +1415,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   }, []);
 
   const handleNavLeave = useCallback(() => {
+    if (navPinnedRef.current) return; // pinned panel never auto-hides
     if (navLockedRef.current) return;
     navHideTimerRef.current = setTimeout(() => {
       if (!isActiveRef.current) return;
@@ -1397,6 +1442,31 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     const container = getScrollContainer(ref);
     container?.scrollTo({ top: 0, behavior: 'smooth' });
   }, [isMobile, activeAgentId, getScrollContainer]);
+
+  // Pin toggle: pin docks the panel open (persisted); unpin returns to hover mode.
+  const handleTogglePin = useCallback(() => {
+    const next = !navPinnedRef.current;
+    navPinnedRef.current = next;
+    _sharedNav.pinned = next;
+    try {
+      localStorage.setItem(NAV_PIN_KEY, String(next));
+    } catch {
+      // localStorage unavailable (private mode) — pin still works for the session
+    }
+    setNavPinned(next);
+    if (next) {
+      if (navHideTimerRef.current) clearTimeout(navHideTimerRef.current);
+      navLockedRef.current = false;
+      _sharedNav.locked = false;
+      navPanelVisibleRef.current = true;
+      _sharedNav.visible = true;
+      setNavPanelVisible(true);
+    } else {
+      navPanelVisibleRef.current = false;
+      _sharedNav.visible = false;
+      setNavPanelVisible(false);
+    }
+  }, []);
 
   // Expand button explicitly unlocks and opens the panel
   const handleNavExpand = useCallback(() => {
@@ -1535,7 +1605,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // Hidden views notify parent via onThreadResolved but skip URL navigate.
   useEffect(() => {
     if (currentThreadId && currentThreadId !== '__default__' && currentThreadId !== threadId && workspaceId) {
-      console.log('[ChatView] Thread ID changed from', threadId, 'to', currentThreadId, '- updating URL');
       // Notify parent so the cache key updates in-place (preserves instanceId)
       onThreadResolved?.(threadId, currentThreadId);
       if (isActive) {
@@ -1793,14 +1862,19 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       // hover trigger zone works again after a minimize + thread switch.
       navLockedRef.current = false;
       _sharedNav.locked = false;
+      // Sync pin state — it may have been toggled in another instance.
+      // Pinned forces visibility on desktop; mobile ignores it (drawer flow).
+      navPinnedRef.current = _sharedNav.pinned;
+      setNavPinned(_sharedNav.pinned);
+      const wantNavVisible = _sharedNav.visible || (_sharedNav.pinned && !getIsMobileSnapshot());
       // Sync nav panel from shared state
-      navPanelVisibleRef.current = _sharedNav.visible;
-      setNavPanelVisible(_sharedNav.visible);
+      navPanelVisibleRef.current = wantNavVisible;
+      setNavPanelVisible(wantNavVisible);
       // Skip slide-in animation if inheriting open state
-      if (_sharedNav.visible) skipNavAnimRef.current = true;
+      if (wantNavVisible) skipNavAnimRef.current = true;
 
       requestAnimationFrame(() => {
-        if (_sharedNav.visible) skipNavAnimRef.current = false;
+        if (wantNavVisible) skipNavAnimRef.current = false;
         const container = getScrollContainer(scrollAreaRef);
         if (container) {
           container.scrollTo({ top: container.scrollHeight });
@@ -1843,16 +1917,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         {/* Top bar */}
         <div className="flex items-center justify-between px-4 py-2 border-b min-w-0 flex-shrink-0" style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
           <div className="flex items-center gap-4 min-w-0 flex-shrink">
-            {isMobile && (
-              <button
-                onClick={handleNavExpand}
-                className="p-2 rounded-md transition-colors flex-shrink-0"
-                style={{ color: 'var(--color-text-primary)' }}
-                title="Menu"
-              >
-                <Menu className="h-5 w-5" />
-              </button>
-            )}
             <button
               onClick={() => {
                 if (activeAgentId !== 'main') {
@@ -1880,6 +1944,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             >
               <ArrowLeft className="h-5 w-5" />
             </button>
+            {isMobile && (
+              <button
+                onClick={handleNavExpand}
+                className="p-2 rounded-md transition-colors flex-shrink-0"
+                style={{ color: 'var(--color-text-primary)' }}
+                title="Menu"
+              >
+                <Menu className="h-5 w-5" />
+              </button>
+            )}
             <h1 className="text-base font-semibold whitespace-nowrap title-font truncate" style={{ color: 'var(--color-text-primary)' }}>
               {workspaceName || t('thread.workspace')}
             </h1>
@@ -1995,29 +2069,60 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   } : {})}
                   style={{ width: '100%', height: '100%', position: 'absolute', left: 0, top: 0 }}
                 >
-                  {/* Minimize button — top right corner */}
-                  <button
-                    onClick={handleNavMinimize}
-                    className="nav-panel-dismiss-btn"
-                    style={{
-                      position: 'absolute',
-                      top: 8,
-                      right: 8,
-                      zIndex: 2,
-                      padding: 4,
-                      background: 'transparent',
-                      border: 'none',
-                      cursor: 'pointer',
-                      borderRadius: 4,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                    }}
-                    title="Minimize panel"
-                  >
-                    <Minus className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
-                  </button>
                   <NavigationPanel
+                    headerActions={
+                      <>
+                        {/* Sidebar display options (workspace/thread visibility) —
+                            pinned to the left edge; margin-right:auto pushes the pin +
+                            minimize controls to the right of the header row. */}
+                        <div style={{ marginRight: 'auto', display: 'flex', alignItems: 'center' }}>
+                          <NavDisplayOptions />
+                        </div>
+                        {/* Pin toggle — desktop only, next to the minimize button */}
+                        {!isMobile && (
+                          <button
+                            onClick={handleTogglePin}
+                            className="nav-panel-dismiss-btn"
+                            aria-pressed={navPinned}
+                            style={{
+                              padding: 4,
+                              background: 'transparent',
+                              border: 'none',
+                              cursor: 'pointer',
+                              borderRadius: 4,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                            }}
+                            title={navPinned ? t('nav.unpin') : t('nav.pin')}
+                            aria-label={navPinned ? t('nav.unpin') : t('nav.pin')}
+                          >
+                            {navPinned
+                              ? <PinOff className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />
+                              : <Pin className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />}
+                          </button>
+                        )}
+                        {/* Minimize button — while pinned it unpins (un-docks) */}
+                        <button
+                          onClick={!isMobile && navPinned ? handleTogglePin : handleNavMinimize}
+                          className="nav-panel-dismiss-btn"
+                          style={{
+                            padding: 4,
+                            background: 'transparent',
+                            border: 'none',
+                            cursor: 'pointer',
+                            borderRadius: 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}
+                          title={!isMobile && navPinned ? t('nav.unpin') : t('nav.minimize')}
+                          aria-label={!isMobile && navPinned ? t('nav.unpin') : t('nav.minimize')}
+                        >
+                          <Minus className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+                        </button>
+                      </>
+                    }
                     workspaces={navWorkspaces}
                     workspaceThreads={navWorkspaceThreads}
                     currentWorkspaceId={workspaceId}
@@ -2030,17 +2135,26 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     onNavigateThread={handleNavigateThread}
                     hasMore={navHasMore}
                     onLoadMore={navLoadAll}
+                    onLoadMoreThreads={navLoadMoreThreads}
+                    onReorderWorkspace={navCanReorderWorkspaces ? navReorderWorkspace : undefined}
+                    onPinWorkspace={navPinWorkspace}
+                    onRenameWorkspace={navRenameWorkspace}
+                    onNewThread={handleNewThread}
                   />
                 </motion.div>
               )}
             </AnimatePresence>
           </div>
 
-          {/* Chat Window — nudge right when nav panel is open so content clears the overlay */}
+          {/* Chat Window — nudge right when nav panel is open so content clears the overlay.
+              Pinned + narrow content (e.g. right panel open): keep the panel visible but
+              drop the push so chat isn't crushed — the panel overlays instead. */}
           <div
             className="flex-1 flex flex-col overflow-hidden min-w-0"
             style={{
-              paddingLeft: !isMobile && navPanelVisible ? 'min(320px, max(0px, calc(1424px - 100%)))' : 0,
+              paddingLeft: !isMobile && navPanelVisible && !(navPinned && contentNarrow)
+                ? 'min(320px, max(0px, calc(1424px - 100%)))'
+                : 0,
               transition: 'padding-left 0.2s cubic-bezier(0.22, 1, 0.36, 1)',
             }}
           >

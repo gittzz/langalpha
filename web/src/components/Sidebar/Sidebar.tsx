@@ -1,42 +1,21 @@
-import { ChartCandlestick, LayoutDashboard, MessageSquareText, Timer } from 'lucide-react';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import logoLight from '../../assets/img/logo.svg';
 import logoDark from '../../assets/img/logo-dark.svg';
 import { useTheme } from '../../contexts/ThemeContext';
+import { NAV_ITEMS } from '../nav/navItems';
+import { useNavActive } from '../nav/useNavActive';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import AccountMenu from './AccountMenu';
 import './Sidebar.css';
 
 function Sidebar() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { t } = useTranslation();
   const { theme } = useTheme();
+  const isActive = useNavActive();
   const logo = theme === 'light' ? logoDark : logoLight;
-
-  const menuItems = [
-    {
-      key: '/dashboard',
-      icon: LayoutDashboard,
-      label: t('sidebar.dashboard'),
-    },
-    {
-      key: '/chat',
-      icon: MessageSquareText,
-      label: t('sidebar.chatAgent'),
-    },
-    {
-      key: '/market',
-      icon: ChartCandlestick,
-      label: t('sidebar.marketView'),
-    },
-    {
-      key: '/automations',
-      icon: Timer,
-      label: t('sidebar.automations'),
-    },
-  ];
 
   const handleItemClick = (path: string) => {
     navigate(path);
@@ -51,26 +30,30 @@ function Sidebar() {
 
       {/* Navigation Items */}
       <nav className="sidebar-nav">
-        {menuItems.map((item) => {
-          const Icon = item.icon;
-          // For chat route, check if pathname starts with '/chat' to include workspace routes
-          // For other routes, use exact match
-          const isActive = item.key === '/chat'
-            ? location.pathname.startsWith('/chat')
-            : location.pathname === item.key;
+        <TooltipProvider delayDuration={300}>
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            const label = t(item.labelKey);
+            const active = isActive(item);
 
-          return (
-            <button
-              key={item.key}
-              className={`sidebar-nav-item ${isActive ? 'active' : ''}`}
-              onClick={() => handleItemClick(item.key)}
-              aria-label={item.label}
-              title={item.label}
-            >
-              <Icon className="sidebar-nav-icon" />
-            </button>
-          );
-        })}
+            return (
+              <Tooltip key={item.key}>
+                <TooltipTrigger asChild>
+                  <button
+                    className={`sidebar-nav-item ${active ? 'active' : ''}`}
+                    onClick={() => handleItemClick(item.key)}
+                    aria-label={label}
+                  >
+                    <Icon className="sidebar-nav-icon" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  {label}
+                </TooltipContent>
+              </Tooltip>
+            );
+          })}
+        </TooltipProvider>
       </nav>
 
       {/* Account menu — pinned to bottom */}

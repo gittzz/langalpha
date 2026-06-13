@@ -84,7 +84,7 @@ export async function updateWorkspace(workspaceId: string, updates: Record<strin
   return data;
 }
 
-export async function reorderWorkspaces(items: Array<{ workspace_id: string; position: number }>) {
+export async function reorderWorkspaces(items: Array<{ workspace_id: string; sort_order: number }>) {
   if (!items?.length) throw new Error('Reorder items are required');
   await api.post('/api/v1/workspaces/reorder', { items });
 }

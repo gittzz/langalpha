@@ -1,9 +1,16 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
+import { motion, AnimatePresence } from 'framer-motion';
+import { DndContext, DragOverlay, closestCenter, PointerSensor, MeasuringStrategy, useSensor, useSensors } from '@dnd-kit/core';
+import type { DragStartEvent, DragEndEvent } from '@dnd-kit/core';
+import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import {
-  ChevronRight, ChevronDown, Folder, Zap, Pin, MessageSquareText,
-  Check, Circle, Loader2, X, ChevronsDown,
+  ChevronRight, Folder, FolderOpen, Zap, Pin, MessageSquareText,
+  Check, Circle, Loader2, X, ChevronsDown, MoreHorizontal, SquarePen, Pencil,
 } from 'lucide-react';
 import { ScrollArea } from '../../../components/ui/scroll-area';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../../../components/ui/dropdown-menu';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import './NavigationPanel.css';
 
@@ -25,6 +32,7 @@ interface ThreadEntry {
 interface ThreadsData {
   threads: ThreadEntry[];
   loading?: boolean;
+  total?: number;
 }
 
 interface AgentMessage {
@@ -57,6 +65,47 @@ interface NavigationPanelProps {
   onNavigateThread: (wsId: string, threadId: string) => void;
   hasMore?: boolean;
   onLoadMore?: () => void;
+  /** Fetch the next page of threads for a workspace ("Show more" row). */
+  onLoadMoreThreads?: (wsId: string) => void;
+  /** Drag-reorder handler: persist `activeId` dropped onto `overId`'s slot. */
+  onReorderWorkspace?: (activeId: string, overId: string) => void;
+  /** Pin/unpin a workspace to the top of the list (options menu). */
+  onPinWorkspace?: (wsId: string, pinned: boolean) => void;
+  /** Persist a workspace rename (options menu → inline edit). */
+  onRenameWorkspace?: (wsId: string, name: string) => void;
+  /** Open a fresh thread in the given workspace. */
+  onNewThread?: (wsId: string) => void;
+  /** Right-aligned controls (pin, minimize) rendered in a header row above the list. */
+  headerActions?: React.ReactNode;
+}
+
+/**
+ * Sortable wrapper for one workspace section (header row + thread sub-list).
+ * The header row receives the drag listeners via the render prop, which also
+ * gets `isDragging` so the section can collapse to header height while lifted.
+ *
+ * Translate-only (not Transform) so displaced siblings never pick up the
+ * scaleX/scaleY that distorts variable-height rows; the lifted item itself is
+ * hidden here and shown as a fixed-size DragOverlay chip instead.
+ */
+function SortableWorkspace({ wsId, disabled, children }: {
+  wsId: string;
+  disabled: boolean;
+  children: (args: { dragHandleProps: Record<string, unknown>; isDragging: boolean }) => React.ReactNode;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: wsId, disabled });
+  const style: React.CSSProperties = {
+    transform: CSS.Translate.toString(transform),
+    transition,
+    opacity: isDragging ? 0 : 1,
+    position: 'relative',
+    zIndex: isDragging ? 5 : undefined,
+  };
+  return (
+    <div ref={setNodeRef} style={style}>
+      {children({ dragHandleProps: disabled ? {} : { ...attributes, ...listeners }, isDragging })}
+    </div>
+  );
 }
 
 /**
@@ -66,6 +115,24 @@ interface NavigationPanelProps {
  * Follows the collapsible tree pattern from FilePanel's DirectoryNode:
  * ChevronRight/Down toggles, indented rows, Lucide icons throughout.
  */
+// Expansion state shared across panel instances (one mounts per cached
+// ChatView), so user-opened folders survive thread switches within a session.
+const _expandedWorkspaces = new Set<string>();
+const _expandedThreads = new Set<string>();
+
+export function resetNavPanelExpansion() {
+  _expandedWorkspaces.clear();
+  _expandedThreads.clear();
+}
+
+// Forget a deleted workspace so the mount-effect doesn't re-expand it (and fire
+// a spurious threads 404) on the next panel remount. Only deletion is a safe
+// prune signal — `workspaces` is a paged/limited slice, so absence there can
+// mean "scrolled out", not "gone".
+export function forgetNavPanelExpansion(workspaceId: string) {
+  _expandedWorkspaces.delete(workspaceId);
+}
+
 function NavigationPanel({
   workspaces,
   workspaceThreads,
@@ -79,20 +146,46 @@ function NavigationPanel({
   onNavigateThread,
   hasMore,
   onLoadMore,
+  onLoadMoreThreads,
+  onReorderWorkspace,
+  onPinWorkspace,
+  onRenameWorkspace,
+  onNewThread,
+  headerActions,
 }: NavigationPanelProps) {
+  const { t } = useTranslation();
   const isMobile = useIsMobile();
-  // Track expanded workspaces and threads via Sets
-  // Current workspace is expanded by default
-  const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(
-    () => new Set(currentWorkspaceId ? [currentWorkspaceId] : [])
-  );
-  const [expandedThreads, setExpandedThreads] = useState<Set<string>>(
-    () => new Set(currentThreadId && currentThreadId !== '__default__' ? [currentThreadId] : [])
-  );
+  // 8px activation distance (same as the gallery's reorder mode) keeps plain
+  // clicks toggling expand/collapse instead of starting a drag.
+  const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+  // Id of the workspace currently being dragged — drives the DragOverlay chip.
+  const [activeDragId, setActiveDragId] = useState<string | null>(null);
+  // Expanded workspaces/threads. Backed by module-level sets because one
+  // NavigationPanel mounts per cached ChatView instance — without them, every
+  // thread switch would remount the panel and collapse the folders the user
+  // opened. Current workspace/thread are expanded by default. Resets on reload.
+  const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(() => {
+    if (currentWorkspaceId) _expandedWorkspaces.add(currentWorkspaceId);
+    return new Set(_expandedWorkspaces);
+  });
+  const [expandedThreads, setExpandedThreads] = useState<Set<string>>(() => {
+    if (currentThreadId && currentThreadId !== '__default__') _expandedThreads.add(currentThreadId);
+    return new Set(_expandedThreads);
+  });
+
+  // Repopulate thread lists for folders that were already open — the thread
+  // data lives in per-instance hook state, so a fresh mount must re-request it
+  // (served from the React Query cache when warm).
+  React.useEffect(() => {
+    _expandedWorkspaces.forEach((wsId) => expandWorkspace(wsId));
+    // Mount-only: expandWorkspace is stable and re-running on its identity churn would be redundant.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Keep current workspace and thread expanded when they change
   React.useEffect(() => {
     if (currentWorkspaceId) {
+      _expandedWorkspaces.add(currentWorkspaceId);
       setExpandedWorkspaces((prev) => {
         if (prev.has(currentWorkspaceId)) return prev;
         const next = new Set(prev);
@@ -105,6 +198,7 @@ function NavigationPanel({
 
   React.useEffect(() => {
     if (currentThreadId && currentThreadId !== '__default__') {
+      _expandedThreads.add(currentThreadId);
       setExpandedThreads((prev) => {
         if (prev.has(currentThreadId)) return prev;
         const next = new Set(prev);
@@ -115,31 +209,83 @@ function NavigationPanel({
   }, [currentThreadId]);
 
   const toggleWorkspace = useCallback((wsId: string) => {
-    setExpandedWorkspaces((prev) => {
-      const next = new Set(prev);
-      if (next.has(wsId)) {
-        next.delete(wsId);
-      } else {
-        next.add(wsId);
-      }
-      return next;
-    });
+    if (_expandedWorkspaces.has(wsId)) {
+      _expandedWorkspaces.delete(wsId);
+    } else {
+      _expandedWorkspaces.add(wsId);
+    }
+    setExpandedWorkspaces(new Set(_expandedWorkspaces));
     // Lazy-load threads when expanding -- called outside updater to avoid setState-during-render warning.
     // expandWorkspace is a no-op when data is already cached, so calling unconditionally is safe.
     expandWorkspace(wsId);
   }, [expandWorkspace]);
 
   const toggleThread = useCallback((threadId: string) => {
-    setExpandedThreads((prev) => {
-      const next = new Set(prev);
-      if (next.has(threadId)) {
-        next.delete(threadId);
-      } else {
-        next.add(threadId);
-      }
-      return next;
-    });
+    if (_expandedThreads.has(threadId)) {
+      _expandedThreads.delete(threadId);
+    } else {
+      _expandedThreads.add(threadId);
+    }
+    setExpandedThreads(new Set(_expandedThreads));
   }, []);
+
+  // Inline workspace rename — the name span becomes a text input while editing.
+  // Refs shadow the editing state so the blur/Enter commit reads fresh values and
+  // stays idempotent: Enter clears the id, the trailing blur then no-ops.
+  const [renamingWsId, setRenamingWsId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const renamingWsIdRef = useRef<string | null>(null);
+  const renameValueRef = useRef('');
+  const renameOriginalRef = useRef('');
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  const startRename = useCallback((wsId: string, currentName: string) => {
+    renamingWsIdRef.current = wsId;
+    renameOriginalRef.current = currentName;
+    renameValueRef.current = currentName;
+    setRenameValue(currentName);
+    setRenamingWsId(wsId);
+  }, []);
+
+  const cancelRename = useCallback(() => {
+    renamingWsIdRef.current = null;
+    setRenamingWsId(null);
+  }, []);
+
+  const commitRename = useCallback(() => {
+    const wsId = renamingWsIdRef.current;
+    if (!wsId) return; // already committed — the trailing blur after Enter is a no-op
+    renamingWsIdRef.current = null;
+    setRenamingWsId(null);
+    const name = renameValueRef.current.trim();
+    if (name && name !== renameOriginalRef.current) onRenameWorkspace?.(wsId, name);
+  }, [onRenameWorkspace]);
+
+  // Focus + select the rename input once it mounts. rAF defers past Radix's
+  // focus-restore-to-trigger when the rename is launched from the options menu.
+  React.useEffect(() => {
+    if (!renamingWsId) return;
+    const raf = requestAnimationFrame(() => {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [renamingWsId]);
+
+  const handleWorkspaceDragStart = useCallback((event: DragStartEvent) => {
+    setActiveDragId(String(event.active.id));
+  }, []);
+
+  const handleWorkspaceDragEnd = useCallback((event: DragEndEvent) => {
+    setActiveDragId(null);
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    onReorderWorkspace?.(String(active.id), String(over.id));
+  }, [onReorderWorkspace]);
+
+  const handleWorkspaceDragCancel = useCallback(() => setActiveDragId(null), []);
+
+  const activeDragWs = activeDragId ? workspaces.find((ws) => ws.workspace_id === activeDragId) : null;
 
   // Derive agent status for display
   const getAgentStatus = useCallback((agent: AgentEntry): string => {
@@ -157,21 +303,27 @@ function NavigationPanel({
     return agent.status || 'pending';
   }, []);
 
-  // Sorted workspaces: current workspace first, then the rest in hook-provided order
-  const sortedWorkspaces = useMemo(() => {
-    if (!workspaces.length) return [];
-    const current = workspaces.find((ws) => ws.workspace_id === currentWorkspaceId);
-    const rest = workspaces.filter((ws) => ws.workspace_id !== currentWorkspaceId);
-    return current ? [current, ...rest] : workspaces;
-  }, [workspaces, currentWorkspaceId]);
-
   return (
     <div
       className="nav-panel h-full flex flex-col"
     >
+      {headerActions && (
+        <div className="nav-panel-header">
+          {headerActions}
+        </div>
+      )}
       <ScrollArea className="flex-1">
         <div className="py-2">
-          {sortedWorkspaces.map((ws) => {
+          <DndContext
+            sensors={dndSensors}
+            collisionDetection={closestCenter}
+            measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+            onDragStart={handleWorkspaceDragStart}
+            onDragEnd={handleWorkspaceDragEnd}
+            onDragCancel={handleWorkspaceDragCancel}
+          >
+          <SortableContext items={workspaces.map((ws) => ws.workspace_id)} strategy={verticalListSortingStrategy}>
+          {workspaces.map((ws) => {
             const wsId = ws.workspace_id;
             const isExpanded = expandedWorkspaces.has(wsId);
             const isFlash = ws.status === 'flash';
@@ -181,39 +333,134 @@ function NavigationPanel({
             const allThreads = threadsData?.threads || [];
             const threads = isFlash ? allThreads.slice(0, 3) : allThreads;
             const threadsLoading = threadsData?.loading || false;
+            const isRenaming = renamingWsId === wsId;
+            // Pin / rename / new-thread aren't offered on the flash workspace
+            // (shared, immutable) — mirrors the gallery hiding its card menu there.
+            const showWsActions = !isFlash && (onNewThread || onPinWorkspace || onRenameWorkspace);
 
             return (
-              <div key={wsId}>
-                {/* Workspace row */}
+              <SortableWorkspace key={wsId} wsId={wsId} disabled={isFlash || isMobile || !onReorderWorkspace}>
+                {({ dragHandleProps, isDragging: isThisDragging }) => (<>
+                {/* Workspace row — doubles as the drag handle for reordering.
+                    While renaming, click-to-toggle and drag are suppressed so the
+                    inline input owns the row. */}
                 <div
-                  className="nav-panel-row"
+                  className="nav-panel-row group"
                   style={{ paddingLeft: 10 }}
-                  onClick={() => toggleWorkspace(wsId)}
+                  onClick={() => { if (!isRenaming) toggleWorkspace(wsId); }}
+                  {...(isRenaming ? {} : dragHandleProps)}
                 >
-                  {isExpanded
-                    ? <ChevronDown className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
-                    : <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
-                  }
                   {isFlash
                     ? <Zap className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
                     : isPinned
                       ? <Pin className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
-                      : <Folder className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+                      : isExpanded
+                        ? <FolderOpen className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+                        : <Folder className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
                   }
-                  <span
-                    className="text-sm font-medium truncate"
-                    style={{ color: isCurrent ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)' }}
-                  >
-                    {ws.name || 'Workspace'}
-                  </span>
-                  {threadsLoading && (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin flex-shrink-0 ml-auto" style={{ color: 'var(--color-text-tertiary)' }} />
+                  {isRenaming ? (
+                    <input
+                      ref={renameInputRef}
+                      className="text-sm font-medium bg-transparent outline-none border-b flex-1 min-w-0"
+                      style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-muted)' }}
+                      value={renameValue}
+                      onChange={(e) => { setRenameValue(e.target.value); renameValueRef.current = e.target.value; }}
+                      onClick={(e) => e.stopPropagation()}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
+                        else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                      }}
+                      onBlur={commitRename}
+                      aria-label={t('workspace.rename')}
+                    />
+                  ) : (
+                    <>
+                      <span
+                        className="text-sm font-medium truncate"
+                        style={{ color: isCurrent ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)' }}
+                      >
+                        {ws.name || 'Workspace'}
+                      </span>
+                      {/* initial={false}: thread switches remount the panel; the
+                          chevron must render at its resting angle, not animate to it.
+                          Hidden until the row is hovered (always visible on touch). */}
+                      <motion.span
+                        className={`flex-shrink-0 flex items-center ${isMobile ? '' : 'opacity-0 group-hover:opacity-100 transition-opacity'}`}
+                        initial={false}
+                        animate={{ rotate: isExpanded ? 90 : 0 }}
+                        transition={{ duration: 0.15, ease: 'easeOut' }}
+                      >
+                        <ChevronRight className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+                      </motion.span>
+                      {/* Right-aligned row actions: new thread + options (pin / rename).
+                          Hover-revealed on desktop, always shown on touch. */}
+                      {showWsActions && (
+                        <div className={`flex items-center gap-0.5 ml-auto flex-shrink-0 ${isMobile ? '' : 'opacity-0 group-hover:opacity-100 transition-opacity'}`}>
+                          {onNewThread && (
+                            <button
+                              type="button"
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => { e.stopPropagation(); onNewThread(wsId); }}
+                              className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-[var(--color-border-muted)]"
+                              title={t('nav.newThread')}
+                              aria-label={t('nav.newThread')}
+                            >
+                              <SquarePen className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+                            </button>
+                          )}
+                          {(onPinWorkspace || onRenameWorkspace) && (
+                            <DropdownMenu modal={false}>
+                              <DropdownMenuTrigger asChild>
+                                <button
+                                  type="button"
+                                  onPointerDown={(e) => e.stopPropagation()}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-[var(--color-border-muted)]"
+                                  title={t('workspace.options')}
+                                  aria-label={t('workspace.options')}
+                                >
+                                  <MoreHorizontal className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+                                </button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" sideOffset={4} onClick={(e) => e.stopPropagation()}>
+                                {onPinWorkspace && (
+                                  <DropdownMenuItem onSelect={() => onPinWorkspace(wsId, !isPinned)}>
+                                    <Pin className="h-4 w-4" />
+                                    {isPinned ? t('workspace.unpin') : t('workspace.pinToTop')}
+                                  </DropdownMenuItem>
+                                )}
+                                {onRenameWorkspace && (
+                                  <DropdownMenuItem onSelect={() => startRename(wsId, ws.name || '')}>
+                                    <Pencil className="h-4 w-4" />
+                                    {t('workspace.rename')}
+                                  </DropdownMenuItem>
+                                )}
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          )}
+                        </div>
+                      )}
+                      {threadsLoading && (
+                        <Loader2 className={`h-3.5 w-3.5 animate-spin flex-shrink-0 ${showWsActions ? '' : 'ml-auto'}`} style={{ color: 'var(--color-text-tertiary)' }} />
+                      )}
+                    </>
                   )}
                 </div>
 
-                {/* Threads under this workspace */}
-                {isExpanded && (
-                  <div>
+                {/* Threads under this workspace — animated expand/collapse.
+                    Hidden while this section is the one being dragged so the
+                    lifted item shrinks to header height (clean gap), and the
+                    DragOverlay chip below carries the visual instead. */}
+                <AnimatePresence initial={false}>
+                  {isExpanded && !isThisDragging && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2, ease: 'easeInOut' }}
+                      style={{ overflow: 'hidden' }}
+                    >
                     {!threadsLoading && threads.length === 0 && (
                       <div
                         className="text-xs px-2 py-1"
@@ -234,7 +481,7 @@ function NavigationPanel({
                         <div key={tid}>
                           {/* Thread row */}
                           <div
-                            className={`nav-panel-row ${isCurrentThread ? 'nav-panel-row-active' : ''}`}
+                            className={`nav-panel-row group ${isCurrentThread ? 'nav-panel-row-active' : ''}`}
                             style={{ paddingLeft: 28 }}
                             onClick={() => {
                               if (isCurrentThread) {
@@ -245,20 +492,6 @@ function NavigationPanel({
                               }
                             }}
                           >
-                            {/* Chevron for expanding agents -- only on current thread */}
-                            {hasSubagents ? (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); toggleThread(tid); }}
-                                className="flex-shrink-0 p-0 bg-transparent border-none cursor-pointer"
-                              >
-                                {isThreadExpanded
-                                  ? <ChevronDown className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
-                                  : <ChevronRight className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
-                                }
-                              </button>
-                            ) : (
-                              <span style={{ width: 16, flexShrink: 0 }} />
-                            )}
                             <MessageSquareText className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
                             <span
                               className="text-sm truncate"
@@ -267,6 +500,25 @@ function NavigationPanel({
                             >
                               {title}
                             </span>
+                            {/* Expand-agents chevron — immediately right of the thread
+                                name, mirroring the workspace row. Only on the current
+                                thread when it has subagents. Hover-revealed (always shown
+                                on touch); rotates 90° when expanded. initial={false}:
+                                thread switches remount the panel, so the chevron renders
+                                at its resting angle. */}
+                            {hasSubagents && (
+                              <motion.button
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); toggleThread(tid); }}
+                                className={`flex-shrink-0 flex items-center p-0 bg-transparent border-none cursor-pointer ${isMobile ? '' : 'opacity-0 group-hover:opacity-100 transition-opacity'}`}
+                                initial={false}
+                                animate={{ rotate: isThreadExpanded ? 90 : 0 }}
+                                transition={{ duration: 0.15, ease: 'easeOut' }}
+                                aria-label={isThreadExpanded ? 'Collapse agents' : 'Expand agents'}
+                              >
+                                <ChevronRight className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+                              </motion.button>
+                            )}
                           </div>
 
                           {/* Agent rows -- only when subagents exist, for current thread when expanded */}
@@ -342,11 +594,46 @@ function NavigationPanel({
                         </div>
                       );
                     })}
-                  </div>
-                )}
-              </div>
+                    {/* Show more — next page of threads for this workspace */}
+                    {!isFlash && onLoadMoreThreads && typeof threadsData?.total === 'number'
+                      && allThreads.length < threadsData.total && !threadsLoading && (
+                      <div
+                        className="nav-panel-row"
+                        style={{ paddingLeft: 44 }}
+                        onClick={(e) => { e.stopPropagation(); onLoadMoreThreads(wsId); }}
+                      >
+                        <ChevronsDown className="h-3.5 w-3.5 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+                        <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                          {t('nav.showMore')}
+                        </span>
+                      </div>
+                    )}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+                </>)}
+              </SortableWorkspace>
             );
           })}
+          </SortableContext>
+          {/* Fixed-size lift preview — a clean header chip that follows the
+              cursor, so the dragged section's real height never distorts. */}
+          <DragOverlay dropAnimation={null}>
+            {activeDragWs ? (
+              <div className="nav-panel nav-panel-drag-chip">
+                <div className="nav-panel-row" style={{ paddingLeft: 10 }}>
+                  {activeDragWs.is_pinned
+                    ? <Pin className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+                    : <Folder className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+                  }
+                  <span className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
+                    {activeDragWs.name || 'Workspace'}
+                  </span>
+                </div>
+              </div>
+            ) : null}
+          </DragOverlay>
+          </DndContext>
           {hasMore && (
             <div
               className="nav-panel-row"
@@ -355,7 +642,7 @@ function NavigationPanel({
             >
               <ChevronsDown className="h-3.5 w-3.5 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
               <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                Load all
+                {t('nav.loadAll')}
               </span>
             </div>
           )}

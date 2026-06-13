@@ -150,6 +150,71 @@ async def test_reasoning_lifecycle_emits_inline_start_and_complete_on_transition
     ]
 
 
+def _reasoning_summary(text, index, msg_id="msg-1"):
+    """OpenAI Response API reasoning chunk: a summary_text item carrying the
+    thought-step ``index`` the forwarder uses to detect section boundaries."""
+    return _chunk(
+        {
+            "type": "reasoning",
+            "summary": [{"index": index, "type": "summary_text", "text": text}],
+        },
+        msg_id=msg_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reasoning_section_transition_inserts_separator():
+    """When the summary_text index advances (0→1) a new reasoning section
+    started: the forwarder must prepend a blank line so the next section's
+    ``**Title**`` header lands on its own line instead of gluing onto the
+    previous section's prose. Mirrors WorkflowStreamHandler's main-agent path."""
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry)
+    fw = _SubagentTokenForwarder(registry, task.tool_call_id, "task:abc")
+
+    await fw.forward(_reasoning_summary("I want to keep things organized!", 0))
+    await fw.forward(_reasoning_summary("**Evaluating DCF Calculation**", 1))
+    await fw.forward(_chunk("here is the answer"))
+    await fw.finalize()
+
+    timeline = [
+        (e["data"].get("content_type"), e["data"].get("content"))
+        for e in task._test_records
+        if e["event"] == "message_chunk"
+    ]
+    assert timeline == [
+        ("reasoning_signal", "start"),
+        ("reasoning", "I want to keep things organized!"),
+        # 0→1 transition → blank line before the new section's title.
+        ("reasoning", "\n\n**Evaluating DCF Calculation**"),
+        ("reasoning_signal", "complete"),
+        ("text", "here is the answer"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_same_section_index_no_separator():
+    """Consecutive chunks within the same reasoning section (index unchanged)
+    must NOT gain a separator — only true section boundaries break."""
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry)
+    fw = _SubagentTokenForwarder(registry, task.tool_call_id, "task:abc")
+
+    await fw.forward(_reasoning_summary("Part one ", 0))
+    await fw.forward(_reasoning_summary("continues here.", 0))
+    await fw.finalize()
+
+    contents = [
+        e["data"].get("content")
+        for e in task._test_records
+        if e["event"] == "message_chunk"
+        and e["data"].get("content_type") == "reasoning"
+    ]
+    # No leading "\n\n" on the first chunk (no prior section) or the second
+    # (same index → same section).
+    assert contents == ["Part one ", "continues here."]
+
+
 @pytest.mark.asyncio
 async def test_finalize_closes_dangling_reasoning_signal():
     """If a run ends while reasoning is still active (LLM returned reasoning

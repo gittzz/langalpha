@@ -101,13 +101,7 @@ export function useCardState(initialCards: CardsMap = {}): UseCardStateResult {
         // history data. This prevents clicking a resumed inline card from replacing
         // the live streaming messages with an old pre-resume snapshot.
         if (!isCurrentlyInactive && subagentDataUpdate.isHistory) {
-          if (import.meta.env.DEV) {
-            console.log('[updateSubagentCard] Skipping history overwrite on active card:', {
-              agentId,
-              cardId,
-              reason: 'Card is active (live streaming) — history push rejected',
-            });
-          }
+          // Card is active (live streaming) — reject the stale history push.
           return prev;
         }
 
@@ -122,13 +116,7 @@ export function useCardState(initialCards: CardsMap = {}): UseCardStateResult {
           subagentDataUpdate.messages !== undefined ||
           subagentDataUpdate.tokenUsage !== undefined;
         if (isCurrentlyInactive && !isBeingReactivated && !hasContentUpdate) {
-          if (import.meta.env.DEV) {
-            console.log('[updateSubagentCard] Skipping update to inactive card:', {
-              agentId,
-              cardId,
-              reason: 'Card is inactive and not being reactivated (no content update)',
-            });
-          }
+          // Card is inactive and not being reactivated — drop the pure status update.
           return prev;
         }
         // Compute resolved values before building the card
@@ -148,24 +136,10 @@ export function useCardState(initialCards: CardsMap = {}): UseCardStateResult {
           const existingStatus = existingSubagentData.status;
 
           if (newStatus !== undefined) {
-            if (import.meta.env.DEV) {
-              console.log('[updateSubagentCard] Status update:', {
-                agentId,
-                newStatus,
-                previousStatus: existingStatus,
-                willUpdate: newStatus !== existingStatus,
-              });
-            }
             return newStatus;
           }
 
           const preservedStatus = existingStatus || 'active';
-          if (import.meta.env.DEV && existingStatus === 'completed') {
-            console.log('[updateSubagentCard] Preserving completed status:', {
-              agentId,
-              preservedStatus,
-            });
-          }
           return preservedStatus;
         })();
 
@@ -221,15 +195,7 @@ export function useCardState(initialCards: CardsMap = {}): UseCardStateResult {
         const isCompletedFromLiveStream = subagentDataUpdate.isActive === false && subagentDataUpdate.isHistory !== true && subagentDataUpdate.isReconnect !== true;
 
         if (isCompletedFromLiveStream) {
-          if (import.meta.env.DEV) {
-            console.log('[updateSubagentCard] Skipping creation of new card for completed task from live streaming:', {
-              agentId,
-              cardId,
-              reason: 'Completed tasks from live streaming should only update existing cards, not create new ones',
-              isActive: subagentDataUpdate.isActive,
-              isHistory: subagentDataUpdate.isHistory,
-            });
-          }
+          // Completed tasks from live streaming should only update existing cards, not create new ones.
           return prev;
         }
 
@@ -304,13 +270,6 @@ export function useCardState(initialCards: CardsMap = {}): UseCardStateResult {
               },
             };
             hasChanges = true;
-            if (import.meta.env.DEV) {
-              console.log('[inactivateAllSubagents] Marking subagent as inactive:', {
-                taskId: card.subagentData!.taskId,
-                cardId,
-                previousStatus: card.subagentData!.status,
-              });
-            }
           }
         }
       });

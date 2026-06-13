@@ -47,6 +47,19 @@
   "account": {
     "menuLabel": "Account menu"
   },
+  "nav": {
+    "pin": "Pin panel",
+    "unpin": "Unpin panel",
+    "minimize": "Minimize panel",
+    "displayOptions": "Display options",
+    "newThread": "New thread",
+    "orderBy": "Order by",
+    "workspacesShown": "Workspaces shown",
+    "threadsPerWorkspace": "Threads per workspace",
+    "all": "All",
+    "showMore": "Show more",
+    "loadAll": "Load all"
+  },
   "settings": {
     "title": "User Settings",
     "userInfo": "User Info",
@@ -55,6 +68,7 @@
     "theme": "Theme",
     "dark": "Dark",
     "light": "Light",
+    "auto": "Auto",
     "locale": "Language",
     "voiceInput": "Voice Input",
     "voiceInputDesc": "Enable microphone icon in the chat bar for speech-to-text.",
@@ -1015,6 +1029,8 @@
     "dragToReorder": "Drag to reorder",
     "pinToTop": "Pin to top",
     "unpin": "Unpin",
+    "rename": "Rename",
+    "options": "Options",
     "noWorkspacesFound": "No workspaces found",
     "welcomeTitle": "Welcome to LangAlpha",
     "welcomeDesc": "Get started by setting up your preferences or creating a workspace.",
