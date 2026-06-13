@@ -88,6 +88,11 @@ vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getFlashWorkspace: vi.fn(async () => ({ workspace_id: 'ws-flash' })),
 }));
 
+// Onboarding — Settings renders replay/reset buttons; no provider in this harness.
+vi.mock('@/pages/Onboarding', () => ({
+  useOnboarding: () => ({ replayGuides: vi.fn(), resetOnboarding: vi.fn() }),
+}));
+
 // Import after mocks are registered.
 import Settings from '../Settings';
 
