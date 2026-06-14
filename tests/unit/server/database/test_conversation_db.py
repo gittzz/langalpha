@@ -405,3 +405,46 @@ async def test_get_thread_checkpoint_id_none(mock_db_connection, mock_cursor):
 
     result = await get_thread_checkpoint_id("nonexistent")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_thread_owner_id_invalid_uuid_short_circuits(
+    mock_db_connection, mock_cursor
+):
+    """A non-UUID thread_id returns None without touching the DB.
+
+    Regression: a directory name (e.g. ``results``) reaching ``WHERE
+    conversation_thread_id = %s`` against the uuid column raised psycopg
+    InvalidTextRepresentation (22P02), which require_thread_owner surfaced as a
+    spurious 500. The guard must short-circuit to None (→ clean 404) before any
+    query.
+    """
+    from src.server.database.conversation import get_thread_owner_id
+
+    for bad_id in ("results", "my_notes.md", "", None):
+        assert await get_thread_owner_id(bad_id) is None
+
+    mock_cursor.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_thread_owner_id_normalizes_noncanonical_uuid(
+    mock_db_connection, mock_cursor
+):
+    """A Python-parseable but non-canonical thread_id is bound to the query in
+    canonical form, never raw.
+
+    Regression: ``uuid.UUID()`` accepts forms postgres' uuid type rejects (e.g.
+    ``urn:uuid:...``); a validate-only guard let those reach postgres →
+    InvalidTextRepresentation (22P02) → spurious 500. The guard must normalize
+    and bind the canonical string.
+    """
+    from src.server.database.conversation import get_thread_owner_id
+
+    canonical = "12345678-1234-5678-1234-567812345678"
+    mock_cursor.fetchone.return_value = None
+    for variant in (f"urn:uuid:{canonical}", "{%s}" % canonical, canonical.upper()):
+        mock_cursor.execute.reset_mock()
+        await get_thread_owner_id(variant)
+        params = mock_cursor.execute.call_args[0][1]
+        assert params == (canonical,), f"{variant!r} bound {params!r}, not canonical"

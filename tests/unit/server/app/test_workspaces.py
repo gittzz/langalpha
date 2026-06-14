@@ -290,6 +290,28 @@ async def test_get_workspace_forbidden(client):
     assert resp.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_get_workspace_malformed_id_returns_404(client):
+    """A non-UUID id is a clean 404, not a 500.
+
+    Regression: a memory-file key reaching the uuid column raised psycopg
+    InvalidTextRepresentation (22P02) in prod, surfaced as a 500. The guard in
+    db_get_workspace must short-circuit to None (→ 404) before any DB access.
+    """
+    resp = await client.get("/api/v1/workspaces/my_notes.md")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_workspace_events_malformed_id_returns_404(client):
+    """The /events endpoint has no try/except, so a malformed id used to be a
+    raw 500. The db_get_workspace guard makes it a clean 404."""
+    resp = await client.get(
+        "/api/v1/workspaces/my_notes.md/events"
+    )
+    assert resp.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # PUT /api/v1/workspaces/{workspace_id}
 # ---------------------------------------------------------------------------
