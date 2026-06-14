@@ -24,6 +24,11 @@ from src.server.services.cache.news_cache_service import NewsCacheService, news_
 
 logger = logging.getLogger(__name__)
 
+# Service-account identity for the poller's background service-to-service data
+# calls. Matches the principal price_monitor and the live-data WS already send,
+# so every background transport authenticates the same way.
+_SERVICE_USER_ID = "langalpha-service"
+
 
 def _merge_delta(
     existing: list[dict[str, Any]],
@@ -149,7 +154,9 @@ class NewsRefreshService:
             return
 
         source = await self._resolve_source(provider)
-        data = await source.get_news(tickers=None, limit=limit)
+        data = await source.get_news(
+            tickers=None, limit=limit, user_id=_SERVICE_USER_ID
+        )
         fetched = data.get("results", []) if isinstance(data, dict) else []
 
         existing_wrap = await self._cache.get(

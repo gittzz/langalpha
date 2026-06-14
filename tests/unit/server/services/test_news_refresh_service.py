@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.config.models import NewsPollFeedConfig
-from src.server.services.news_refresh_service import NewsRefreshService, _merge_delta
+from src.server.services.news_refresh_service import (
+    _SERVICE_USER_ID,
+    NewsRefreshService,
+    _merge_delta,
+)
 
 
 def _article(aid: str, hour: int) -> dict:
@@ -64,7 +68,9 @@ class TestRefreshFeed:
 
         await svc._refresh_feed(NewsPollFeedConfig(provider="tickertick", limit=50))
 
-        source.get_news.assert_awaited_once_with(tickers=None, limit=50)
+        source.get_news.assert_awaited_once_with(
+            tickers=None, limit=50, user_id=_SERVICE_USER_ID
+        )
         payload, kwargs = cache.set.await_args.args[0], cache.set.await_args.kwargs
         assert [r["id"] for r in payload["results"]] == ["new", "old"]
         assert payload["next_cursor"] is None  # only 2 items < limit 50
@@ -148,6 +154,28 @@ class TestRefreshFeed:
         assert [r["id"] for r in payload["results"]] == ["s4", "s3", "s2", "s1", "s0"]
         # served page is limit=3 → boundary is merged[2] == "s2", NOT the tail "s0"
         assert payload["next_cursor"] == "s2"
+
+    @pytest.mark.asyncio
+    async def test_poller_names_service_user_on_every_feed(self, monkeypatch):
+        """Regression: the user-less poller must send a service-account identity
+        so its background data call authenticates. Without it the request is
+        rejected and the provider chain silently falls back (news.fallback).
+        """
+        svc = _make_service()
+        cache = AsyncMock()
+        cache.acquire_lock = AsyncMock(return_value=True)
+        cache.get = AsyncMock(return_value=None)
+        cache.set = AsyncMock()
+        svc._cache = cache
+
+        source = AsyncMock()
+        source.get_news = AsyncMock(return_value={"results": []})
+        monkeypatch.setattr(svc, "_resolve_source", AsyncMock(return_value=source))
+
+        # The chain feed (provider=None) is the path that hits the data service.
+        await svc._refresh_feed(NewsPollFeedConfig(provider=None, limit=50))
+
+        assert source.get_news.await_args.kwargs["user_id"] == _SERVICE_USER_ID
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("lock_result", [False, None])
