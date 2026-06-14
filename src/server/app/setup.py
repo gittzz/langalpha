@@ -636,7 +636,7 @@ class MalformedIdDiagnosticMiddleware:
                     # embedded CR/LF (the ASGI path is percent-decoded, so a
                     # %0a in the URL would otherwise forge a log line); length
                     # caps bound the log volume an attacker can spam.
-                    path = scope.get("path", "")
+                    path = scope.get("path", "")[:512]
                     referer = headers.get("referer", "")[:256]
                     user_id = headers.get("x-user-id", "")[:128]
                     ua = headers.get("user-agent", "")[:256]
