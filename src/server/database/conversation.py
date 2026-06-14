@@ -1348,6 +1348,54 @@ async def update_sse_events(
         raise
 
 
+async def append_sse_event(
+    conversation_thread_id: str,
+    event: Dict[str, Any],
+    conn=None,
+) -> bool:
+    """Atomically append one SSE event to the thread's latest response blob.
+
+    A server-side ``sse_events || event`` JSONB concat scoped to the most-recent
+    response (by turn_index). Avoids reading the whole blob into Python and
+    rewriting it, and is race-free against concurrent appenders (the
+    read-modify-write it replaces is not). Returns True when a row was updated,
+    False when the thread has no response row yet.
+    """
+    sql = """
+        UPDATE conversation_responses
+        SET sse_events = COALESCE(sse_events, '[]'::jsonb) || %s::jsonb
+        WHERE conversation_response_id = (
+            SELECT conversation_response_id
+            FROM conversation_responses
+            WHERE conversation_thread_id = %s
+            ORDER BY turn_index DESC
+            LIMIT 1
+        )
+    """
+    params = (SafeJson([event]), conversation_thread_id)
+    try:
+        if conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+                updated = cur.rowcount > 0
+        else:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(sql, params)
+                    updated = cur.rowcount > 0
+
+        if not updated:
+            logger.debug(
+                "[conversation_db] append_sse_event: no response row for thread "
+                f"{conversation_thread_id}"
+            )
+        return updated
+
+    except Exception as e:
+        logger.error(f"Error appending sse_event: {e}")
+        raise
+
+
 async def get_responses_for_thread(
     conversation_thread_id: str, limit: Optional[int] = None, offset: int = 0
 ) -> Tuple[List[Dict[str, Any]], int]:
