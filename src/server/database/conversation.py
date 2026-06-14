@@ -1384,11 +1384,6 @@ async def append_sse_event(
                     await cur.execute(sql, params)
                     updated = cur.rowcount > 0
 
-        if not updated:
-            logger.debug(
-                "[conversation_db] append_sse_event: no response row for thread "
-                f"{conversation_thread_id}"
-            )
         return updated
 
     except Exception as e:
