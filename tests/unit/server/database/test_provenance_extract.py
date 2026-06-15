@@ -41,6 +41,7 @@ class TestExtractProvenance:
                 source_type="mcp_tool",
                 identifier="server:get_prices",
                 title="Daily prices",
+                detail="daily_prices",
                 tool_call_id="call-1",
                 args_fingerprint={"symbol": "TEST"},
                 args={"symbol": "TEST", "api_key": "[redacted]"},
@@ -55,6 +56,7 @@ class TestExtractProvenance:
         assert record["source_type"] == "mcp_tool"
         assert record["identifier"] == "server:get_prices"
         assert record["title"] == "Daily prices"
+        assert record["detail"] == "daily_prices"
         assert record["tool_call_id"] == "call-1"
         assert record["args_fingerprint"] == {"symbol": "TEST"}
         # Readable redacted args ride alongside the hash.

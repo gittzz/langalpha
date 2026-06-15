@@ -87,6 +87,21 @@ class TestInsertProvenanceRecords:
         assert len(params) == 2 * NCOLS
 
     @pytest.mark.asyncio
+    async def test_detail_bound_at_its_column(self, mock_connection, mock_cursor):
+        # `detail` (the data-kind slug) must reach the INSERT at its _INSERT_COLUMNS
+        # position so GET /provenance can distinguish e.g. company_overview from
+        # daily_prices for one ticker. Bind index = position in the column tuple.
+        await insert_provenance_records(
+            mock_connection,
+            conversation_response_id=RESPONSE_ID,
+            conversation_thread_id=THREAD_ID,
+            turn_index=0,
+            records=[_record(detail="daily_prices")],
+        )
+        _, params = _insert_call(mock_cursor).args
+        assert params[_INSERT_COLUMNS.index("detail")] == "daily_prices"
+
+    @pytest.mark.asyncio
     async def test_empty_records_only_deletes(self, mock_connection, mock_cursor):
         n = await insert_provenance_records(
             mock_connection,

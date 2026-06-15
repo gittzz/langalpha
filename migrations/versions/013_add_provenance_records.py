@@ -29,6 +29,7 @@ def upgrade() -> None:
             source_type TEXT NOT NULL,
             identifier TEXT,
             title TEXT,
+            detail TEXT,
             args_fingerprint JSONB,
             args JSONB,
             result_sha256 TEXT,

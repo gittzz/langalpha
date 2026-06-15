@@ -41,6 +41,7 @@ def _row(turn_index, response_id, source_type, identifier, sha):
         "source_type": source_type,
         "identifier": identifier,
         "title": "A title",
+        "detail": "company_overview",
         "args_fingerprint": {"q": "test"},
         "args": {"symbol": "AAPL", "api_key": "[redacted]"},
         "result_sha256": sha,
@@ -147,5 +148,7 @@ class TestGetProvenanceShape:
         assert source["record_id"] == "rec-https://example.test/a"
         assert "provenance_record_id" not in source  # renamed, not duplicated
         assert source["timestamp"] == ts.isoformat()
+        # detail (the data-kind slug) is passed through for the verification agent.
+        assert source["detail"] == "company_overview"
         # Readable redacted args are passed through to the REST shape.
         assert source["args"] == {"symbol": "AAPL", "api_key": "[redacted]"}

@@ -26,6 +26,7 @@ _TEXT_FIELDS = (
     "source_type",
     "identifier",
     "title",
+    "detail",
     "result_sha256",
     "result_snippet",
     "agent",
@@ -41,9 +42,9 @@ _BIGINT_MAX = 2**63 - 1
 # delete-then-insert (and the SSE/render fan-out downstream) defensively.
 _MAX_RECORDS_PER_RESPONSE = 1000
 
-# Columns of one provenance_records row, in INSERT bind order. 15 columns; with
-# the _MAX_RECORDS_PER_RESPONSE cap that's 15 * 1000 = 15_000 binds per INSERT,
-# well under Postgres's 65_535-parameter ceiling (would only break above ~4_369
+# Columns of one provenance_records row, in INSERT bind order. 16 columns; with
+# the _MAX_RECORDS_PER_RESPONSE cap that's 16 * 1000 = 16_000 binds per INSERT,
+# well under Postgres's 65_535-parameter ceiling (would only break above ~4_095
 # rows). Keep in sync with _row_binds' tuple order.
 _INSERT_COLUMNS = (
     "conversation_response_id",
@@ -53,6 +54,7 @@ _INSERT_COLUMNS = (
     "source_type",
     "identifier",
     "title",
+    "detail",
     "args_fingerprint",
     "args",
     "result_sha256",
@@ -207,6 +209,7 @@ def _row_binds(
         strip_pg_nul_str(record.get("source_type")),
         strip_pg_nul_str(record.get("identifier")),
         strip_pg_nul_str(record.get("title")),
+        strip_pg_nul_str(record.get("detail")),
         SafeJson(fingerprint) if fingerprint is not None else None,
         SafeJson(args) if args is not None else None,
         strip_pg_nul_str(record.get("result_sha256")),
@@ -319,8 +322,8 @@ async def get_provenance_for_thread(
                 SELECT
                     provenance_record_id, conversation_response_id,
                     conversation_thread_id, turn_index, tool_call_id,
-                    source_type, identifier, title, args_fingerprint, args,
-                    result_sha256, result_size, result_snippet, agent,
+                    source_type, identifier, title, detail, args_fingerprint,
+                    args, result_sha256, result_size, result_snippet, agent,
                     provider, source_timestamp, created_at
                 FROM provenance_records
                 WHERE conversation_thread_id = %s

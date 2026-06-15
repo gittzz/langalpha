@@ -1337,6 +1337,7 @@ async def get_provenance(thread_id: str, x_user_id: CurrentUserId):
                 "source_type": row["source_type"],
                 "identifier": row.get("identifier"),
                 "title": row.get("title"),
+                "detail": row.get("detail"),
                 "tool_call_id": row.get("tool_call_id"),
                 "args_fingerprint": row.get("args_fingerprint"),
                 "args": row.get("args"),
