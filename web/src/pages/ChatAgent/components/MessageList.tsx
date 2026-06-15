@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, memo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Bot, User, FileText, FileSearch, ImageIcon, Pencil, RefreshCw, RotateCcw, Copy, Check, Info, ThumbsUp, ThumbsDown } from 'lucide-react';
+import { Bot, User, FileText, FileSearch, ImageIcon, Pencil, RefreshCw, RotateCcw, Copy, Check, Info, ThumbsUp, ThumbsDown, StopCircle } from 'lucide-react';
 import { type WidgetContextPreviewShape } from '@/pages/Dashboard/widgets/framework/WidgetContextPreview';
 import { WidgetContextDeck } from '@/pages/Dashboard/widgets/framework/WidgetContextDeck';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -815,6 +815,18 @@ const MessageBubble = memo(function MessageBubble({ message, isLoading, hideAvat
               <FileSearch className="h-3.5 w-3.5" />
               {t('chat.sources.pill', { count: sourceCount })}
             </button>
+          </div>
+        )}
+
+        {/* Per-message "⏹ Stopped" chip — the turn was hard-stopped by the
+            user (live finalize or replay of a stopped turn). */}
+        {isAssistant && (message.stopped as boolean) && (
+          <div
+            className="inline-flex items-center gap-1 self-start px-2 py-0.5 rounded text-xs"
+            style={{ backgroundColor: 'var(--color-loss-soft)', color: 'var(--color-loss)' }}
+          >
+            <StopCircle className="h-3 w-3 flex-shrink-0" />
+            <span>{t('chat.stoppedChip')}</span>
           </div>
         )}
 
