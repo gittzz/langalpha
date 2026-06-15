@@ -148,4 +148,12 @@ describe('parseThreadIdFromContentLocation', () => {
     expect(parseThreadIdFromContentLocation('')).toBeNull();
     expect(parseThreadIdFromContentLocation('/api/v1/threads/messages')).toBeNull();
   });
+
+  it('returns null (does not throw) on malformed percent-encoding', () => {
+    expect(
+      parseThreadIdFromContentLocation(
+        '/api/v1/threads/%ZZ/messages/stream?run_id=r',
+      ),
+    ).toBeNull();
+  });
 });

@@ -1612,6 +1612,13 @@ class WorkflowStreamHandler:
                 if agent_name in closed_tool_agents:
                     continue
                 closed_tool_agents.add(agent_name)
+                # The `id` here is the open *message* id, not the tool-call id —
+                # intentional. The frontend ignores both `id` and `finish_reason`
+                # on a tool_call_chunks event (handleToolCallChunks only iterates
+                # the `tool_call_chunks` array, absent here → no-op). The preparing
+                # shimmer actually clears off the step-4 message_chunk
+                # finish_reason:"stopped" below (matched by message id). This close
+                # event just keeps the persisted transcript internally consistent.
                 self._format_sse_event(
                     "tool_call_chunks",
                     {
@@ -1648,7 +1655,8 @@ class WorkflowStreamHandler:
             self._open_message_ids.clear()
         except Exception as e:
             logger.warning(
-                f"[WorkflowStreamHandler] finalize_stopped_events failed: {e}"
+                f"[WorkflowStreamHandler] finalize_stopped_events failed: {e}",
+                exc_info=True,
             )
 
         return self.get_sse_events()

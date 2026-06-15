@@ -298,7 +298,14 @@ export function parseThreadIdFromContentLocation(
   if (!contentLocation) return null;
   const match = contentLocation.match(/\/threads\/([^/?]+)\//);
   const tid = match?.[1];
-  return tid && tid.length > 0 ? decodeURIComponent(tid) : null;
+  if (!tid || tid.length === 0) return null;
+  try {
+    return decodeURIComponent(tid);
+  } catch {
+    // Malformed percent-encoding (e.g. "%ZZ") throws URIError. The contract is
+    // non-throwing/return-null for unusable input — a bad id can't be latched.
+    return null;
+  }
 }
 
 async function streamFetch(

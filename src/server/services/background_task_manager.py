@@ -213,6 +213,13 @@ class BackgroundTaskManager:
 
     _instance: Optional['BackgroundTaskManager'] = None
 
+    # Margin added to the checkpoint-flush timeout when a new turn waits for a
+    # stopping turn's teardown to finish. Teardown does more than flush (subagent
+    # drain, registry clear, persist), so the wait must outlast the flush alone;
+    # past it, admission returns "stopping" → 409 retry rather than racing a
+    # second checkpoint writer.
+    _ADMISSION_TEARDOWN_MARGIN_S = 2.0
+
     def __init__(self):
         # Keyed by (thread_id, run_id). One slot per turn; no cross-turn
         # aliasing because run_id is fresh per POST.
@@ -742,6 +749,7 @@ class BackgroundTaskManager:
 
         # --- 2. Drain killed-subagent events (best-effort, hard timeout) ---
         merged_subagent_events: list[dict] = []
+        drain_timeout = get_stop_drain_timeout()
         if registry is not None:
             try:
                 tasks = await registry.get_all_tasks()
@@ -750,12 +758,12 @@ class BackgroundTaskManager:
             try:
                 merged_subagent_events = await asyncio.wait_for(
                     self._drain_killed_subagent_events(thread_id, tasks),
-                    timeout=get_stop_drain_timeout(),
+                    timeout=drain_timeout,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     f"[StopTeardown] Subagent drain exceeded "
-                    f"{get_stop_drain_timeout()}s for thread_id={thread_id}; "
+                    f"{drain_timeout}s for thread_id={thread_id}; "
                     "proceeding without drained events"
                 )
             except Exception as exc:
@@ -2052,7 +2060,7 @@ class BackgroundTaskManager:
         # ends via ``raise CancelledError``, and a bare await would re-raise
         # that into this (new) request handler. ``asyncio.wait`` swallows the
         # task's exception so the caller is unaffected.
-        timeout = get_checkpoint_flush_timeout() + 2.0
+        timeout = get_checkpoint_flush_timeout() + self._ADMISSION_TEARDOWN_MARGIN_S
         logger.info(
             f"[BackgroundTaskManager] Waiting for stopping workflow {key} "
             f"to finish teardown (timeout={timeout}s)"
