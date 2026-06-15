@@ -19,6 +19,17 @@ from .mcp_sanitize import (
 logger = structlog.get_logger(__name__)
 
 
+# Version of the generated mcp_client.py output. Bump whenever the generated
+# client *code* changes (e.g. the _trace_mcp_call template) in a way that should
+# reach existing sandboxes. The sandbox manifest hashes generation *inputs* (MCP
+# server files, tool schemas, user config) — not this generator's source — so a
+# pure codegen change is otherwise invisible to sync_sandbox_assets and never
+# re-uploaded to a reused sandbox. Folding this constant into the tool_modules
+# version makes a bump force the regenerated client onto every workspace on its
+# next sync. See ptc_sandbox._compute_sandbox_manifest.
+MCP_CLIENT_CODEGEN_VERSION = "1"
+
+
 def _safe_func_name(name: str) -> str:
     """Map an MCP tool name to a wrapper function name.
 

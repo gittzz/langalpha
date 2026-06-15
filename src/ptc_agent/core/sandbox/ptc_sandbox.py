@@ -45,7 +45,7 @@ from ..mcp_sanitize import (
     is_user_server,
     sanitize_tool_name,
 )
-from ..tool_generator import ToolFunctionGenerator
+from ..tool_generator import MCP_CLIENT_CODEGEN_VERSION, ToolFunctionGenerator
 
 logger = structlog.get_logger(__name__)
 
@@ -1176,6 +1176,11 @@ class PTCSandbox:
         source_versions = {
             "mcp_servers": mcp_version,
             "tool_schemas": tool_schema_hash,
+            # Generated-client output version. Folded in unconditionally so a
+            # codegen bump (e.g. new _trace_mcp_call template) changes tm_version
+            # for EVERY workspace and re-uploads the regenerated mcp_client.py on
+            # the next sync — the manifest otherwise hashes only generation inputs.
+            "client_codegen": MCP_CLIENT_CODEGEN_VERSION,
         }
         # User-server config hash — GATED on the presence of user servers so a
         # builtin-only workspace's source_versions dict (and thus tool_modules
