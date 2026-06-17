@@ -2705,9 +2705,13 @@ except OSError as e:
                 if isinstance(entry, dict):
                     records.append(entry)
         try:
+            # Delete via the same raw absolute trace_path the read above used.
+            # trace_path is already rooted at the live work_dir; normalize_path
+            # would re-prepend work_dir when it isn't under allowed_directories,
+            # so the rm would miss and leak the file (read uses the raw path).
             await self._runtime_call(
                 self.runtime.exec,
-                f"rm -f {shlex.quote(self.normalize_path(trace_path))}",
+                f"rm -f {shlex.quote(trace_path)}",
                 retry_policy=RetryPolicy.SAFE,
             )
         except Exception as e:
@@ -2766,6 +2770,11 @@ except OSError as e:
         # Set before the try so the crash path can still read any trace lines
         # flushed before the failure (durability).
         trace_path: str | None = None
+        # True once _collect_mcp_trace has run (it reads AND deletes the file).
+        # The finally block only cleans up when this stayed False — i.e. an
+        # asyncio.CancelledError unwound the turn before either the success or
+        # crash path collected, which would otherwise orphan the JSONL.
+        trace_collected = False
         carry_trace = list(_carry_mcp_trace or [])
         try:
             # Write code to thread dir or fallback to code/
@@ -2853,6 +2862,7 @@ except OSError as e:
             # failed-then-retried run keeps the pre-failure sources (dedup is
             # handled downstream by the extractor).
             mcp_trace = [*carry_trace, *await self._collect_mcp_trace(trace_path)]
+            trace_collected = True
 
             execution_result = ExecutionResult(
                 success=success,
@@ -2944,6 +2954,7 @@ except OSError as e:
             crash_mcp_trace: list[dict] = list(carry_trace)
             if trace_path:
                 crash_mcp_trace.extend(await self._collect_mcp_trace(trace_path))
+                trace_collected = True
 
             return ExecutionResult(
                 success=False,
@@ -2959,6 +2970,29 @@ except OSError as e:
             )
         finally:
             _exec_span.end()
+            # asyncio.CancelledError (BaseException) skips the except above, so a
+            # disconnect/cancel after MCP_TRACE_FILE was set would leave the JSONL
+            # behind. Delete it here when neither path collected. shield() so the
+            # rm still runs even though this await is itself unwinding a cancel.
+            if (
+                trace_path is not None
+                and not trace_collected
+                and self.runtime is not None
+            ):
+                try:
+                    await asyncio.shield(
+                        self._runtime_call(
+                            self.runtime.exec,
+                            f"rm -f {shlex.quote(trace_path)}",
+                            retry_policy=RetryPolicy.SAFE,
+                        )
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Failed to clean up MCP trace file on cancel",
+                        path=trace_path,
+                        error=str(e),
+                    )
 
     @property
     def proxy_domain(self) -> str | None:
