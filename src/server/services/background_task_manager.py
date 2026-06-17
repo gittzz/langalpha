@@ -520,6 +520,29 @@ class BackgroundTaskManager:
             if key in self.tasks:
                 existing = self.tasks[key]
                 if existing.status == TaskStatus.QUEUED and existing.task is None:
+                    if existing.cancel_event.is_set():
+                        # Cancelled in the pre_register → start_workflow window
+                        # (dispatched flow). Do NOT resurrect it into a RUNNING
+                        # task: wait_for_admission returns "fresh" for a
+                        # task-less cancelled placeholder, so a new turn may
+                        # already be RUNNING on this thread. A resurrected run
+                        # would tear down on its first cancel-event check —
+                        # flushing a stale checkpoint and marking the thread
+                        # CANCELLED over the new turn. Settle the placeholder
+                        # terminally and release its burst slot here (no task is
+                        # created, so the BTM finalizer that normally releases it
+                        # never runs).
+                        existing.status = TaskStatus.CANCELLED
+                        existing.completed_at = datetime.now()
+                        existing.persistence_complete.set()
+                        uid = (metadata or {}).get("user_id")
+                        if uid:
+                            await release_burst_slot(uid)
+                        logger.info(
+                            f"[BackgroundTaskManager] Placeholder {key} cancelled "
+                            "before start; settled without resurrecting"
+                        )
+                        return existing
                     # Upgrade pre-registered placeholder in-place.
                     existing.metadata = metadata or {}
                     existing.completion_callback = completion_callback

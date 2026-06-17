@@ -876,3 +876,76 @@ class TestWaitForAdmission:
         ti = _make_task_info(thread_id="t-done", status=TaskStatus.COMPLETED)
         btm.tasks[("t-done", ti.run_id)] = ti
         assert await btm.wait_for_admission("t-done") == "fresh"
+
+
+class TestStartWorkflowCancelledPlaceholder:
+    """A dispatched placeholder cancelled in the pre_register → start_workflow
+    window must NOT be resurrected into a RUNNING task. wait_for_admission
+    returns 'fresh' for a task-less cancelled placeholder, so a new turn can
+    already be RUNNING on the thread; resurrecting would flush a stale
+    checkpoint and mark the thread CANCELLED over that new turn."""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_placeholder_not_resurrected(self):
+        btm = _make_btm()
+        thread_id, run_id = "t-zombie", "run-zombie"
+
+        # Dispatched pre-register: QUEUED, task=None.
+        await btm.pre_register(thread_id, run_id)
+        # User cancels before the generator reaches start_workflow.
+        assert await btm.cancel_workflow(thread_id, run_id) is True
+
+        consumed = False
+
+        async def gen():
+            nonlocal consumed
+            consumed = True
+            yield {}
+
+        mod = "src.server.services.background_task_manager"
+        with patch(f"{mod}.release_burst_slot", new_callable=AsyncMock) as rel:
+            ti = await btm.start_workflow(
+                thread_id=thread_id,
+                run_id=run_id,
+                workflow_generator=gen(),
+                metadata={"user_id": "u-1"},
+            )
+
+        # Settled terminally; no resurrected task; generator never consumed.
+        assert ti.status == TaskStatus.CANCELLED
+        assert ti.task is None
+        assert consumed is False
+        # Burst slot released here — no BTM task will finalize to release it.
+        rel.assert_awaited_once_with("u-1")
+        # No second workflow lingers active on the thread.
+        assert await btm.wait_for_admission(thread_id) == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_uncancelled_placeholder_still_upgrades(self):
+        """Negative case: a normal (uncancelled) placeholder still upgrades to
+        RUNNING — the guard must not break the happy path."""
+        btm = _make_btm()
+        thread_id, run_id = "t-ok", "run-ok"
+        await btm.pre_register(thread_id, run_id)
+
+        started = asyncio.Event()
+
+        async def gen():
+            started.set()
+            yield {}
+            await asyncio.sleep(0)
+
+        ti = await btm.start_workflow(
+            thread_id=thread_id,
+            run_id=run_id,
+            workflow_generator=gen(),
+            metadata={"user_id": "u-1"},
+        )
+        try:
+            assert ti.status == TaskStatus.RUNNING
+            assert ti.task is not None
+        finally:
+            if ti.task and not ti.task.done():
+                ti.task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await ti.task

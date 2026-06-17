@@ -3887,6 +3887,12 @@ export function useChatMessages(
     let pendingRunIdFromHeader: string | null = null;
 
     const demoteToNewTurn = (): void => {
+      // If the user already hit stop, do NOT promote this in-flight steering
+      // POST into a fresh turn: clearing wasStoppedRef + re-enabling the
+      // spinner here would make the stop look undone (the backend tore the
+      // prior turn down and routed this POST as new). Drop it instead — the
+      // finally below honors wasStoppedRef and returns.
+      if (wasStoppedRef.current) return;
       demotedToNewTurn = true;
       if (pendingRunIdFromHeader) {
         currentRunIdRef.current = pendingRunIdFromHeader;
@@ -4285,7 +4291,19 @@ export function useChatMessages(
           if (mainStreamAbortRef.current === abortController) {
             mainStreamAbortRef.current = null;
           }
-          if (!wasDisconnected && !wasInterruptedRef.current && !wasStoppedRef.current) {
+          // wasStoppedRef is shared across streams: if the user stopped THIS
+          // stream then sent a new one, the new send resets wasStoppedRef to
+          // false, so this stale finally would otherwise run cleanup against
+          // currentMessageRef — now the NEW stream's message — clobbering it
+          // mid-flight. The per-stream abort signal is the reliable guard: an
+          // aborted stream's teardown is always owned elsewhere (stopWorkflow
+          // or the superseding send), never this finally.
+          if (
+            !wasDisconnected &&
+            !wasInterruptedRef.current &&
+            !wasStoppedRef.current &&
+            !abortController.signal.aborted
+          ) {
             // Mark message as complete (use live ref in case steering_delivered switched it)
             const finalId = currentMessageRef.current || assistantMessageId;
             setMessages((prev) =>
