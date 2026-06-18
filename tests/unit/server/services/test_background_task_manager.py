@@ -812,6 +812,24 @@ class TestStopTeardownOrdering:
         assert collector.cancelled()
         assert "t-orph" not in btm._orphan_collectors
 
+    @pytest.mark.asyncio
+    async def test_orphan_collector_bucket_cleared_on_natural_completion(self):
+        """A collector that finishes without a stop drops its empty bucket — no
+        unbounded empty-set leak on long-lived servers."""
+        btm = _make_btm()
+
+        async def quick_collector():
+            return None
+
+        collector = asyncio.create_task(quick_collector())
+        btm._track_orphan_collector("t-nat", collector)
+        assert "t-nat" in btm._orphan_collectors  # tracked while running
+
+        await collector
+        await asyncio.sleep(0)  # let the done-callback run
+
+        assert "t-nat" not in btm._orphan_collectors
+
 
 # ---------------------------------------------------------------------------
 # wait_for_admission decisions (decision 2A)

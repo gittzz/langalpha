@@ -752,10 +752,23 @@ class BackgroundTaskManager:
             )
 
     def _track_orphan_collector(self, thread_id: str, task: asyncio.Task) -> None:
-        """Register a live orphan-collector task for stop-time cancellation."""
+        """Register a live orphan-collector task for stop-time cancellation.
+
+        The done-callback discards the finished task and drops the per-thread
+        bucket once it empties, so threads whose collectors complete naturally
+        (turn ends without a user stop) don't leak empty sets on a long-lived
+        server. The ``is bucket`` guard keeps a fresh bucket from a later turn
+        on the same thread from being removed by this callback.
+        """
         bucket = self._orphan_collectors.setdefault(thread_id, set())
         bucket.add(task)
-        task.add_done_callback(lambda t: bucket.discard(t))
+
+        def _discard(t: asyncio.Task) -> None:
+            bucket.discard(t)
+            if not bucket and self._orphan_collectors.get(thread_id) is bucket:
+                self._orphan_collectors.pop(thread_id, None)
+
+        task.add_done_callback(_discard)
 
     async def _teardown_subagents_on_stop(self, thread_id: str, run_id: str) -> None:
         """Single-owner subagent teardown on a user stop.
