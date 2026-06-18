@@ -10,7 +10,7 @@ duplicating rows. All binds pass through the shared NUL sanitizers.
 import logging
 import math
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from psycopg.rows import dict_row
 
@@ -66,7 +66,7 @@ _INSERT_COLUMNS = (
 )
 
 
-def _coerce_int(value: Any) -> Optional[int]:
+def _coerce_int(value: Any) -> int | None:
     """Best-effort BIGINT for result_size; None for anything out of range.
 
     The MCP trace is LLM-authored in the sandbox, so a poisoned entry (non-finite
@@ -93,7 +93,7 @@ def _coerce_int(value: Any) -> Optional[int]:
     return candidate if _BIGINT_MIN <= candidate <= _BIGINT_MAX else None
 
 
-def _coerce_str(value: Any) -> Optional[str]:
+def _coerce_str(value: Any) -> str | None:
     """Coerce an untrusted trace field to str-or-None for a TEXT bind.
 
     Text fields flow partly from LLM-authored sandbox traces; a non-string
@@ -107,7 +107,7 @@ def _coerce_str(value: Any) -> Optional[str]:
     return str(value)
 
 
-def _coerce_timestamp(value: Any) -> Optional[datetime]:
+def _coerce_timestamp(value: Any) -> datetime | None:
     """Parse an ISO-8601 source-access timestamp to a datetime, or None.
 
     For mcp_tool entries the timestamp is agent-controlled, so a bad value must
@@ -122,8 +122,8 @@ def _coerce_timestamp(value: Any) -> Optional[datetime]:
 
 
 def extract_provenance_from_sse_events(
-    sse_events: Optional[List[Dict[str, Any]]],
-) -> List[Dict[str, Any]]:
+    sse_events: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
     """Return normalized provenance rows from accumulated SSE events.
 
     Filters entries with top-level ``event == "provenance"`` and dedups within
@@ -141,7 +141,7 @@ def extract_provenance_from_sse_events(
     if not sse_events:
         return []
 
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     seen: set[tuple] = set()
     for entry in sse_events:
         if not isinstance(entry, dict) or entry.get("event") != "provenance":
@@ -192,7 +192,7 @@ def extract_provenance_from_sse_events(
 
 
 def _row_binds(
-    record: Dict[str, Any],
+    record: dict[str, Any],
     *,
     conversation_response_id: str,
     conversation_thread_id: str,
@@ -227,7 +227,7 @@ async def insert_provenance_records(
     conversation_response_id: str,
     conversation_thread_id: str,
     turn_index: int,
-    records: List[Dict[str, Any]],
+    records: list[dict[str, Any]],
 ) -> int:
     """Delete-then-insert provenance rows for one response (idempotent, atomic).
 
@@ -263,7 +263,7 @@ async def insert_provenance_records(
 
         row_placeholder = "(" + ", ".join(["%s"] * len(_INSERT_COLUMNS)) + ")"
         values_clause = ", ".join([row_placeholder] * len(records))
-        params: List[Any] = []
+        params: list[Any] = []
         for record in records:
             params.extend(
                 _row_binds(
@@ -288,7 +288,7 @@ async def sync_provenance_for_response(
     conversation_response_id: str,
     conversation_thread_id: str,
     turn_index: int,
-    sse_events: Optional[List[Dict[str, Any]]],
+    sse_events: list[dict[str, Any]] | None,
 ) -> int:
     """Extract provenance from sse_events and (re)write rows for one response.
 
@@ -313,7 +313,7 @@ async def sync_provenance_for_response(
 
 async def get_provenance_for_thread(
     conversation_thread_id: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Return all provenance rows for a thread ordered by turn_index."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
