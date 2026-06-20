@@ -11,9 +11,20 @@ import { createContext, useContext } from 'react';
  *   the user can click to expand into MarketView.
  * - MarketView (`chartPresent: true`): the real chart already shows the
  *   drawing live, so the card collapses to a one-line confirmation chip.
+ *
+ * MarketView also supplies the instance currently on screen (`activeSymbol` /
+ * `activeTimeframe`) and an `onJumpToChart` callback, so a chip describing a
+ * different ticker/timeframe than what's displayed can switch the live chart
+ * to it on click.
  */
 export interface ChartSurface {
   chartPresent: boolean;
+  /** Symbol currently shown on the adjacent live chart (MarketView only). */
+  activeSymbol?: string;
+  /** Normalized timeframe currently shown on the adjacent live chart. */
+  activeTimeframe?: string;
+  /** Switch the adjacent live chart to a symbol+timeframe (MarketView only). */
+  onJumpToChart?: (symbol: string, timeframe: string) => void;
 }
 
 export const ChartSurfaceContext = createContext<ChartSurface>({ chartPresent: false });

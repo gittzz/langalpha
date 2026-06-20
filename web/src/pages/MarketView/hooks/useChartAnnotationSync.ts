@@ -38,6 +38,9 @@ export function useChartAnnotationSync(
 
     const controller = new AbortController();
     let cancelled = false;
+    // Capture the live-mutation seq before the fetch so a stale response can't
+    // overwrite an instance a concurrent SSE add/remove/clear changed meanwhile.
+    const seqAtStart = chartAnnotationStore.getMutationSeq();
 
     (async () => {
       try {
@@ -50,6 +53,7 @@ export function useChartAnnotationSync(
           workspaceId,
           symbol,
           data?.charts ?? [],
+          seqAtStart,
         );
       } catch (err: unknown) {
         const error = err as { name?: string };
@@ -69,37 +73,4 @@ export function useChartAnnotationSync(
       controller.abort();
     };
   }, [workspaceId, symbol]);
-}
-
-/**
- * Ensure the user's Flash workspace exists and return its id. Cached in
- * module scope so a successful call happens once per session. A failed
- * call clears the cache so the next caller retries instead of the
- * session being permanently stuck on a null id.
- */
-let flashWorkspaceIdPromise: Promise<string | null> | null = null;
-
-export function getOrFetchFlashWorkspaceId(): Promise<string | null> {
-  if (flashWorkspaceIdPromise) return flashWorkspaceIdPromise;
-  const pending = (async () => {
-    try {
-      const { data } = await api.post<{ workspace_id: string }>(
-        '/api/v1/workspaces/flash',
-      );
-      const id = data?.workspace_id ?? null;
-      if (!id) {
-        // Empty response — treat as failure so we retry next time.
-        flashWorkspaceIdPromise = null;
-      }
-      return id;
-    } catch (err) {
-      if (import.meta.env.DEV) {
-        console.warn('[chart-annotation] flash workspace lookup failed', err);
-      }
-      flashWorkspaceIdPromise = null;
-      return null;
-    }
-  })();
-  flashWorkspaceIdPromise = pending;
-  return pending;
 }

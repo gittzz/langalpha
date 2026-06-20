@@ -161,9 +161,27 @@ function roundRectPath(
   ctx.closePath();
 }
 
-function chipWidth(ctx: CanvasRenderingContext2D, text: string): number {
+// CHIP_FONT is a module constant, so a given text always measures to the same
+// width. Cache measured text widths so we don't re-run measureText for every
+// label on every paint (every tick/pan/zoom). Capped to bound memory across
+// many distinct labels; on overflow we clear wholesale (cheaper than LRU and
+// the cost is one re-measure pass, which is what we were paying every frame
+// before this cache existed).
+const TEXT_WIDTH_CACHE_MAX = 512;
+const textWidthCache = new Map<string, number>();
+
+function measureTextWidth(ctx: CanvasRenderingContext2D, text: string): number {
+  const cached = textWidthCache.get(text);
+  if (cached !== undefined) return cached;
   ctx.font = CHIP_FONT;
-  return CHIP_PAD_X * 2 + DOT_R * 2 + DOT_GAP + ctx.measureText(text).width;
+  const width = ctx.measureText(text).width;
+  if (textWidthCache.size >= TEXT_WIDTH_CACHE_MAX) textWidthCache.clear();
+  textWidthCache.set(text, width);
+  return width;
+}
+
+function chipWidth(ctx: CanvasRenderingContext2D, text: string): number {
+  return CHIP_PAD_X * 2 + DOT_R * 2 + DOT_GAP + measureTextWidth(ctx, text);
 }
 
 /**
@@ -324,8 +342,9 @@ export class AgentAnnotationsPrimitive {
 
     target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
       const timeScale = chart.timeScale();
+      const range = getVisibleSecondsRange(chart);
       for (const r of rects) {
-        const box = rectToBox(timeScale, series, r, mediaSize.width);
+        const box = rectToBox(timeScale, series, r, mediaSize.width, range);
         if (!box) continue;
         ctx.fillStyle = withAlpha(r.color, 0.1);
         ctx.fillRect(box.left, box.top, box.width, box.height);
@@ -344,13 +363,14 @@ export class AgentAnnotationsPrimitive {
 
     target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
       const timeScale = chart.timeScale();
+      const range = getVisibleSecondsRange(chart);
       // All labels are collected, then placed + drawn last, so chips sit above
       // every stroke and a single declutter pass keeps them from colliding.
       const labels: LabelReq[] = [];
 
       // Rectangle borders (fills are drawn in the bottom pane view).
       for (const r of rects) {
-        const box = rectToBox(timeScale, series, r, mediaSize.width);
+        const box = rectToBox(timeScale, series, r, mediaSize.width, range);
         if (!box) continue;
         ctx.save();
         ctx.strokeStyle = withAlpha(r.color, 0.7);
@@ -394,8 +414,12 @@ export class AgentAnnotationsPrimitive {
 
       // Fibonacci retracement levels.
       for (const f of fibs) {
+        if (!range) continue;
         const x1 = timeScale.timeToCoordinate(f.time1 as unknown as Time);
         const x2 = timeScale.timeToCoordinate(f.time2 as unknown as Time);
+        // Both anchors off-screen on the same side would clamp to a phantom
+        // full-pane line; skip those (opposite-side straddles still span below).
+        if (shouldSkipOffscreenSpan(range, x1, f.time1, x2, f.time2)) continue;
         const left = Math.min(x1 ?? 0, x2 ?? mediaSize.width);
         const right = Math.max(x1 ?? 0, x2 ?? mediaSize.width);
         for (const lvl of f.levels) {
@@ -452,15 +476,72 @@ interface TimeScaleLike {
   timeToCoordinate(time: Time): number | null;
 }
 
+/** Visible time range as unix-second numbers (matches stored item times). */
+export interface VisibleTimeRange {
+  from: number;
+  to: number;
+}
+
+/**
+ * Read the chart's visible time range as unix-second numbers, or null if the
+ * chart has no data. Times in this primitive are stored as unix seconds and the
+ * chart uses UTCTimestamp (numeric) times, so `from`/`to` come back numeric —
+ * mirroring how `ExtendedHoursBgPrimitive` compares them.
+ */
+function getVisibleSecondsRange(chart: IChartApiBase<Time>): VisibleTimeRange | null {
+  const range = chart.timeScale().getVisibleRange();
+  if (!range) return null;
+  const from = range.from as unknown as number;
+  const to = range.to as unknown as number;
+  if (typeof from !== 'number' || typeof to !== 'number') return null;
+  return { from, to };
+}
+
+/**
+ * Decide whether a two-anchor shape (rect / fib) should be skipped because both
+ * of its anchors lie off-screen on the SAME side of the viewport — in which case
+ * clamping each null coordinate to 0/width would paint a phantom full-pane shape.
+ *
+ * Returns true (skip) only when both anchors are off-screen AND on the same side.
+ * When the anchors straddle the viewport (one off-left, one off-right) the shape
+ * genuinely spans the pane, so we return false and let the caller draw full-width.
+ * On-screen anchors (non-null coordinate) never trigger a skip.
+ */
+export function shouldSkipOffscreenSpan(
+  range: VisibleTimeRange,
+  coordA: number | null,
+  timeA: number,
+  coordB: number | null,
+  timeB: number,
+): boolean {
+  if (coordA != null || coordB != null) return false; // at least one on-screen
+  const sideA = classifyOffscreenSide(range, timeA);
+  const sideB = classifyOffscreenSide(range, timeB);
+  // Both off-screen on the same, known side → phantom; skip.
+  return sideA !== 0 && sideA === sideB;
+}
+
+/** -1 = off-left (before `from`), +1 = off-right (after `to`), 0 = inside/unknown. */
+function classifyOffscreenSide(range: VisibleTimeRange, time: number): -1 | 0 | 1 {
+  if (time < range.from) return -1;
+  if (time > range.to) return 1;
+  return 0;
+}
+
 /** Convert a rect item to viewport-clipped pixel box, or null if undrawable. */
 function rectToBox(
   timeScale: TimeScaleLike,
   series: SeriesLike,
   r: RectItem,
   width: number,
+  range: VisibleTimeRange | null,
 ): Box | null {
+  if (!range) return null;
   const xa = timeScale.timeToCoordinate(r.time1 as unknown as Time);
   const xb = timeScale.timeToCoordinate(r.time2 as unknown as Time);
+  // Both corners off-screen on the same side would clamp to a phantom full-pane
+  // box; skip those (opposite-side straddles still draw full-width below).
+  if (shouldSkipOffscreenSpan(range, xa, r.time1, xb, r.time2)) return null;
   // Clip horizontally to the viewport when a corner is off-screen.
   const x1 = xa ?? 0;
   const x2 = xb ?? width;
@@ -475,12 +556,70 @@ function rectToBox(
   return { left, top, width: right - left, height: bottom - top };
 }
 
+// Lazily-created 2d context used only to normalize named CSS colors (e.g.
+// "tomato" → "#ff6347"). Resolution results are cached. `null` means we tried
+// and there's no usable canvas (non-DOM / jsdom without a canvas backend), so
+// we stop trying and fall back to returning named colors unchanged.
+let colorResolverCtx: CanvasRenderingContext2D | null | undefined;
+const namedColorCache = new Map<string, string | null>();
+
+function getColorResolverCtx(): CanvasRenderingContext2D | null {
+  if (colorResolverCtx !== undefined) return colorResolverCtx;
+  try {
+    if (typeof document === 'undefined') {
+      colorResolverCtx = null;
+      return null;
+    }
+    colorResolverCtx = document.createElement('canvas').getContext('2d');
+  } catch {
+    colorResolverCtx = null;
+  }
+  return colorResolverCtx;
+}
+
+/** Drop the lazily-created resolver context so it is re-acquired on next use. */
+function resetColorResolver(): void {
+  colorResolverCtx = undefined;
+}
+
 /**
- * Apply an alpha to a CSS color. Handles #rgb/#rrggbb/#rrggbbaa and
- * rgb()/rgba(); for anything else returns the color unchanged (so named
- * colors still render, just without the requested transparency).
+ * Resolve a named/unknown CSS color to a normalized form the hex/rgb fast paths
+ * can re-parse (browsers return `#rrggbb` or `rgb(...)`). Returns null when no
+ * canvas is available or the value isn't a recognized color. Cached per input.
+ */
+function resolveNamedColor(color: string): string | null {
+  const cached = namedColorCache.get(color);
+  if (cached !== undefined) return cached;
+  const ctx = getColorResolverCtx();
+  if (!ctx) {
+    namedColorCache.set(color, null);
+    return null;
+  }
+  // Setting fillStyle to an unparseable value is a no-op, so seed with a sentinel
+  // and detect rejection by the value not changing away from it.
+  const SENTINEL = '#010203';
+  ctx.fillStyle = SENTINEL;
+  ctx.fillStyle = color;
+  const normalized = ctx.fillStyle;
+  const resolved =
+    typeof normalized === 'string' && normalized.toLowerCase() !== SENTINEL
+      ? normalized
+      : null;
+  namedColorCache.set(color, resolved);
+  return resolved;
+}
+
+/**
+ * Apply an alpha to a CSS color. Handles #rgb/#rrggbb/#rrggbbaa, rgb()/rgba(),
+ * and named CSS colors (resolved via a canvas context when one is available).
+ * Falls back to returning the color unchanged only when it can't be parsed and
+ * no canvas is available to normalize it.
  */
 function withAlpha(color: string, alpha: number): string {
+  return withAlphaInner(color, alpha, true);
+}
+
+function withAlphaInner(color: string, alpha: number, allowNamed: boolean): string {
   const c = color.trim();
   if (c.startsWith('#')) {
     const hex = c.slice(1);
@@ -508,5 +647,26 @@ function withAlpha(color: string, alpha: number): string {
       return `rgba(${parts[0]},${parts[1]},${parts[2]},${alpha})`;
     }
   }
+  // Named/unknown color: normalize via canvas, then re-run the fast paths on the
+  // normalized hex/rgb. `allowNamed` guards against infinite recursion if a
+  // resolver ever returns another unparseable string.
+  if (allowNamed) {
+    const resolved = resolveNamedColor(c);
+    if (resolved && resolved !== c) {
+      return withAlphaInner(resolved, alpha, false);
+    }
+  }
   return color;
 }
+
+/**
+ * Internal helpers exposed only for unit tests. Not part of the public API —
+ * do not import from application code.
+ */
+export const __testing = {
+  chipWidth,
+  withAlpha,
+  textWidthCache,
+  namedColorCache,
+  resetColorResolver,
+};

@@ -178,12 +178,74 @@ let state: State = { byChart: {} };
 // reload re-syncs from the server and shows everything again.
 let clearedKeys: ReadonlySet<string> = new Set();
 
+// Safety valve: a long session that clears many distinct charts must not grow
+// this set without bound. Well above any realistic count of charts a user
+// hides in one session; the oldest entry is evicted past the cap (that chart
+// simply re-shows — harmless, the data is untouched).
+const MAX_CLEARED_KEYS = 200;
+
+// Monotonic counter bumped on every data mutation (add/remove/clear), plus the
+// seq of each instance's last mutation. The persistence sync captures the seq
+// before its fetch and passes it to `setChartsForSymbol`, so a stale server
+// snapshot can't clobber an instance a concurrent live add/remove/clear just
+// changed — e.g. `clear_all` racing an in-flight list must not resurrect the
+// cleared instance.
+let mutationSeq = 0;
+const keyMutatedAt = new Map<string, number>();
+
+function bumpMutation(key: string): void {
+  mutationSeq += 1;
+  keyMutatedAt.set(key, mutationSeq);
+}
+
 const listeners = new Set<() => void>();
 
 function emit(): void {
   for (const listener of listeners) {
     listener();
   }
+}
+
+/**
+ * One freshly-drawn annotation instance, broadcast on the live-add channel.
+ * Carries the resolved instance identity so a surface with a live chart can
+ * focus the drawing the agent just made.
+ */
+export interface LiveAnnotationAdd {
+  workspaceId: string;
+  chartId: string;
+  symbol: string;
+  timeframe: string;
+}
+
+// Live-add channel. Fired ONLY for a fresh SSE `add` artifact (see
+// `applyAnnotationArtifact`) — never on server re-sync (`setChartsForSymbol`)
+// or bare `add()` calls. MarketView subscribes so it can auto-focus the chart
+// on the instance the agent just drew, even when that's a different ticker /
+// timeframe than the one currently on screen.
+const liveAddListeners = new Set<(add: LiveAnnotationAdd) => void>();
+
+function emitLiveAdd(add: LiveAnnotationAdd): void {
+  for (const listener of liveAddListeners) {
+    listener(add);
+  }
+}
+
+/** Subscribe to fresh annotation draws. Returns an unsubscribe function. */
+export function subscribeLiveAnnotationAdd(
+  listener: (add: LiveAnnotationAdd) => void,
+): () => void {
+  liveAddListeners.add(listener);
+  return () => {
+    liveAddListeners.delete(listener);
+  };
+}
+
+/** Split a `{SYMBOL}:{timeframe}` chart id into its parts. */
+function parseChartId(chartId: string): { symbol: string; timeframe: string } {
+  const idx = chartId.indexOf(':');
+  if (idx < 0) return { symbol: chartId, timeframe: DEFAULT_TIMEFRAME };
+  return { symbol: chartId.slice(0, idx), timeframe: chartId.slice(idx + 1) };
 }
 
 function toUpper(symbol: string): string {
@@ -205,6 +267,11 @@ export const chartAnnotationStore = {
     return state;
   },
 
+  /** Current live-mutation sequence — capture before a sync fetch (see `setChartsForSymbol`). */
+  getMutationSeq(): number {
+    return mutationSeq;
+  },
+
   subscribe(listener: () => void): () => void {
     listeners.add(listener);
     return () => {
@@ -222,6 +289,7 @@ export const chartAnnotationStore = {
       [annotation.annotation_id]: annotation,
     };
     state = { byChart: { ...state.byChart, [key]: nextBucket } };
+    bumpMutation(key);
     emit();
   },
 
@@ -241,6 +309,7 @@ export const chartAnnotationStore = {
     }
     if (!changed) return;
     state = { byChart: { ...state.byChart, [key]: next } };
+    bumpMutation(key);
     emit();
   },
 
@@ -264,6 +333,11 @@ export const chartAnnotationStore = {
     if (clearedKeys.has(key)) return;
     const next = new Set(clearedKeys);
     next.add(key);
+    // Evict the oldest entry once past the cap (insertion-ordered Set).
+    if (next.size > MAX_CLEARED_KEYS) {
+      const oldest = next.values().next().value;
+      if (oldest !== undefined) next.delete(oldest);
+    }
     clearedKeys = next;
     emit();
   },
@@ -287,6 +361,7 @@ export const chartAnnotationStore = {
     const nextByChart = { ...state.byChart };
     delete nextByChart[key];
     state = { byChart: nextByChart };
+    bumpMutation(key);
     emit();
   },
 
@@ -315,27 +390,39 @@ export const chartAnnotationStore = {
    * dropping any local instance the server no longer has. Used by the
    * persistence sync so a reload is the source of truth for that symbol
    * without nuking other workspaces' or symbols' instances.
+   *
+   * `sinceSeq` (optional): the mutation seq captured before the sync's fetch.
+   * Any instance whose last live mutation happened *after* that seq is left as
+   * its current local state — never overwritten or resurrected — so a stale
+   * server snapshot can't undo a concurrent live add/remove/clear.
    */
   setChartsForSymbol(
     workspaceId: string,
     symbol: string,
     charts: ChartInstance[],
+    sinceSeq?: number,
   ): void {
     if (!workspaceId) return;
     const sym = toUpper(symbol);
     const prefix = `${workspaceId}${SEP}${sym}:`;
+    const isFresher = (key: string): boolean =>
+      sinceSeq != null && (keyMutatedAt.get(key) ?? 0) > sinceSeq;
     const nextByChart: Record<string, Bucket> = {};
-    // Keep everything that isn't this (workspace, symbol).
+    // Keep everything that isn't this (workspace, symbol), plus any instance of
+    // this (workspace, symbol) that a concurrent live mutation owns now.
     for (const [k, v] of Object.entries(state.byChart)) {
-      if (!k.startsWith(prefix)) nextByChart[k] = v;
+      if (!k.startsWith(prefix) || isFresher(k)) nextByChart[k] = v;
     }
-    // Install the server's instances for this (workspace, symbol).
+    // Install the server's instances for this (workspace, symbol), skipping any
+    // a concurrent live mutation changed mid-fetch (stale snapshot must not win).
     for (const chart of charts) {
+      const key = storeKey(workspaceId, chart.chart_id);
+      if (isFresher(key)) continue;
       const bucket: Bucket = {};
       for (const ann of chart.annotations ?? []) {
         bucket[ann.annotation_id] = ann;
       }
-      nextByChart[storeKey(workspaceId, chart.chart_id)] = bucket;
+      nextByChart[key] = bucket;
     }
     state = { byChart: nextByChart };
     emit();
@@ -345,6 +432,8 @@ export const chartAnnotationStore = {
   _resetForTesting(): void {
     state = { byChart: {} };
     clearedKeys = new Set();
+    mutationSeq = 0;
+    keyMutatedAt.clear();
     emit();
   },
 };
@@ -358,6 +447,16 @@ const KNOWN_ANNOTATION_TYPES: ReadonlySet<string> = new Set<AnnotationType>([
   'text',
   'event',
   'fib_retracement',
+]);
+
+// A marker with no valid shape makes lightweight-charts' setMarkers() throw,
+// which would blank the whole (shared) marker layer — earnings + grades too.
+// Reject it at the store boundary so one bad agent marker can't take them down.
+const VALID_MARKER_SHAPES: ReadonlySet<string> = new Set([
+  'arrowUp',
+  'arrowDown',
+  'circle',
+  'square',
 ]);
 
 /** Resolve the chart_id from a payload, deriving it if only symbol+tf given. */
@@ -398,11 +497,17 @@ export function applyAnnotationArtifact(
       typeof raw.annotation_id === 'string' &&
       typeof raw.symbol === 'string' &&
       typeof raw.type === 'string' &&
-      KNOWN_ANNOTATION_TYPES.has(raw.type)
+      KNOWN_ANNOTATION_TYPES.has(raw.type) &&
+      (raw.type !== 'marker' ||
+        (typeof raw.shape === 'string' && VALID_MARKER_SHAPES.has(raw.shape)))
     ) {
       chartAnnotationStore.add(workspaceId, chartId, raw as unknown as StoredAnnotation);
       // A fresh draw un-clears the instance so the new annotation is visible.
       chartAnnotationStore.restoreDisplay(workspaceId, chartId);
+      // Notify live-add subscribers so a live chart can auto-focus the
+      // instance just drawn (a different ticker/timeframe than what's shown).
+      const { symbol, timeframe } = parseChartId(chartId);
+      emitLiveAdd({ workspaceId, chartId, symbol, timeframe });
     }
   } else if (op === 'remove') {
     const ids = payload.ids as string[] | undefined;

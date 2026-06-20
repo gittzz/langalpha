@@ -16,7 +16,7 @@
   height: 7px;
   border-radius: 50%;
   transform: translate(-50%, -50%);
-  box-shadow: 0 0 0 2px var(--color-bg-base, rgba(0, 0, 0, 0.6));
+  box-shadow: 0 0 0 2px var(--color-bg-card);
   pointer-events: none;
 }
 
@@ -48,6 +48,7 @@
 }
 
 .agent-event-badge:hover,
+.agent-event-badge--open,
 .agent-event-badge[data-state='open'] {
   border-color: var(--color-accent-primary);
 }
@@ -80,6 +81,25 @@
   border-top: 1px solid var(--color-border-muted);
 }
 
+/* Coarse pointers (touch): the visible badge chrome is ~22px tall and can be
+   narrow for short titles — below the 44x44px recommended touch target. Expand
+   an invisible, centered hit overlay to >=44px in both axes so taps land
+   reliably, without growing the visible badge on any device. */
+@media (pointer: coarse) {
+  .agent-event-badge::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 100%;
+    min-width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
+    /* Behind the badge's own content but still part of the button's hit area. */
+    z-index: -1;
+  }
+}
+
 .agent-event-badge-dot {
   flex-shrink: 0;
   width: 7px;
@@ -94,6 +114,9 @@
 
 /* Detail popover (portaled to body, inherits the theme tokens). */
 .agent-event-pop.agent-event-pop {
+  /* Sit above the inline annotation card's modal (z-1030); the overlay can be
+     mounted inside that dialog, and a popover behind its own trigger is unusable. */
+  z-index: 1040;
   width: 280px;
   max-width: calc(100vw - 24px);
   padding: 12px 14px;

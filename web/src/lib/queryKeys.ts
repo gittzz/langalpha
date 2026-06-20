@@ -62,4 +62,8 @@ export const queryKeys = {
     // Effective per-workspace server list (builtins + workspace servers).
     workspace: (wsId: string) => [...queryKeys.mcp.all, 'workspace', wsId],
   },
+  marketData: {
+    all:  ['marketData'],
+    bars: (symbol: string, interval: string) => [...queryKeys.marketData.all, 'bars', symbol, interval],
+  },
 };

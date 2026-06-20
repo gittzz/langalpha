@@ -1172,6 +1172,7 @@
       "sector-overviewDesc": "Industry landscape report: market size, competitive dynamics, company profiles, valuation context",
       "competitive-analysisDesc": "Competitive landscape analysis: positioning, scorecards, moat assessment, market share trends",
       "initiating-coverageDesc": "Full equity research initiation: company research, financial model, valuation, charts, 30-50 page report",
+      "chart-annotationDesc": "Annotate a price chart: price lines, trendlines, zones, and event markers, live on MarketView or as a clickable preview card",
       "report-issueDesc": "Report issues and propose fixes to improve agent capabilities"
     },
     "compactedNotification": "Context compacted · {{from}} messages → summary",
@@ -1253,6 +1254,26 @@
     "a11y": {
       "toolCallCompleted": "completed",
       "toolCallFailed": "failed"
+    },
+    "chartAnnotationCard": {
+      "openAnnotatedChart": "Open annotated chart",
+      "openInMarketView": "Open in MarketView",
+      "loadingChart": "Loading chart…",
+      "previewUnavailable": "Preview unavailable",
+      "close": "Close",
+      "cardAria_one": "{{symbol}} {{timeframe}}, {{count}} annotation. Open annotated chart.",
+      "cardAria_other": "{{symbol}} {{timeframe}}, {{count}} annotations. Open annotated chart.",
+      "dialogTitle_one": "{{symbol}} {{timeframe}} — {{count}} annotation",
+      "dialogTitle_other": "{{symbol}} {{timeframe}} — {{count}} annotations",
+      "chipJumpTitle": "Switch the chart to {{symbol}} · {{timeframe}} to show these annotations",
+      "chipShowTitle": "Show these annotations on the chart",
+      "chipShownTitle": "Shown on the chart",
+      "chipViewCount_one": "View {{count}} annotation on chart",
+      "chipViewCount_other": "View {{count}} annotations on chart",
+      "chipShowCount_one": "Show {{count}} annotation on chart",
+      "chipShowCount_other": "Show {{count}} annotations on chart",
+      "chipShownCount_one": "{{count}} annotation on chart",
+      "chipShownCount_other": "{{count}} annotations on chart"
     }
   },
   "context": {
@@ -2090,7 +2111,13 @@
       "noWorkspacePrompt": "No workspace selected. Pick one in the chat input.",
       "startConversation": "Start a conversation by typing a message below",
       "defaultPlaceholder": "What would you like to know?",
-      "returnToChat": "Return to Chat"
+      "returnToChat": "Return to Chat",
+      "openInChat": "Open in Chat"
+    },
+    "chart": {
+      "clearAnnotations": "Clear",
+      "clearAnnotationsTitle": "Clear annotations from the chart (kept in chat — click the artifact to restore)",
+      "newsEventAria": "News event: {{title}}"
     }
   },
   "onboarding": {

@@ -123,6 +123,49 @@ export function isEvent(a: StoredAnnotation): a is EventAnnotation {
   return a.type === 'event';
 }
 
+// --- Compact visual summary -----------------------------------------------
+
+export interface AnnotationVisual {
+  /** Display label — the agent's label/text/title, or a per-type fallback. */
+  label: string;
+  /** Accent color — the agent's color, or the per-type default. */
+  color: string;
+  /** Human-readable kind ("Price line", "Trendline", …). */
+  kind: string;
+  /** Optional value detail ("$317.40"); empty when not applicable. */
+  detail: string;
+}
+
+function formatPrice(n: number): string {
+  if (!Number.isFinite(n)) return '';
+  return `$${n.toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+}
+
+/**
+ * Resolve one annotation to label / color / kind / detail for compact UIs —
+ * the chat card's legend, swatches and schematic thumbnail. Pure; mirrors the
+ * per-type default colors used when the agent omits one.
+ */
+export function describeAnnotationVisual(a: StoredAnnotation): AnnotationVisual {
+  if (isPriceLine(a))
+    return { label: a.label || 'Price line', color: a.color || DEFAULT_LINE_COLOR, kind: 'Price line', detail: formatPrice(a.price) };
+  if (isTrendline(a))
+    return { label: a.label || 'Trendline', color: a.color || DEFAULT_TRENDLINE_COLOR, kind: 'Trendline', detail: '' };
+  if (isMarker(a))
+    return { label: a.text || 'Marker', color: a.color || DEFAULT_MARKER_COLOR, kind: 'Marker', detail: '' };
+  if (isVerticalLine(a))
+    return { label: a.label || 'Time marker', color: a.color || DEFAULT_VLINE_COLOR, kind: 'Vertical line', detail: '' };
+  if (isRectangle(a))
+    return { label: a.label || 'Zone', color: a.color || DEFAULT_RECT_COLOR, kind: 'Zone', detail: '' };
+  if (isText(a))
+    return { label: a.text || 'Note', color: a.color || DEFAULT_TEXT_COLOR, kind: 'Note', detail: '' };
+  if (isEvent(a))
+    return { label: a.title || 'Event', color: a.color || DEFAULT_EVENT_COLOR, kind: 'Event', detail: '' };
+  if (isFib(a))
+    return { label: a.label || 'Fib retracement', color: a.color || DEFAULT_FIB_COLOR, kind: 'Fib retracement', detail: '' };
+  return { label: 'Annotation', color: DEFAULT_LINE_COLOR, kind: 'Annotation', detail: '' };
+}
+
 /**
  * Two-point line data for a trendline, snapped to bars when possible.
  *
@@ -134,6 +177,9 @@ export function resolveTrendlineData(
   ann: TrendlineAnnotation,
   chartData: ChartDataPoint[] | null,
 ): { time: Time; value: number }[] | null {
+  // Defensive: stored payloads come from agent-generated JSONB; a row missing
+  // its anchor points would otherwise throw on the .time deref below.
+  if (!ann.point1 || !ann.point2) return null;
   const t1 = toUnixSeconds(ann.point1.time);
   const t2 = toUnixSeconds(ann.point2.time);
   if (t1 == null || t2 == null) return null;
@@ -185,6 +231,7 @@ export function buildPrimitiveData(
 
   for (const ann of annotations) {
     if (isRectangle(ann)) {
+      if (!ann.point1 || !ann.point2) continue;
       const t1 = resolveBarTime(chartData, ann.point1.time);
       const t2 = resolveBarTime(chartData, ann.point2.time);
       if (t1 == null || t2 == null) continue;
@@ -215,6 +262,7 @@ export function buildPrimitiveData(
         color: ann.color ?? DEFAULT_TEXT_COLOR,
       });
     } else if (isFib(ann)) {
+      if (!ann.point1 || !ann.point2) continue;
       const t1 = resolveBarTime(chartData, ann.point1.time);
       const t2 = resolveBarTime(chartData, ann.point2.time);
       if (t1 == null || t2 == null) continue;
@@ -242,6 +290,7 @@ export function buildPrimitiveData(
         color: ann.color ?? DEFAULT_EVENT_COLOR,
       });
     } else if (isTrendline(ann) && ann.label) {
+      if (!ann.point1 || !ann.point2) continue;
       // The line itself is drawn natively (addLineSeries); only its label
       // becomes a chip, anchored at the chronologically-later endpoint so it
       // sits at the end of the drawn line instead of stranded on the price
@@ -315,7 +364,7 @@ export function buildMarkers(
     markers.push({
       time: snapped as Time,
       position: ann.position ?? 'aboveBar',
-      shape: ann.shape === 'circle' || ann.shape === 'square' ? 'circle' : ann.shape,
+      shape: ann.shape,
       color: ann.color ?? DEFAULT_MARKER_COLOR,
       text: ann.text ?? '',
     });

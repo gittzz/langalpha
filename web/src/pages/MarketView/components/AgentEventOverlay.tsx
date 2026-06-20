@@ -23,9 +23,15 @@ import React, {
   useState,
   type RefObject,
 } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts';
 
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import {
+  Popover,
+  PopoverAnchor,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
 import type { ChartDataPoint } from '@/types/market';
 
 import { useAnnotationsForView } from '../stores/chartAnnotationStore';
@@ -70,6 +76,7 @@ interface EventBadgeProps {
 
 /** One news badge + its hover/tap detail popover. */
 function EventBadge({ ev, hoverCapable }: EventBadgeProps): React.ReactElement {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const closeTimer = useRef<number | null>(null);
 
@@ -79,21 +86,26 @@ function EventBadge({ ev, hoverCapable }: EventBadgeProps): React.ReactElement {
       closeTimer.current = null;
     }
   }, []);
+  const openNow = useCallback(() => {
+    clearClose();
+    setOpen(true);
+  }, [clearClose]);
   const scheduleClose = useCallback(() => {
     clearClose();
     closeTimer.current = window.setTimeout(() => setOpen(false), HOVER_CLOSE_MS);
   }, [clearClose]);
   useEffect(() => clearClose, [clearClose]);
 
-  // Hover handlers only on hover-capable devices; touch falls back to the
-  // trigger's native click toggle (Radix calls onOpenChange on tap).
-  const triggerHover = hoverCapable
+  // Hover-capable devices: open on hover/focus and anchor the popover (no
+  // click trigger, so a click can't toggle it shut right after pointerenter
+  // opened it). Touch devices: a Trigger so a tap toggles the detail.
+  const Mount = hoverCapable ? PopoverAnchor : PopoverTrigger;
+  const hoverProps = hoverCapable
     ? {
-        onPointerEnter: () => {
-          clearClose();
-          setOpen(true);
-        },
+        onPointerEnter: openNow,
         onPointerLeave: scheduleClose,
+        onFocus: openNow,
+        onBlur: scheduleClose,
       }
     : {};
   const contentHover = hoverCapable
@@ -110,18 +122,18 @@ function EventBadge({ ev, hoverCapable }: EventBadgeProps): React.ReactElement {
         setOpen(o);
       }}
     >
-      <PopoverTrigger asChild>
+      <Mount asChild>
         <button
           type="button"
-          className={`agent-event-badge${ev.below ? ' agent-event-badge--below' : ''}`}
+          className={`agent-event-badge${ev.below ? ' agent-event-badge--below' : ''}${open ? ' agent-event-badge--open' : ''}`}
           style={{ left: `${ev.x}px`, top: `${ev.y}px` }}
-          aria-label={`News event: ${ev.title}`}
-          {...triggerHover}
+          aria-label={t('marketView.chart.newsEventAria', { title: ev.title })}
+          {...hoverProps}
         >
           <span className="agent-event-badge-dot" style={{ background: ev.color }} />
           <span className="agent-event-badge-title">{ev.title}</span>
         </button>
-      </PopoverTrigger>
+      </Mount>
       <PopoverContent
         side={side}
         align="center"
@@ -223,7 +235,20 @@ export function AgentEventOverlay({
     } catch {
       return;
     }
-    const onRange = () => recompute();
+    // Coalesce pan/zoom + resize repositioning into one reposition per frame.
+    // lightweight-charts fires the range-change handler many times per drag; a
+    // synchronous setPlaced() on each tick thrashes React (re-rendering every
+    // badge + its Radix popover). Batch them through a single rAF instead.
+    let scheduled = 0;
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = requestAnimationFrame(() => {
+        scheduled = 0;
+        recompute();
+      });
+    };
+
+    const onRange = () => schedule();
     try {
       timeScale.subscribeVisibleLogicalRangeChange(onRange);
     } catch {
@@ -233,7 +258,7 @@ export function AgentEventOverlay({
     let ro: ResizeObserver | null = null;
     const host = hostRef.current;
     if (host && typeof ResizeObserver !== 'undefined') {
-      ro = new ResizeObserver(() => recompute());
+      ro = new ResizeObserver(() => schedule());
       ro.observe(host);
     }
     const raf = requestAnimationFrame(() => recompute());
@@ -246,6 +271,7 @@ export function AgentEventOverlay({
       }
       ro?.disconnect();
       cancelAnimationFrame(raf);
+      if (scheduled) cancelAnimationFrame(scheduled);
     };
   }, [recompute, symbol, theme, visible, events, chartData, chartRef]);
 

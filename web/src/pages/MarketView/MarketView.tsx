@@ -23,11 +23,10 @@ import { loadPref, savePref } from './utils/prefs';
 import { useIsMobile } from '@/hooks/useIsMobile';
 
 import { useStockData } from './hooks/useStockData';
-import {
-  useChartAnnotationSync,
-  getOrFetchFlashWorkspaceId,
-} from './hooks/useChartAnnotationSync';
-import { normalizeTimeframe } from './stores/chartAnnotationStore';
+import { useChartAnnotationSync } from './hooks/useChartAnnotationSync';
+import { getOrFetchFlashWorkspaceId } from './utils/flashWorkspace';
+import { marketViewAnnotationContext } from './constants/annotationPrompt';
+import { normalizeTimeframe, subscribeLiveAnnotationAdd } from './stores/chartAnnotationStore';
 
 interface SearchResult {
   name?: string;
@@ -210,6 +209,36 @@ function MarketViewInner() {
   const activeWorkspaceId = mode === 'fast' ? flashWorkspaceId : selectedWorkspaceId;
   useChartAnnotationSync(activeWorkspaceId, selectedStock);
 
+  // Switch the chart to a given instance — used by the live-add auto-focus
+  // below and by an annotation chip that jumps to a different ticker.
+  const handleJumpToChart = useCallback((symbol: string, timeframe?: string | null) => {
+    const sym = (symbol || '').trim().toUpperCase();
+    if (!sym) return;
+    if (sym !== selectedStock) {
+      setSelectedStock(sym);
+      setSelectedStockDisplay(null);
+      setChartMeta(null);
+      setShowOverview(false);
+    }
+    if (timeframe) {
+      const tf = normalizeTimeframe(timeframe);
+      setSelectedInterval((cur) => (cur === tf ? cur : tf));
+    }
+  }, [selectedStock]);
+
+  // Auto-apply: when the agent draws an annotation from the chat panel on a
+  // different instance than what's on screen (e.g. the user asks to mark GOOGL
+  // while viewing AAPL), bring the chart to that symbol+timeframe so the new
+  // drawing is actually visible instead of silently landing off-screen. Scoped
+  // to the active workspace's live draws (the store's live-add channel only
+  // fires for fresh SSE adds, not server re-sync).
+  useEffect(() => {
+    return subscribeLiveAnnotationAdd((add) => {
+      if (!activeWorkspaceId || add.workspaceId !== activeWorkspaceId) return;
+      handleJumpToChart(add.symbol, add.timeframe);
+    });
+  }, [activeWorkspaceId, handleJumpToChart]);
+
   // Chat return path — captured from URL when navigating from chat DetailPanel
   const [chatReturnPath, setChatReturnPath] = useState<string | null>(null);
 
@@ -383,9 +412,7 @@ function MarketViewInner() {
       {
         type: 'skills',
         name: 'chart-annotation',
-        instruction: sym
-          ? `The user is viewing the ${sym} chart on the ${tf} timeframe in MarketView. When they ask to annotate or draw on "the chart", pass symbol="${sym}" and timeframe="${tf}" unless they name another ticker or interval.`
-          : undefined,
+        instruction: sym ? marketViewAnnotationContext(sym, tf) : undefined,
       },
     ];
     if (chartImage) {
@@ -715,6 +742,7 @@ function MarketViewInner() {
                   onNavigateSubagent={(tid, taskId) => navigate(`/chat/t/${tid}/${taskId}`)}
                   placeholder="What would you like to know?"
                   onReturnToChat={chatReturnPath ? () => navigate(chatReturnPath) : undefined}
+                  onJumpToChart={handleJumpToChart}
                 />
               </div>
             </div>

@@ -65,6 +65,13 @@ type OverlayMarker = {
   text?: string;
 };
 
+const VALID_MARKER_SHAPES: ReadonlySet<string> = new Set([
+  'arrowUp',
+  'arrowDown',
+  'circle',
+  'square',
+]);
+
 /**
  * Manages series markers on the candlestick series.
  * Combines earnings surprises, analyst grade changes, and caller-supplied
@@ -137,11 +144,18 @@ export function useChartOverlays(
       markers.push(...extraMarkers);
     }
 
+    // Drop any marker without a valid shape/time. setMarkers replaces the whole
+    // list and throws on a malformed entry, so one bad agent marker would
+    // otherwise blank every marker here — earnings and grades included.
+    const safeMarkers = markers.filter(
+      (m) => VALID_MARKER_SHAPES.has(m.shape) && Number.isFinite(m.time as number),
+    );
+
     // Sort markers by time (required by lightweight-charts)
-    markers.sort((a, b) => (a.time as number) - (b.time as number));
+    safeMarkers.sort((a, b) => (a.time as number) - (b.time as number));
 
     try {
-      series.setMarkers(markers);
+      series.setMarkers(safeMarkers);
     } catch (_) {
       /* series may be disposed */
     }

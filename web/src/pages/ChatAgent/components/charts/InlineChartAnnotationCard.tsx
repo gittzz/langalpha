@@ -2,91 +2,107 @@
  * Inline preview for an agent ``chart_annotation`` artifact in the chat
  * transcript.
  *
- * On the standalone ChatAgent page there is no chart, so this renders a live
- * lightweight-charts mini candlestick with the annotations drawn on it; the
- * card expands into MarketView (carrying symbol + thread + workspace so the
- * conversation continues there). Inside the MarketView desktop panel the real
- * chart already shows the drawing live, so the card collapses to a one-line
- * confirmation chip (see ChartSurfaceContext).
+ * Two-stage on the standalone ChatAgent page (no live chart present):
+ *   1. a full-bleed "spotlight" card — the symbol's real (clean) price chart;
+ *      ticker, latest price, window change and an annotation legend float over
+ *      soft scrims, all from the same bars (annotations are listed, not drawn);
+ *   2. clicking opens a roomy modal with the full interactive chart (candles,
+ *      MA, volume, RSI, the annotations) plus a button to open it in MarketView.
+ *
+ * Inside the MarketView desktop panel the real chart already shows the drawing
+ * live, so the card collapses to a one-line confirmation chip (see
+ * ChartSurfaceContext).
  */
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { createChart, ColorType, CrosshairMode, LineStyle } from 'lightweight-charts';
-import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts';
-import { LineChart, ExternalLink, Check } from 'lucide-react';
+import * as DialogPrimitive from '@radix-ui/react-dialog';
+import { LineChart, ExternalLink, Check, ArrowRight, X } from 'lucide-react';
 
-import type { ChartDataPoint } from '@/types/market';
-import { fetchStockData } from '@/pages/MarketView/utils/api';
+import {
+  Dialog,
+  DialogOverlay,
+  DialogPortal,
+  DialogClose,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { useIsMobile } from '@/hooks/useIsMobile';
 import type { StoredAnnotation } from '@/pages/MarketView/stores/chartAnnotationStore';
 import {
   chartAnnotationStore,
   makeChartId,
   useDisplayCleared,
 } from '@/pages/MarketView/stores/chartAnnotationStore';
-import { AgentAnnotationsPrimitive } from '@/pages/MarketView/utils/agentAnnotationsPrimitive';
-import {
-  DEFAULT_LINE_COLOR,
-  DEFAULT_TRENDLINE_COLOR,
-  buildMarkers,
-  buildPrimitiveData,
-  isPriceLine,
-  isTrendline,
-  resolveTrendlineData,
-  styleToLwc,
-  toUnixSeconds,
-} from '@/pages/MarketView/utils/annotationGeometry';
+import { useStockBars } from '@/pages/MarketView/hooks/useStockBars';
+import { AUTO_FIT_BARS } from '@/pages/MarketView/utils/chartConstants';
+import { describeAnnotationVisual } from '@/pages/MarketView/utils/annotationGeometry';
 
 import { useWorkspaceId } from '../../contexts/WorkspaceContext';
 import { useChartSurface } from '../../contexts/ChartSurfaceContext';
+import { AnnotationPreviewChart } from './AnnotationPreviewChart';
+
+// Lazy: the surface pulls in the whole MarketView chart stack (lightweight-charts,
+// html2canvas, TradingView). Keep it out of the chat bundle until a chart opens.
+const MarketChartSurface = lazy(() =>
+  import('@/pages/MarketView/components/MarketChartSurface').then((m) => ({
+    default: m.MarketChartSurface,
+  })),
+);
 
 const CARD_BG = 'var(--color-bg-tool-card)';
 const CARD_BORDER = 'var(--color-border-muted)';
 const TEXT_COLOR = 'var(--color-text-tertiary)';
 const ACCENT = 'var(--color-accent-primary)';
-const CHART_HEIGHT = 184;
+const ACCENT_SOFT = 'var(--color-accent-soft)';
+
+// Centered overlay for the chart's loading / empty states.
+const CENTERED: React.CSSProperties = {
+  position: 'absolute',
+  inset: 0,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+};
+
+// Short label for the timeframe pill (falls back to the raw value). Keys mirror
+// the agent's `Timeframe` enum — the only timeframes a chart instance can have.
+const TF_LABEL: Record<string, string> = {
+  '1min': '1m',
+  '5min': '5m',
+  '15min': '15m',
+  '30min': '30m',
+  '1hour': '1H',
+  '4hour': '4H',
+  '1day': '1D',
+};
+
+// Translucent chrome that floats over the chart (theme-aware via color-mix).
+const GLASS_BG = 'color-mix(in srgb, var(--color-bg-tool-card) 62%, transparent)';
+const GLASS_BORDER = 'color-mix(in srgb, var(--color-text-primary) 16%, transparent)';
+const SCRIM_TOP =
+  'linear-gradient(to bottom, color-mix(in srgb, var(--color-bg-tool-card) 92%, transparent), transparent)';
+const SCRIM_BOTTOM =
+  'linear-gradient(to top, color-mix(in srgb, var(--color-bg-tool-card) 94%, transparent), transparent)';
+
+// How many annotation chips to show in the floating legend before "+N".
+const MAX_LEGEND = 3;
 
 interface InlineChartAnnotationCardProps {
   artifact: Record<string, unknown> | null | undefined;
   onClick?: () => void;
 }
 
-/** Gather every ISO time referenced by an annotation set (for chart range). */
-function collectTimes(annotations: StoredAnnotation[]): number[] {
-  const out: number[] = [];
-  for (const a of annotations) {
-    if ('time' in a && typeof a.time === 'string') {
-      const t = toUnixSeconds(a.time);
-      if (t != null) out.push(t);
-    }
-    if ('point1' in a && 'point2' in a) {
-      const t1 = toUnixSeconds(a.point1.time);
-      const t2 = toUnixSeconds(a.point2.time);
-      if (t1 != null) out.push(t1);
-      if (t2 != null) out.push(t2);
-    }
-  }
-  return out;
-}
-
-function fmtDate(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
-}
-
-/** Resolve a chart color from a CSS variable on the element, with fallback. */
-function cssVar(el: HTMLElement, name: string, fallback: string): string {
-  const v = getComputedStyle(el).getPropertyValue(name).trim();
-  return v || fallback;
-}
-
 export function InlineChartAnnotationCard({
   artifact,
 }: InlineChartAnnotationCardProps): React.ReactElement | null {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
   const params = useParams();
   const ctxWorkspaceId = useWorkspaceId();
-  const { chartPresent } = useChartSurface();
+  const { chartPresent, activeSymbol, activeTimeframe, onJumpToChart } = useChartSurface();
+  const isMobile = useIsMobile();
 
   const symbol = ((artifact?.symbol as string) || '').toUpperCase();
   const timeframe = (artifact?.timeframe as string) || '1day';
@@ -100,15 +116,16 @@ export function InlineChartAnnotationCard({
   // Whether this instance is currently cleared from the chart (MarketView only).
   const displayCleared = useDisplayCleared(workspaceId, symbol, timeframe);
 
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const chartRef = useRef<IChartApi | null>(null);
-  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  // Stage-2 modal open state (standalone ChatAgent page only).
+  const [open, setOpen] = useState(false);
+  // Card hover drives the CTA fill (glass → accent).
+  const [hover, setHover] = useState(false);
 
-  // Stable dependency key so the chart only rebuilds when the set changes.
-  const annKey = useMemo(
-    () => annotations.map((a) => a.annotation_id).join(','),
-    [annotations],
-  );
+  // Resting-card price preview: cached bars for this symbol/timeframe. Skipped
+  // inside MarketView (chartPresent) where the card collapses to a chip.
+  const { bars, isLoading: barsLoading } = useStockBars(symbol, timeframe, {
+    enabled: !chartPresent,
+  });
 
   // Re-apply a cleared drawing to the adjacent MarketView chart.
   const handleRestore = useCallback(() => {
@@ -116,7 +133,7 @@ export function InlineChartAnnotationCard({
     chartAnnotationStore.restoreDisplay(workspaceId, makeChartId(symbol, timeframe));
   }, [workspaceId, symbol, timeframe]);
 
-  const handleExpand = useCallback(() => {
+  const handleOpenInMarketView = useCallback(() => {
     if (!symbol) return;
     const sp = new URLSearchParams();
     sp.set('symbol', symbol);
@@ -128,161 +145,53 @@ export function InlineChartAnnotationCard({
     navigate(`/market?${sp.toString()}`);
   }, [symbol, timeframe, workspaceId, threadId, location, navigate]);
 
-  // Fetch data + build the mini chart. Skipped entirely when a real chart is
-  // present (MarketView) — the chip variant renders instead.
-  useEffect(() => {
-    if (chartPresent || !symbol) return;
-    let cancelled = false;
-    const controller = new AbortController();
-    setStatus('loading');
-
-    (async () => {
-      // Range: span the annotation times (padded), else backend default.
-      const times = collectTimes(annotations);
-      let fromDate: string | undefined;
-      let toDate: string | undefined;
-      if (times.length > 0) {
-        const min = Math.min(...times);
-        const max = Math.max(...times);
-        const span = Math.max(max - min, 30 * 86400);
-        const pad = Math.round(span * 0.2);
-        fromDate = fmtDate(min - pad);
-        toDate = fmtDate(max + pad + 5 * 86400);
-      }
-
-      const result = await fetchStockData(symbol, timeframe, fromDate, toDate, {
-        signal: controller.signal,
-      });
-      if (cancelled) return;
-
-      const data = result.data as ChartDataPoint[];
-      const container = containerRef.current;
-      if (result.error || !data?.length || !container) {
-        setStatus('error');
-        return;
-      }
-
-      // Tear down a prior chart (set changed / re-render).
-      if (chartRef.current) {
-        chartRef.current.remove();
-        chartRef.current = null;
-      }
-
-      let chart: IChartApi;
-      try {
-        chart = createChart(container, {
-          layout: {
-            background: { type: ColorType.Solid, color: cssVar(container, '--color-bg-tool-card', '#0e0f12') },
-            textColor: cssVar(container, '--color-text-tertiary', '#8b8f98'),
-          },
-          autoSize: true,
-          grid: {
-            vertLines: { color: cssVar(container, '--color-border-muted', '#23262e') },
-            horzLines: { color: cssVar(container, '--color-border-muted', '#23262e') },
-          },
-          crosshair: { mode: CrosshairMode.Hidden },
-          handleScroll: false,
-          handleScale: false,
-          rightPriceScale: { borderColor: cssVar(container, '--color-border-muted', '#23262e') },
-          timeScale: {
-            borderColor: cssVar(container, '--color-border-muted', '#23262e'),
-            timeVisible: false,
-          },
-        });
-      } catch {
-        setStatus('error');
-        return;
-      }
-      chartRef.current = chart;
-
-      const upColor = cssVar(container, '--color-profit', '#0FEDBE');
-      const downColor = cssVar(container, '--color-loss', '#FF383C');
-      const series: ISeriesApi<'Candlestick'> = chart.addCandlestickSeries({
-        upColor,
-        downColor,
-        borderVisible: false,
-        wickUpColor: upColor,
-        wickDownColor: downColor,
-      });
-      series.setData(
-        data.map((d) => ({ time: d.time as Time, open: d.open, high: d.high, low: d.low, close: d.close })),
-      );
-
-      // Native annotations: price lines + trendlines.
-      for (const ann of annotations) {
-        if (isPriceLine(ann)) {
-          series.createPriceLine({
-            price: ann.price,
-            title: ann.label ?? '',
-            color: ann.color ?? DEFAULT_LINE_COLOR,
-            lineWidth: 1,
-            lineStyle: styleToLwc(ann.style),
-            axisLabelVisible: true,
-            lineVisible: true,
-          });
-        } else if (isTrendline(ann)) {
-          const lineData = resolveTrendlineData(ann, data);
-          if (!lineData) continue;
-          const ls = chart.addLineSeries({
-            color: ann.color ?? DEFAULT_TRENDLINE_COLOR,
-            lineWidth: 2,
-            lineStyle: LineStyle.Dashed,
-            lastValueVisible: false,
-            priceLineVisible: false,
-            crosshairMarkerVisible: false,
-            // Label drawn as a chip at the line end (buildPrimitiveData).
-          });
-          ls.setData(lineData);
-        }
-      }
-
-      // Markers + canvas-primitive shapes (rect / vline / text / fib).
-      const markers = buildMarkers(annotations, data);
-      if (markers.length) series.setMarkers(markers);
-      const prim = new AgentAnnotationsPrimitive();
-      series.attachPrimitive(prim);
-      prim.setTheme(
-        document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark',
-      );
-      // The inline card has no interactive overlay, so event titles render as
-      // canvas chips here (the detail is only reachable on the live chart).
-      prim.setData(buildPrimitiveData(annotations, data, { eventsAsText: true }));
-
-      chart.timeScale().fitContent();
-      setStatus('ready');
-    })();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-      if (chartRef.current) {
-        chartRef.current.remove();
-        chartRef.current = null;
-      }
-    };
-  }, [chartPresent, symbol, timeframe, annKey, annotations]);
-
   if (!artifact || !symbol) return null;
 
   const count = annotations.length;
-  const countLabel = `${count} annotation${count === 1 ? '' : 's'}`;
 
   // Inside MarketView: the real chart shows the drawing — collapse to a chip.
-  // The chip is clickable: when the user has cleared the drawing from the chart,
-  // clicking re-applies it; otherwise it's a confirmation that it's on the chart.
+  // The chip is clickable. Three states:
+  //  - different instance than what's on screen → jump the chart to it;
+  //  - this instance but cleared from the chart → re-apply it;
+  //  - this instance and showing → a passive confirmation.
   if (chartPresent) {
+    const isActiveInstance =
+      (activeSymbol ?? '').toUpperCase() === symbol &&
+      (!activeTimeframe || activeTimeframe === timeframe);
+    const canJump = !!onJumpToChart && !isActiveInstance;
+    // Accent border invites a click whenever one would change the chart.
+    const accented = canJump || displayCleared;
+
+    const handleChipClick = (): void => {
+      if (canJump) {
+        onJumpToChart?.(symbol, timeframe);
+        // Un-clear so the drawing shows once the chart switches to it.
+        if (workspaceId) {
+          chartAnnotationStore.restoreDisplay(workspaceId, makeChartId(symbol, timeframe));
+        }
+      } else {
+        handleRestore();
+      }
+    };
+
+    const title = canJump
+      ? t('chat.chartAnnotationCard.chipJumpTitle', { symbol, timeframe })
+      : displayCleared
+        ? t('chat.chartAnnotationCard.chipShowTitle')
+        : t('chat.chartAnnotationCard.chipShownTitle');
+
     return (
       <button
         type="button"
-        onClick={handleRestore}
-        title={displayCleared ? 'Show these annotations on the chart' : 'Shown on the chart'}
+        onClick={handleChipClick}
+        title={title}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
           gap: 8,
           background: CARD_BG,
-          border: `1px solid ${displayCleared ? ACCENT : CARD_BORDER}`,
-          borderRadius: 8,
+          border: `1px solid ${accented ? ACCENT : CARD_BORDER}`,
+          borderRadius: 999,
           padding: '6px 12px',
           fontSize: 12,
           color: TEXT_COLOR,
@@ -291,95 +200,432 @@ export function InlineChartAnnotationCard({
         }}
         onMouseEnter={(e) => (e.currentTarget.style.borderColor = ACCENT)}
         onMouseLeave={(e) =>
-          (e.currentTarget.style.borderColor = displayCleared ? ACCENT : CARD_BORDER)
+          (e.currentTarget.style.borderColor = accented ? ACCENT : CARD_BORDER)
         }
       >
-        {displayCleared
+        {accented
           ? <LineChart size={14} style={{ color: ACCENT, flexShrink: 0 }} />
           : <Check size={14} style={{ color: 'var(--color-profit)', flexShrink: 0 }} />}
         <span>
           <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{symbol}</span>
           <span style={{ color: TEXT_COLOR }}>{` · ${timeframe}`}</span>
           {' · '}
-          {displayCleared ? `Show ${countLabel} on chart` : `${countLabel} on chart`}
+          {canJump
+            ? t('chat.chartAnnotationCard.chipViewCount', { count })
+            : displayCleared
+              ? t('chat.chartAnnotationCard.chipShowCount', { count })
+              : t('chat.chartAnnotationCard.chipShownCount', { count })}
         </span>
+        {canJump && <ArrowRight size={13} style={{ color: ACCENT, flexShrink: 0 }} />}
       </button>
     );
   }
 
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={handleExpand}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          handleExpand();
-        }
-      }}
-      style={{
-        background: CARD_BG,
-        border: `1px solid ${CARD_BORDER}`,
-        borderRadius: 8,
-        padding: 10,
-        cursor: 'pointer',
-        transition: 'border-color 0.15s',
-        outline: 'none',
-        userSelect: 'none',
-      }}
-      onMouseEnter={(e) => (e.currentTarget.style.borderColor = ACCENT)}
-      onMouseLeave={(e) => (e.currentTarget.style.borderColor = CARD_BORDER)}
-    >
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-        <LineChart size={15} style={{ color: ACCENT, flexShrink: 0 }} />
-        <span style={{ fontWeight: 700, color: 'var(--color-text-primary)', fontSize: 14 }}>{symbol}</span>
-        <span style={{ fontSize: 11, color: TEXT_COLOR }}>{timeframe}</span>
-        <span style={{ fontSize: 11, color: TEXT_COLOR }}>·</span>
-        <span style={{ fontSize: 11, color: TEXT_COLOR }}>{countLabel}</span>
-        <span
-          style={{
-            marginLeft: 'auto',
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 4,
-            fontSize: 11,
-            fontWeight: 600,
-            color: ACCENT,
-          }}
-        >
-          Open in MarketView
-          <ExternalLink size={12} />
-        </span>
-      </div>
+  // Render the same recent window the live chart auto-fits to (not the whole
+  // fetched history), so the header %-change and curve match what opens.
+  const fitBars = AUTO_FIT_BARS[timeframe] ?? 180;
+  const viewBars = bars.length > fitBars ? bars.slice(-fitBars) : bars;
 
-      {/* Chart / fallback */}
-      {status === 'error' ? (
-        <div style={{ fontSize: 12, color: TEXT_COLOR, padding: '12px 2px' }}>
-          Chart preview unavailable — open in MarketView to view the {countLabel}.
-        </div>
-      ) : (
-        <div style={{ position: 'relative', width: '100%', height: CHART_HEIGHT }}>
-          <div ref={containerRef} className="[&_*]:outline-none" style={{ width: '100%', height: CHART_HEIGHT }} />
-          {status === 'loading' && (
+  // Price + window change from those same bars, so the header never disagrees
+  // with the curve underneath it.
+  const lastClose = viewBars.length ? viewBars[viewBars.length - 1].close : null;
+  const firstClose = viewBars.length ? viewBars[0].close : null;
+  const pct =
+    lastClose != null && firstClose ? ((lastClose - firstClose) / firstClose) * 100 : null;
+  const up = pct == null || pct >= 0;
+  const trendColor = up ? 'var(--color-profit)' : 'var(--color-loss)';
+  const hasChart = !barsLoading && viewBars.length >= 2;
+  const plotHeight = isMobile ? 200 : 248;
+
+  // The floating legend names the real annotations (they're listed here, not
+  // drawn over the preview curve — the full set shows when the chart opens).
+  const visuals = annotations.map(describeAnnotationVisual);
+  const shownVisuals = visuals.slice(0, MAX_LEGEND);
+  const extraCount = visuals.length - shownVisuals.length;
+
+  // Stage 1 — the "spotlight" card: a clean full-bleed price chart; ticker /
+  // price float over soft scrims, an annotation legend sits bottom-left, and the
+  // CTA opens the full interactive chart (where the annotations are drawn).
+  return (
+    <>
+      <div
+        role="button"
+        tabIndex={0}
+        aria-label={t('chat.chartAnnotationCard.cardAria', { symbol, timeframe, count })}
+        onClick={() => setOpen(true)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setOpen(true);
+          }
+        }}
+        onMouseEnter={(e) => {
+          setHover(true);
+          e.currentTarget.style.borderColor = ACCENT;
+          e.currentTarget.style.transform = 'translateY(-2px)';
+          e.currentTarget.style.boxShadow =
+            '0 2px 6px rgba(0,0,0,0.06), 0 26px 50px -20px rgba(0,0,0,0.6)';
+        }}
+        onMouseLeave={(e) => {
+          setHover(false);
+          e.currentTarget.style.borderColor = CARD_BORDER;
+          e.currentTarget.style.transform = 'none';
+          e.currentTarget.style.boxShadow =
+            '0 1px 2px rgba(0,0,0,0.05), 0 16px 36px -18px rgba(0,0,0,0.5)';
+        }}
+        // Keyboard focus needs a visible ring (outline is suppressed for the
+        // rounded card). Gate on :focus-visible so a mouse click stays clean.
+        onFocus={(e) => {
+          if (!e.currentTarget.matches(':focus-visible')) return;
+          setHover(true);
+          e.currentTarget.style.borderColor = ACCENT;
+          e.currentTarget.style.transform = 'translateY(-2px)';
+          e.currentTarget.style.boxShadow =
+            `0 0 0 2px ${ACCENT}, 0 2px 6px rgba(0,0,0,0.06), 0 26px 50px -20px rgba(0,0,0,0.6)`;
+        }}
+        onBlur={(e) => {
+          setHover(false);
+          e.currentTarget.style.borderColor = CARD_BORDER;
+          e.currentTarget.style.transform = 'none';
+          e.currentTarget.style.boxShadow =
+            '0 1px 2px rgba(0,0,0,0.05), 0 16px 36px -18px rgba(0,0,0,0.5)';
+        }}
+        style={{
+          position: 'relative',
+          background: CARD_BG,
+          border: `1px solid ${CARD_BORDER}`,
+          borderRadius: 20,
+          overflow: 'hidden',
+          cursor: 'pointer',
+          outline: 'none',
+          userSelect: 'none',
+          boxShadow: '0 1px 2px rgba(0,0,0,0.05), 0 16px 36px -18px rgba(0,0,0,0.5)',
+          transition: 'border-color 0.16s, box-shadow 0.16s, transform 0.16s',
+        }}
+      >
+        {/* Full-bleed plot — the real chart, or a loading / empty fallback. */}
+        <div style={{ position: 'relative', height: plotHeight }}>
+          {barsLoading ? (
+            <div style={CENTERED}>
+              <span style={{ fontSize: 12, color: TEXT_COLOR }}>
+                {t('chat.chartAnnotationCard.loadingChart')}
+              </span>
+            </div>
+          ) : hasChart ? (
+            // Clean price line only — the legend below conveys the annotations.
+            <AnnotationPreviewChart
+              bars={viewBars}
+              trendColor={trendColor}
+              showLastPrice
+            />
+          ) : (
+            <div style={CENTERED}>
+              <span
+                style={{
+                  display: 'inline-flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  gap: 6,
+                  color: TEXT_COLOR,
+                }}
+              >
+                <LineChart size={26} style={{ opacity: 0.5 }} />
+                <span style={{ fontSize: 12 }}>
+                  {t('chat.chartAnnotationCard.previewUnavailable')}
+                </span>
+              </span>
+            </div>
+          )}
+
+          {/* Scrims keep the floating chrome legible over the chart. */}
+          {hasChart && (
+            <>
+              <div
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  height: 78,
+                  background: SCRIM_TOP,
+                  pointerEvents: 'none',
+                }}
+              />
+              <div
+                style={{
+                  position: 'absolute',
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  height: 92,
+                  background: SCRIM_BOTTOM,
+                  pointerEvents: 'none',
+                }}
+              />
+            </>
+          )}
+
+          {/* Top-left — ticker, latest price, window change. */}
+          <div
+            style={{
+              position: 'absolute',
+              top: 15,
+              left: 17,
+              display: 'flex',
+              alignItems: 'baseline',
+              gap: 9,
+              minWidth: 0,
+            }}
+          >
+            <span
+              style={{
+                fontSize: 21,
+                fontWeight: 700,
+                color: 'var(--color-text-primary)',
+                letterSpacing: '-0.01em',
+              }}
+            >
+              {symbol}
+            </span>
+            {lastClose != null && (
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+                ${lastClose.toLocaleString('en-US', {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}
+              </span>
+            )}
+            {pct != null && (
+              <span
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 3,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: trendColor,
+                }}
+              >
+                <span
+                  style={{
+                    width: 0,
+                    height: 0,
+                    borderLeft: '3.5px solid transparent',
+                    borderRight: '3.5px solid transparent',
+                    ...(up
+                      ? { borderBottom: `5px solid ${trendColor}` }
+                      : { borderTop: `5px solid ${trendColor}` }),
+                  }}
+                />
+                {pct >= 0 ? '+' : ''}
+                {pct.toFixed(2)}%
+              </span>
+            )}
+          </div>
+
+          {/* Top-right — timeframe pill. */}
+          <span
+            style={{
+              position: 'absolute',
+              top: 16,
+              right: 16,
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: '0.03em',
+              color: TEXT_COLOR,
+              background: GLASS_BG,
+              border: `1px solid ${GLASS_BORDER}`,
+              backdropFilter: 'blur(8px)',
+              padding: '4px 9px',
+              borderRadius: 7,
+            }}
+          >
+            {TF_LABEL[timeframe] ?? timeframe}
+          </span>
+
+          {/* Bottom-left — annotation legend (the real annotations). */}
+          {hasChart && shownVisuals.length > 0 && (
             <div
               style={{
                 position: 'absolute',
-                inset: 0,
+                bottom: 15,
+                left: 17,
                 display: 'flex',
+                flexWrap: 'wrap',
                 alignItems: 'center',
-                justifyContent: 'center',
-                fontSize: 12,
-                color: TEXT_COLOR,
+                gap: 14,
+                maxWidth: '62%',
               }}
             >
-              Loading chart…
+              {shownVisuals.map((v, i) => (
+                <span
+                  key={i}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    fontSize: 11.5,
+                    fontWeight: 600,
+                    color: 'var(--color-text-secondary)',
+                  }}
+                >
+                  <span
+                    style={{ width: 8, height: 8, borderRadius: 2.5, background: v.color, flexShrink: 0 }}
+                  />
+                  <span
+                    style={{
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      maxWidth: 130,
+                    }}
+                  >
+                    {v.label}
+                  </span>
+                </span>
+              ))}
+              {extraCount > 0 && (
+                <span style={{ fontSize: 11.5, fontWeight: 600, color: TEXT_COLOR }}>+{extraCount}</span>
+              )}
             </div>
           )}
+
+          {/* Bottom-right — CTA (glass → accent on hover). */}
+          <span
+            style={{
+              position: 'absolute',
+              bottom: 14,
+              right: 14,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 7,
+              fontSize: 13,
+              fontWeight: 600,
+              padding: '9px 15px',
+              borderRadius: 11,
+              backdropFilter: 'blur(8px)',
+              background: hover ? ACCENT : GLASS_BG,
+              border: `1px solid ${hover ? 'transparent' : GLASS_BORDER}`,
+              color: hover ? '#fff' : 'var(--color-text-primary)',
+              transition: 'background 0.16s, color 0.16s, border-color 0.16s',
+            }}
+          >
+            {t('chat.chartAnnotationCard.openAnnotatedChart')}
+            <ArrowRight
+              size={14}
+              style={{ transform: hover ? 'translateX(3px)' : 'none', transition: 'transform 0.16s' }}
+            />
+          </span>
         </div>
-      )}
-    </div>
+      </div>
+
+      {/* Stage 2 — the modal: a ~3/4-viewport, self-contained replica of the
+          MarketView chart surface (same header, toolbar, candles, MA, volume,
+          RSI and the agent's annotations). */}
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogPortal>
+          <DialogOverlay />
+          <DialogPrimitive.Content
+            aria-describedby={undefined}
+            className="fixed left-1/2 top-1/2 z-[1030] flex flex-col -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-xl border bg-background shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95"
+            style={{
+              width: isMobile ? '96vw' : '75vw',
+              height: isMobile ? '88vh' : '80vh',
+              maxWidth: 'none',
+              maxHeight: '94vh',
+            }}
+          >
+            <DialogTitle className="sr-only">
+              {t('chat.chartAnnotationCard.dialogTitle', { symbol, timeframe, count })}
+            </DialogTitle>
+
+            {/* Slim modal chrome — keeps the close + "Open in MarketView"
+                buttons off the chart's own header (which has the price). */}
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'flex-end',
+                gap: 8,
+                padding: '8px 10px',
+                borderBottom: `1px solid ${CARD_BORDER}`,
+                flexShrink: 0,
+              }}
+            >
+              <button
+                type="button"
+                onClick={handleOpenInMarketView}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: '6px 12px',
+                  borderRadius: 8,
+                  border: `1px solid ${CARD_BORDER}`,
+                  background: ACCENT_SOFT,
+                  color: ACCENT,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap',
+                  transition: 'border-color 0.15s',
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.borderColor = ACCENT)}
+                onMouseLeave={(e) => (e.currentTarget.style.borderColor = CARD_BORDER)}
+              >
+                {t('chat.chartAnnotationCard.openInMarketView')}
+                <ExternalLink size={13} />
+              </button>
+              <DialogClose
+                aria-label={t('chat.chartAnnotationCard.close')}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  width: 30,
+                  height: 30,
+                  borderRadius: 8,
+                  border: `1px solid ${CARD_BORDER}`,
+                  background: 'transparent',
+                  color: TEXT_COLOR,
+                  cursor: 'pointer',
+                }}
+              >
+                <X size={16} />
+              </DialogClose>
+            </div>
+
+            {/* The chart surface fills the rest — mounted only while open. */}
+            <div style={{ flex: 1, minHeight: 0 }}>
+              {open && (
+                <Suspense
+                  fallback={
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        height: '100%',
+                        fontSize: 13,
+                        color: TEXT_COLOR,
+                      }}
+                    >
+                      {t('chat.chartAnnotationCard.loadingChart')}
+                    </div>
+                  }
+                >
+                  <MarketChartSurface
+                    symbol={symbol}
+                    timeframe={timeframe}
+                    workspaceId={workspaceId ?? null}
+                  />
+                </Suspense>
+              )}
+            </div>
+          </DialogPrimitive.Content>
+        </DialogPortal>
+      </Dialog>
+    </>
   );
 }
 

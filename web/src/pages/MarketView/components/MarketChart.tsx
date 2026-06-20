@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useImperativeHandle, forwardRef, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { createChart, ColorType, CrosshairMode, PriceScaleMode, LineType, LineStyle } from 'lightweight-charts';
 import type { IChartApi, LogicalRange, MouseEventParams } from 'lightweight-charts';
 import html2canvas from 'html2canvas';
@@ -120,6 +121,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   marketStatus,
   snapshot,
 }, ref) => {
+  const { t } = useTranslation();
   const { theme } = useTheme();
   const ct = getChartTheme(theme as 'dark' | 'light');
   const providers = Array.isArray(marketStatus?.providers) ? marketStatus.providers as string[] : [];
@@ -1799,10 +1801,10 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
                   type="button"
                   className="chart-tool-btn chart-clear-annotations-btn"
                   onClick={handleClearAgentAnnotations}
-                  title="Clear annotations from the chart (kept in chat — click the artifact to restore)"
+                  title={t('marketView.chart.clearAnnotationsTitle')}
                 >
                   <X size={14} />
-                  Clear
+                  {t('marketView.chart.clearAnnotations')}
                 </button>
               )}
               {/* Tools dropdown — wide only */}

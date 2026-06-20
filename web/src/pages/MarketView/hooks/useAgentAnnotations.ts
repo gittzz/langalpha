@@ -85,6 +85,19 @@ export function useAgentAnnotations(
   const primitiveRef = useRef<AgentAnnotationsPrimitive | null>(null);
   const primitiveSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
 
+  // Cheap grid signature: bar count + first/last bar time. The geometry
+  // functions only read `chartData` to snap anchor TIMES to bar times — never
+  // the live price — so a price-only tick (same length + first/last time, new
+  // last close) yields identical output. Memoizing on this signature instead of
+  // the raw `chartData` reference skips the full rebuild on every price tick,
+  // while still recomputing when a bar is appended/backfilled or the
+  // symbol/timeframe changes (any of which moves length or first/last time).
+  const gridSig = useMemo(() => {
+    const n = chartData?.length ?? 0;
+    if (!n) return '0';
+    return `${n}:${chartData![0].time}:${chartData![n - 1].time}`;
+  }, [chartData]);
+
   useEffect(() => {
     const series = candlestickSeriesRef.current;
     const chart = chartRef.current;
@@ -180,9 +193,17 @@ export function useAgentAnnotations(
         trendlines.delete(id);
       }
     }
-  }, [annotations, applyable, symbol, chartRef, candlestickSeriesRef, chartData]);
+    // `chartData` is read inside (resolveTrendlineData) but `gridSig` is the
+    // intentional dependency — see the gridSig comment above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [annotations, applyable, symbol, chartRef, candlestickSeriesRef, gridSig]);
 
   // Canvas-primitive shapes: rectangle, vertical_line, text, fib_retracement.
+  // Memoized on `gridSig` (not the raw `chartData` ref) so a price-only tick
+  // reuses the same payload and the effect below doesn't fire `setData`.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const primitiveData = useMemo(() => buildPrimitiveData(annotations, chartData), [annotations, gridSig]);
+
   useEffect(() => {
     const series = candlestickSeriesRef.current;
     if (!series) return;
@@ -211,8 +232,8 @@ export function useAgentAnnotations(
     prim.setTheme(theme);
     // Not in Light mode → draw nothing, but keep the primitive attached so
     // toggling back re-populates from the store.
-    prim.setData(applyable ? buildPrimitiveData(annotations, chartData) : EMPTY_PRIMITIVE_DATA);
-  }, [annotations, applyable, symbol, chartRef, candlestickSeriesRef, chartData, theme]);
+    prim.setData(applyable ? primitiveData : EMPTY_PRIMITIVE_DATA);
+  }, [primitiveData, applyable, symbol, chartRef, candlestickSeriesRef, theme]);
 
   // Detach the primitive on unmount (chart teardown disposes it otherwise,
   // but a bare hook unmount should clean up after itself too).
@@ -233,8 +254,12 @@ export function useAgentAnnotations(
   }, []);
 
   // Derive marker payloads for the caller to merge with overlay markers.
+  // Memoized on `gridSig` (not the raw `chartData` ref) — markers snap to bar
+  // times only, so a price-only tick reuses the same array identity.
   return useMemo<SeriesMarker<Time>[]>(
     () => (applyable ? buildMarkers(annotations, chartData) : []),
-    [annotations, applyable, chartData],
+    // gridSig is the intentional dependency in place of the raw chartData ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [annotations, applyable, gridSig],
   );
 }
