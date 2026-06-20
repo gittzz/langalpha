@@ -25,12 +25,13 @@ from src.tools.chart_annotation.schemas import (
     Annotation,
     DrawChartAnnotationArgs,
     ManageChartAnnotationsArgs,
+    Timeframe,
 )
 
 logger = logging.getLogger(__name__)
 
 # Validates raw-dict annotation payloads against the discriminated union.
-_ANNOTATION_ADAPTER: TypeAdapter = TypeAdapter(Annotation)
+_ANNOTATION_ADAPTER = TypeAdapter(Annotation)
 
 
 # --------------------------------------------------------------------------- #
@@ -163,7 +164,7 @@ async def draw_chart_annotation(
     symbol: str,
     annotation: Any,
     config: RunnableConfig,
-    timeframe: str = "1day",
+    timeframe: Timeframe = "1day",
 ) -> tuple[str, dict]:
     """Draw on the user's stock chart.
 
@@ -277,7 +278,7 @@ async def manage_chart_annotations(
     symbol: str,
     action: str,
     config: RunnableConfig,
-    timeframe: str = "1day",
+    timeframe: Timeframe = "1day",
     ids: list[str] | None = None,
 ) -> tuple[str, dict]:
     """Inspect or delete annotations on a chart (``SYMBOL:timeframe``).

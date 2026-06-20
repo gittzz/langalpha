@@ -71,13 +71,17 @@ async def list_chart_annotations(
     workspace_id: str,
     x_user_id: CurrentUserId,
     symbol: str = Query(..., max_length=32, description="Ticker symbol (case-insensitive)"),
-    timeframe: str | None = Query(
+    timeframe: Timeframe | None = Query(
         None,
-        max_length=16,
         description="Chart interval; omit to return every timeframe for the symbol",
     ),
 ):
-    """List chart instances for a workspace + symbol (optionally one timeframe)."""
+    """List chart instances for a workspace + symbol (optionally one timeframe).
+
+    ``timeframe`` is constrained to the supported set (symmetric with DELETE): a
+    typo yields 422 rather than silently returning an empty list. Omit it to get
+    every timeframe for the symbol.
+    """
     await _ensure_owner(workspace_id, x_user_id)
     sym = _normalize_symbol(symbol)
     tf = timeframe.strip() if timeframe is not None else None
