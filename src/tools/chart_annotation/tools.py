@@ -15,7 +15,7 @@ from langchain_core.tools import tool
 from pydantic import TypeAdapter, ValidationError
 
 from src.server.database.chart_annotation import (
-    add_annotation,
+    add_and_list_annotations,
     clear_chart,
     list_annotations,
     make_chart_id,
@@ -221,8 +221,15 @@ async def draw_chart_annotation(
     # Fail-closed: persist first. If the DB write fails, we return an error
     # tuple and do NOT emit an SSE event — the user sees a clear failure in
     # chat and no ghost drawing appears on the chart.
+    # Persist the write and read back the full set in one connection checkout
+    # (autocommit → the read sees the just-written row). Fail closed on the
+    # write so no ghost drawing appears in chat or on the chart. The returned
+    # set is the chart instance's full current annotations so the inline-card
+    # artifact renders the cumulative chart, not just this one shape.
     try:
-        await add_annotation(workspace_id, chart_id, symbol_upper, timeframe, stored)
+        all_items = await add_and_list_annotations(
+            workspace_id, chart_id, symbol_upper, timeframe, stored
+        )
     except Exception as exc:
         logger.exception("[chart_annotation] persistence failed")
         return (
@@ -230,6 +237,8 @@ async def draw_chart_annotation(
             "The drawing was NOT applied. Please try again in a moment.",
             {},
         )
+    if not all_items:
+        all_items = [stored]
 
     _emit(
         _get_writer(),
@@ -245,17 +254,6 @@ async def draw_chart_annotation(
             "annotation": stored,
         },
     )
-
-    # Build the inline-card artifact for the chat transcript. Include the full
-    # current annotation set for this chart so the preview renders the
-    # cumulative annotated chart, not just this one shape. Best-effort: fall
-    # back to the single new annotation if the list read fails.
-    try:
-        all_items = await list_annotations(workspace_id, chart_id)
-    except Exception:
-        all_items = []
-    if not all_items:
-        all_items = [stored]
 
     result_artifact = {
         "type": "chart_annotation",

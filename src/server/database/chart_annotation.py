@@ -25,6 +25,56 @@ logger = logging.getLogger(__name__)
 # logged so it is never silent.
 _MAX_ANNOTATION_ROWS = 2000
 
+# Shared SQL so the single-write, single-read, and combined write+read paths
+# never drift. ``add_and_list_annotations`` runs both on ONE pooled connection:
+# autocommit makes the read see the just-upserted row, so a draw costs one
+# checkout instead of two.
+_UPSERT_SQL = """
+    INSERT INTO chart_annotations
+        (workspace_id, chart_id, symbol, timeframe, annotation_id, payload)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (workspace_id, chart_id, annotation_id)
+    DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+"""
+
+_CHART_SELECT_SQL = """
+    SELECT payload
+    FROM chart_annotations
+    WHERE workspace_id = %s AND chart_id = %s
+    ORDER BY created_at
+    LIMIT %s
+"""
+
+
+def _upsert_params(
+    workspace_id: str,
+    chart_id: str,
+    symbol: str,
+    timeframe: str,
+    annotation: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Bind tuple for ``_UPSERT_SQL`` — same NUL-stripping for every write path."""
+    return (
+        workspace_id,
+        strip_pg_nul_str(chart_id),
+        strip_pg_nul_str(symbol.upper()),
+        timeframe,
+        annotation["annotation_id"],
+        SafeJson(annotation),
+    )
+
+
+def _warn_if_capped(row_count: int, workspace_id: str, chart_id: str) -> None:
+    """Log (never silently) when a chart-scoped read hit the row cap."""
+    if row_count >= _MAX_ANNOTATION_ROWS:
+        logger.warning(
+            "[chart_annotation] chart read hit the %d-row cap "
+            "(workspace=%s chart=%s); some annotations were not returned",
+            _MAX_ANNOTATION_ROWS,
+            workspace_id,
+            chart_id,
+        )
+
 
 def make_chart_id(symbol: str, timeframe: str) -> str:
     """Disclosed instance key: ``{SYMBOL}:{timeframe}`` (uppercased ticker)."""
@@ -42,25 +92,11 @@ async def add_annotation(
 
     Raises on any DB failure so the caller can stay fail-closed.
     """
-    annotation_id = annotation["annotation_id"]
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                """
-                INSERT INTO chart_annotations
-                    (workspace_id, chart_id, symbol, timeframe, annotation_id, payload)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (workspace_id, chart_id, annotation_id)
-                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
-                """,
-                (
-                    workspace_id,
-                    strip_pg_nul_str(chart_id),
-                    strip_pg_nul_str(symbol.upper()),
-                    timeframe,
-                    annotation_id,
-                    SafeJson(annotation),
-                ),
+                _UPSERT_SQL,
+                _upsert_params(workspace_id, chart_id, symbol, timeframe, annotation),
             )
 
 
@@ -69,24 +105,46 @@ async def list_annotations(workspace_id: str, chart_id: str) -> list[dict[str, A
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
-                SELECT payload
-                FROM chart_annotations
-                WHERE workspace_id = %s AND chart_id = %s
-                ORDER BY created_at
-                LIMIT %s
-                """,
+                _CHART_SELECT_SQL,
                 (workspace_id, chart_id, _MAX_ANNOTATION_ROWS),
             )
             rows = await cur.fetchall()
-    if len(rows) >= _MAX_ANNOTATION_ROWS:
-        logger.warning(
-            "[chart_annotation] list_annotations hit the %d-row cap "
-            "(workspace=%s chart=%s); some annotations were not returned",
-            _MAX_ANNOTATION_ROWS,
-            workspace_id,
-            chart_id,
-        )
+    _warn_if_capped(len(rows), workspace_id, chart_id)
+    return [row["payload"] for row in rows]
+
+
+async def add_and_list_annotations(
+    workspace_id: str,
+    chart_id: str,
+    symbol: str,
+    timeframe: str,
+    annotation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Upsert one annotation and return the instance's full set, oldest first.
+
+    Write and read share one pooled connection (autocommit, so the read sees the
+    just-written row) — one checkout per draw instead of two. Raises on the write
+    so the caller stays fail-closed; the read-back is best-effort and falls back
+    to the just-written annotation so a transient read error can't mask a
+    successful write.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                _UPSERT_SQL,
+                _upsert_params(workspace_id, chart_id, symbol, timeframe, annotation),
+            )
+        try:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    _CHART_SELECT_SQL,
+                    (workspace_id, chart_id, _MAX_ANNOTATION_ROWS),
+                )
+                rows = await cur.fetchall()
+        except Exception:
+            logger.exception("[chart_annotation] read-back after upsert failed")
+            return [annotation]
+    _warn_if_capped(len(rows), workspace_id, chart_id)
     return [row["payload"] for row in rows]
 
 

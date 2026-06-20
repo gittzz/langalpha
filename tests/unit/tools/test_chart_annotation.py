@@ -74,6 +74,14 @@ class FakeChartDB:
     async def list_annotations(self, workspace_id, chart_id):
         return list(self.instances.get((workspace_id, chart_id), {}).values())
 
+    async def add_and_list_annotations(
+        self, workspace_id, chart_id, symbol, timeframe, annotation
+    ):
+        # Mirrors the real combined write+read: the add raises on fail_on_add,
+        # so the fail-closed path stays exercised.
+        await self.add_annotation(workspace_id, chart_id, symbol, timeframe, annotation)
+        return await self.list_annotations(workspace_id, chart_id)
+
     async def remove_annotations(self, workspace_id, chart_id, ids):
         bucket = self.instances.get((workspace_id, chart_id), {})
         removed = 0
@@ -94,7 +102,10 @@ class FakeChartDB:
 def _patch_db(db: FakeChartDB):
     """Patch the DB functions the tool module imported with the fake's methods."""
     return (
-        patch("src.tools.chart_annotation.tools.add_annotation", db.add_annotation),
+        patch(
+            "src.tools.chart_annotation.tools.add_and_list_annotations",
+            db.add_and_list_annotations,
+        ),
         patch("src.tools.chart_annotation.tools.list_annotations", db.list_annotations),
         patch("src.tools.chart_annotation.tools.remove_annotations", db.remove_annotations),
         patch("src.tools.chart_annotation.tools.clear_chart", db.clear_chart),
