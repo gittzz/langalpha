@@ -230,10 +230,10 @@ async def draw_chart_annotation(
         all_items = await add_and_list_annotations(
             workspace_id, chart_id, symbol_upper, timeframe, stored
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("[chart_annotation] persistence failed")
         return (
-            f"Could not save annotation (persistence unavailable): {exc}. "
+            "Could not save annotation (persistence unavailable). "
             "The drawing was NOT applied. Please try again in a moment.",
             {},
         )
@@ -306,10 +306,10 @@ async def manage_chart_annotations(
             return "Error: 'list' action does not accept 'ids'.", {}
         try:
             items = await list_annotations(workspace_id, chart_id)
-        except Exception as exc:
+        except Exception:
             logger.exception("[chart_annotation] list failed")
             return (
-                f"Could not list annotations (persistence unavailable): {exc}. "
+                "Could not list annotations (persistence unavailable). "
                 "Please try again in a moment.",
                 {},
             )
@@ -329,10 +329,10 @@ async def manage_chart_annotations(
             )
         try:
             removed = await remove_annotations(workspace_id, chart_id, ids)
-        except Exception as exc:
+        except Exception:
             logger.exception("[chart_annotation] remove failed")
             return (
-                f"Could not remove annotations (persistence unavailable): {exc}. "
+                "Could not remove annotations (persistence unavailable). "
                 "Nothing was deleted. Please try again in a moment.",
                 {},
             )
@@ -356,10 +356,10 @@ async def manage_chart_annotations(
             )
         try:
             cleared = await clear_chart(workspace_id, chart_id)
-        except Exception as exc:
+        except Exception:
             logger.exception("[chart_annotation] clear failed")
             return (
-                f"Could not clear annotations (persistence unavailable): {exc}. "
+                "Could not clear annotations (persistence unavailable). "
                 "Nothing was deleted. Please try again in a moment.",
                 {},
             )
