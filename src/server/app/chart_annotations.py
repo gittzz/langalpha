@@ -25,6 +25,7 @@ from src.server.database.chart_annotation import (
 )
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.utils.api import CurrentUserId, require_workspace_owner
+from src.tools.chart_annotation.schemas import Timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +96,14 @@ async def clear_chart_annotations(
     workspace_id: str,
     x_user_id: CurrentUserId,
     symbol: str = Query(..., max_length=32, description="Ticker symbol (case-insensitive)"),
-    timeframe: str = Query("1day", max_length=16, description="Chart interval"),
+    timeframe: Timeframe = Query("1day", description="Chart interval"),
 ):
-    """Delete every annotation on one chart instance (workspace + symbol + timeframe)."""
+    """Delete every annotation on one chart instance (workspace + symbol + timeframe).
+
+    ``timeframe`` is constrained to the supported set (it is part of the chart
+    identity, unlike the GET filter) so a typo yields 422 rather than a silent
+    no-op delete.
+    """
     await _ensure_owner(workspace_id, x_user_id)
     sym = _normalize_symbol(symbol)
     chart_id = make_chart_id(sym, timeframe)

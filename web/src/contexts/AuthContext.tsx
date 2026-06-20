@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase';
 import { setTokenGetter } from '../api/client';
 import { queryKeys } from '../lib/queryKeys';
 import { OAUTH_BROADCAST_CHANNEL, OAUTH_POPUP_WINDOW_NAME, OAUTH_POPUP_FEATURES } from '../lib/oauthPopup';
+import { clearFlashWorkspaceCache } from '@/pages/MarketView/utils/flashWorkspace';
 
 import type { AuthResponse, OAuthResponse, Provider, Session } from '@supabase/supabase-js';
 
@@ -140,6 +141,7 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
       } else {
         // Logged out — wipe all cached data
         queryClient.clear();
+        clearFlashWorkspaceCache();
         setTokenGetter(() => Promise.resolve(null));
       }
     });
