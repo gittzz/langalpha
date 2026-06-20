@@ -141,6 +141,46 @@ describe('buildPrimitiveData', () => {
     expect(byRatio[0.5]).toBe(150);
   });
 
+  it('orders rect and fib x-anchors by time even when points arrive reversed', () => {
+    // point1 is LATER than point2 for both shapes. The off-screen clamp in the
+    // primitive assumes time1 is the earlier (left) edge, so buildPrimitiveData
+    // must reorder the span — otherwise a corner outside the loaded range paints
+    // a phantom shape spanning the whole chart.
+    const anns: StoredAnnotation[] = [
+      {
+        annotation_id: 'r-rev',
+        symbol: 'NVDA',
+        type: 'rectangle',
+        point1: { time: '2024-12-20T00:00:00Z', price: 140 },
+        point2: { time: '2024-10-16T00:00:00Z', price: 150 },
+      },
+      {
+        annotation_id: 'f-rev',
+        symbol: 'NVDA',
+        type: 'fib_retracement',
+        point1: { time: '2024-12-20T00:00:00Z', price: 200 },
+        point2: { time: '2024-10-16T00:00:00Z', price: 100 },
+      },
+    ];
+
+    const data = buildPrimitiveData(anns, CHART);
+
+    const rect = data.rects[0];
+    expect(rect.time1).toBeLessThanOrEqual(rect.time2);
+    expect(rect.time1).toBe(T('2024-10-16T00:00:00Z'));
+    expect(rect.time2).toBe(T('2024-12-20T00:00:00Z'));
+
+    const fib = data.fibs[0];
+    expect(fib.time1).toBeLessThanOrEqual(fib.time2);
+    expect(fib.time1).toBe(T('2024-10-16T00:00:00Z'));
+    expect(fib.time2).toBe(T('2024-12-20T00:00:00Z'));
+    // Direction is preserved: level prices stay tied to point identity, NOT the
+    // reordered time span. point1.price=200 -> ratio 1.0, point2.price=100 -> 0.0.
+    const byRatio = Object.fromEntries(fib.levels.map((l) => [l.ratio, l.price]));
+    expect(byRatio[1]).toBe(200);
+    expect(byRatio[0]).toBe(100);
+  });
+
   it('renders a trendline label as a chip anchored at the later endpoint', () => {
     const anns: StoredAnnotation[] = [
       {

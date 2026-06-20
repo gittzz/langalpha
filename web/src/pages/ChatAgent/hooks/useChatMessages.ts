@@ -1084,6 +1084,14 @@ export function useChatMessages(
 
         // Handle artifact events (e.g., todo_update)
         // In history replay, artifacts DO have turn_index, so we can use it directly
+        //
+        // NOTE: `chart_annotation` artifacts are intentionally NOT replayed here
+        // (only the live stream applies them to the annotation store). On reload,
+        // MarketView's `useChartAnnotationSync` REST fetch is the authoritative
+        // source that repopulates the store from Postgres, and the inline card
+        // renders from the replayed `tool_call_result.artifact`. If a live chart
+        // surface is ever added to the standalone chat page, add a
+        // `chart_annotation` branch here so reloads stay consistent.
         if (eventType === 'artifact') {
           const artifactType = event.artifact_type;
           if (artifactType === 'todo_update') {

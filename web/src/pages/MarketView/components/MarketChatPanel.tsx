@@ -294,7 +294,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     () => ({
       chartPresent: true,
       activeSymbol: symbol ? symbol.toUpperCase() : undefined,
-      activeTimeframe: normalizeTimeframe(interval),
+      // Raw interval, not normalized: the chip compares this against an
+      // annotation's timeframe to decide "shown vs jump". A view-only interval
+      // like 1s (which collapses to 1day) must NOT read as active for a 1day
+      // annotation that the 1s chart can't actually display.
+      activeTimeframe: interval,
       onJumpToChart,
     }),
     [symbol, interval, onJumpToChart],

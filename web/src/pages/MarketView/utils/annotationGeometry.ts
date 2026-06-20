@@ -235,9 +235,14 @@ export function buildPrimitiveData(
       const t1 = resolveBarTime(chartData, ann.point1.time);
       const t2 = resolveBarTime(chartData, ann.point2.time);
       if (t1 == null || t2 == null) continue;
+      // Order corners so time1 <= time2. The box is symmetric in its two
+      // corners, but the off-screen clamp in the primitive assumes time1 is the
+      // earlier (left) edge — reversed anchors would otherwise paint a phantom
+      // span when one corner falls outside the loaded range.
+      const rectEarlierFirst = t1 <= t2;
       rects.push({
-        time1: t1,
-        time2: t2,
+        time1: rectEarlierFirst ? t1 : t2,
+        time2: rectEarlierFirst ? t2 : t1,
         price1: ann.point1.price,
         price2: ann.point2.price,
         color: ann.color ?? DEFAULT_RECT_COLOR,
@@ -268,13 +273,16 @@ export function buildPrimitiveData(
       if (t1 == null || t2 == null) continue;
       const p1 = ann.point1.price;
       const p2 = ann.point2.price;
+      // Level prices are tied to point identity (point1 = 1.0, point2 = 0.0),
+      // so do NOT reorder them by time. Only the rendered x-span needs time1 <=
+      // time2 for the primitive's off-screen clamp to be correct.
       const levels = FIB_RATIOS.map((ratio) => ({
         ratio,
         price: p2 + (p1 - p2) * ratio,
       }));
       fibs.push({
-        time1: t1,
-        time2: t2,
+        time1: Math.min(t1, t2),
+        time2: Math.max(t1, t2),
         levels,
         color: ann.color ?? DEFAULT_FIB_COLOR,
       });

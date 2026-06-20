@@ -9,7 +9,7 @@ import type { MarketChartHandle } from './components/MarketChart';
 import ChatInput from '../../components/ui/chat-input';
 import MarketChatPanel from './components/MarketChatPanel';
 import MarketSidebarPanel from './components/MarketSidebarPanel';
-import { supports1sInterval } from './utils/chartConstants';
+import { INTERVALS, supports1sInterval } from './utils/chartConstants';
 import { useMarketChat } from './hooks/useMarketChat';
 import { getWorkspaces } from '../ChatAgent/utils/api';
 import { attachmentsToContexts } from '../ChatAgent/utils/fileUpload';
@@ -261,8 +261,10 @@ function MarketViewInner() {
       }
     }
     // Land on the timeframe the expanded card was drawn for, so its annotations
-    // (keyed by symbol:timeframe) show immediately.
-    if (tfParam) {
+    // (keyed by symbol:timeframe) show immediately. Validate against the chart's
+    // own interval allowlist so a stale/hand-crafted ?tf= can't strand the chart
+    // on an unknown interval (empty data + annotations keyed to a dead chart_id).
+    if (tfParam && INTERVALS.some((i) => i.key === tfParam)) {
       setSelectedInterval(tfParam);
     }
     // Apply workspace before mode so MarketChatPanel resolves the right
