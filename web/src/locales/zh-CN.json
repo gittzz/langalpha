@@ -1765,6 +1765,8 @@
       "automations": "自动化",
       "createAutomation": "创建自动化",
       "manageAutomation": "管理自动化",
+      "annotateChart": "标注图表",
+      "manageAnnotations": "管理标注",
       "skill": "技能",
       "memory": "记忆",
       "workspaceMemory": "工作区记忆",
@@ -1845,6 +1847,8 @@
       "creatingAutomation": "创建自动化...",
       "actionAutomation": "{{action}} 自动化...",
       "managingAutomation": "管理自动化...",
+      "annotatingChart": "正在标注图表...",
+      "updatingAnnotations": "正在更新标注...",
       "processing": "处理中..."
     },
     "preparing": {

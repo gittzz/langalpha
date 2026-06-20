@@ -3,9 +3,10 @@ import {
   TrendingUp, Building2, BarChart3, PieChart, Search, Globe,
   FilePlus, FileText, FilePen, FolderSearch, SquareChevronRight, Wrench,
   Newspaper, Brain, User, FileBarChart, Clock, ClipboardList, Zap, Settings, Terminal,
-  Sparkles, BookText, BookMarked, BookPlus,
+  Sparkles, BookText, BookMarked, BookPlus, PenLine,
 } from 'lucide-react';
 import { classifyAgentPath, topicFromMemoryKey, type AgentPathInfo } from '../utils/agentPaths';
+import { INTERVAL_LABEL } from '@/pages/MarketView/utils/chartConstants';
 
 /** Translation function signature compatible with i18next's t() */
 type TFn = (key: string, opts?: Record<string, unknown>) => string;
@@ -89,6 +90,9 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayEntry> = {
   check_automations:        { displayName: 'Automations',          i18nKey: 'automations',         icon: Clock },
   create_automation:        { displayName: 'Create Automation',    i18nKey: 'createAutomation',    icon: Zap },
   manage_automation:        { displayName: 'Manage Automation',    i18nKey: 'manageAutomation',    icon: Settings },
+  // Chart annotation
+  draw_chart_annotation:    { displayName: 'Annotate Chart',       i18nKey: 'annotateChart',       icon: PenLine },
+  manage_chart_annotations: { displayName: 'Manage Annotations',   i18nKey: 'manageAnnotations',   icon: Settings },
 };
 
 // Single source of truth for "what tool name indicates a file
@@ -316,6 +320,10 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
       return args?.action
         ? (tr?.('actionAutomation', { action: args.action }) ?? `${args.action} automation...`)
         : (tr?.('managingAutomation') ?? 'managing automation...');
+    case 'draw_chart_annotation':
+      return tr?.('annotatingChart') ?? 'annotating chart...';
+    case 'manage_chart_annotations':
+      return tr?.('updatingAnnotations') ?? 'updating annotations...';
     default:
       return tr?.('processing') ?? 'processing...';
   }
@@ -350,6 +358,14 @@ export function getCompletedSummary(toolName: string, toolCall: ToolCall | undef
       // extra pill needed (would duplicate the entity name).
       return null;
     }
+  }
+  // Annotation steps: headline reads "NVDA · 1D" — the chart instance the draw
+  // targets. `timeframe` defaults to 1day server-side, so a missing arg means 1D.
+  // INTERVAL_LABEL is the shared chart interval→label map (chartConstants).
+  if (toolName === 'draw_chart_annotation' || toolName === 'manage_chart_annotations') {
+    if (!args.symbol) return null;
+    const tf = (args.timeframe as string) || '1day';
+    return `${String(args.symbol).toUpperCase()} · ${INTERVAL_LABEL[tf] ?? tf}`;
   }
   if (args.description) return args.description;
   if (args.symbol) return args.symbol;

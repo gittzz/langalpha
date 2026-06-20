@@ -24,6 +24,7 @@ import {
 import { InlineAutomationCard } from './charts/InlineAutomationCards';
 import { InlinePreviewCard } from './charts/InlinePreviewCard';
 import { InlineChartAnnotationCard } from './charts/InlineChartAnnotationCard';
+import { chartInstanceKey, planChartAnnotationCards } from './chartAnnotationGrouping';
 import { extractFilePaths, FileMentionCards } from './FileCard';
 import { normalizeFileRefs } from '../utils/normalizeFileRefs';
 import { useUser } from '@/hooks/useUser';
@@ -1216,6 +1217,11 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
         return false;
       });
 
+      // One card per chart instance, pinned at the first draw and fed the
+      // latest cumulative artifact (so it grows in place); every other draw
+      // folds into the timeline as an ordinary row.
+      const chartCardPlan = planChartAnnotationCards(filtered, toolCallProcesses);
+
       const blocks: RenderBlock[] = [];
       let pendingItems: Array<Record<string, unknown>> = [];
       let activityCounter = 0;
@@ -1318,13 +1324,45 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
               }
             }
           } else if (isArtifactReady) {
-            flushActivity();
-            blocks.push({
-              type: 'compact_artifact',
-              key: `compact-${seg.toolCallId}`,
-              toolCallId: seg.toolCallId!,
-              proc,
-            });
+            const isChartAnnotation = (artifactResult as Record<string, unknown>).type === 'chart_annotation';
+            const plan = isChartAnnotation
+              ? chartCardPlan.get(chartInstanceKey(artifactResult as Record<string, unknown>))
+              : undefined;
+            if (isChartAnnotation && plan && plan.anchorCallId !== seg.toolCallId) {
+              // A later draw on a chart whose card is already pinned at its first
+              // draw: render as an ordinary completed row (its content shows in
+              // the pinned card above). `_annotationStep` stops ActivityBlock
+              // (see its partition guard) from re-promoting it into a card.
+              pendingItems.push({
+                type: 'tool_call',
+                id: seg.toolCallId,
+                toolCallId: seg.toolCallId,
+                ...proc,
+                _liveState: 'completed',
+                _annotationStep: true,
+              });
+            } else if (isChartAnnotation && plan) {
+              // The anchor (first) draw: pin the card here but feed it the LATEST
+              // cumulative artifact so it grows in place. Key is the chart
+              // instance, not the tool-call id, so the element persists across
+              // draws (no remount) and its legend can animate the new annotations.
+              const latestProc = (toolCallProcesses[plan.latestCallId] as typeof proc) ?? proc;
+              flushActivity();
+              blocks.push({
+                type: 'compact_artifact',
+                key: `chart-${chartInstanceKey(artifactResult as Record<string, unknown>)}`,
+                toolCallId: plan.latestCallId,
+                proc: latestProc,
+              });
+            } else {
+              flushActivity();
+              blocks.push({
+                type: 'compact_artifact',
+                key: `compact-${seg.toolCallId}`,
+                toolCallId: seg.toolCallId!,
+                proc,
+              });
+            }
           } else if (!streamEnded && age < MIN_LIVE_EXPOSURE_MS && !INLINE_ARTIFACT_TOOLS.has(proc.toolName as string)) {
             pendingItems.push({
               type: 'tool_call',
@@ -1386,39 +1424,12 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
       // Flush trailing activity items
       flushActivity();
 
-      // Collapse chart-annotation previews to one card per chart instance.
-      // Every draw_chart_annotation call returns the FULL cumulative annotation
-      // set for its (workspace, chart_id) instance — chart_id = SYMBOL:timeframe
-      // — so each card is a complete snapshot and earlier cards are strict
-      // subsets of the last. Rendering all of them stacks near-duplicate charts
-      // (one per tool call); keep only the latest card per instance. Distinct
-      // timeframes (e.g. AAPL:1day vs AAPL:1hour) are separate charts and each
-      // keeps its own latest card.
-      const chartKeyOf = (b: RenderBlock): string | null => {
-        if (b.type !== 'compact_artifact') return null;
-        const artifact = ((b as CompactArtifactRenderBlock).proc.toolCallResult as Record<string, unknown> | undefined)
-          ?.artifact as Record<string, unknown> | undefined;
-        if (artifact?.type !== 'chart_annotation') return null;
-        const ws = (artifact.workspace_id as string) ?? '';
-        const chartId =
-          (artifact.chart_id as string) ??
-          `${String(artifact.symbol ?? '').toUpperCase()}:${(artifact.timeframe as string) ?? '1day'}`;
-        return `${ws}|${chartId}`;
-      };
-      const lastChartIdxByKey = new Map<string, number>();
-      blocks.forEach((b, i) => {
-        const key = chartKeyOf(b);
-        if (key !== null) lastChartIdxByKey.set(key, i);
-      });
-      const dedupedBlocks =
-        lastChartIdxByKey.size === 0
-          ? blocks
-          : blocks.filter((b, i) => {
-              const key = chartKeyOf(b);
-              return key === null || lastChartIdxByKey.get(key) === i;
-            });
-
-      return { blocks: dedupedBlocks, nextExpiry: computedNextExpiry };
+      // Per chart instance, only the anchor (first) draw became a
+      // `compact_artifact` block — fed the latest cumulative proc via
+      // `chartCardPlan` (see `planChartAnnotationCards` above); every later draw
+      // was forced to an ordinary `_annotationStep` row, so no post-pass dedup
+      // is needed.
+      return { blocks, nextExpiry: computedNextExpiry };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- tick is a semantic dep: forces recomputation when timer fires for live→completed transitions
     }, [groupedSegments, tick, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, textOnly]);
 

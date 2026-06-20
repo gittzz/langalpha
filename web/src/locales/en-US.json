@@ -1776,6 +1776,8 @@
       "automations": "Automations",
       "createAutomation": "Create Automation",
       "manageAutomation": "Manage Automation",
+      "annotateChart": "Annotate Chart",
+      "manageAnnotations": "Manage Annotations",
       "skill": "Skill",
       "memory": "Memory",
       "workspaceMemory": "Workspace Memory",
@@ -1856,6 +1858,8 @@
       "creatingAutomation": "creating automation...",
       "actionAutomation": "{{action}} automation...",
       "managingAutomation": "managing automation...",
+      "annotatingChart": "annotating chart...",
+      "updatingAnnotations": "updating annotations...",
       "processing": "processing..."
     },
     "preparing": {

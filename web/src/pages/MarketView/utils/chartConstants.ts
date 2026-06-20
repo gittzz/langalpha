@@ -100,6 +100,13 @@ export const INTERVALS: IntervalConfig[] = [
   { key: '1day',  label: '1D'  },
 ];
 
+// Interval key → short display label, derived from INTERVALS. Single source for
+// any surface that shows a timeframe badge (chart picker, annotation cards/rows).
+// Look up as `INTERVAL_LABEL[key] ?? key` so unknown keys degrade to the raw value.
+export const INTERVAL_LABEL: Record<string, string> = Object.fromEntries(
+  INTERVALS.map((i) => [i.key, i.label]),
+);
+
 // Intervals shown as direct buttons in the toolbar
 export const PRIMARY_INTERVAL_KEYS = new Set(['1s', '1min', '1day']);
 

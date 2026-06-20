@@ -18,6 +18,7 @@ import React, { Suspense, lazy, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { LineChart, ExternalLink, Check, ArrowRight, X } from 'lucide-react';
 
 import {
@@ -35,7 +36,7 @@ import {
   useDisplayCleared,
 } from '@/pages/MarketView/stores/chartAnnotationStore';
 import { useStockBars } from '@/pages/MarketView/hooks/useStockBars';
-import { AUTO_FIT_BARS } from '@/pages/MarketView/utils/chartConstants';
+import { AUTO_FIT_BARS, INTERVAL_LABEL } from '@/pages/MarketView/utils/chartConstants';
 import { describeAnnotationVisual } from '@/pages/MarketView/utils/annotationGeometry';
 
 import { useWorkspaceId } from '../../contexts/WorkspaceContext';
@@ -65,17 +66,6 @@ const CENTERED: React.CSSProperties = {
   justifyContent: 'center',
 };
 
-// Short label for the timeframe pill (falls back to the raw value). Keys mirror
-// the agent's `Timeframe` enum — the only timeframes a chart instance can have.
-const TF_LABEL: Record<string, string> = {
-  '1min': '1m',
-  '5min': '5m',
-  '15min': '15m',
-  '30min': '30m',
-  '1hour': '1H',
-  '4hour': '4H',
-  '1day': '1D',
-};
 
 // Translucent chrome that floats over the chart (theme-aware via color-mix).
 const GLASS_BG = 'color-mix(in srgb, var(--color-bg-tool-card) 62%, transparent)';
@@ -103,6 +93,7 @@ export function InlineChartAnnotationCard({
   const ctxWorkspaceId = useWorkspaceId();
   const { chartPresent, activeSymbol, activeTimeframe, onJumpToChart } = useChartSurface();
   const isMobile = useIsMobile();
+  const reduceMotion = useReducedMotion();
 
   const symbol = ((artifact?.symbol as string) || '').toUpperCase();
   const timeframe = (artifact?.timeframe as string) || '1day';
@@ -175,7 +166,10 @@ export function InlineChartAnnotationCard({
     };
 
     const title = canJump
-      ? t('chat.chartAnnotationCard.chipJumpTitle', { symbol, timeframe })
+      ? t('chat.chartAnnotationCard.chipJumpTitle', {
+          symbol,
+          timeframe: INTERVAL_LABEL[timeframe] ?? timeframe,
+        })
       : displayCleared
         ? t('chat.chartAnnotationCard.chipShowTitle')
         : t('chat.chartAnnotationCard.chipShownTitle');
@@ -208,7 +202,7 @@ export function InlineChartAnnotationCard({
           : <Check size={14} style={{ color: 'var(--color-profit)', flexShrink: 0 }} />}
         <span>
           <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{symbol}</span>
-          <span style={{ color: TEXT_COLOR }}>{` · ${timeframe}`}</span>
+          <span style={{ color: TEXT_COLOR }}>{` · ${INTERVAL_LABEL[timeframe] ?? timeframe}`}</span>
           {' · '}
           {canJump
             ? t('chat.chartAnnotationCard.chipViewCount', { count })
@@ -440,7 +434,7 @@ export function InlineChartAnnotationCard({
               borderRadius: 7,
             }}
           >
-            {TF_LABEL[timeframe] ?? timeframe}
+            {INTERVAL_LABEL[timeframe] ?? timeframe}
           </span>
 
           {/* Bottom-left — annotation legend (the real annotations). */}
@@ -457,33 +451,43 @@ export function InlineChartAnnotationCard({
                 maxWidth: '62%',
               }}
             >
-              {shownVisuals.map((v, i) => (
-                <span
-                  key={i}
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 6,
-                    fontSize: 11.5,
-                    fontWeight: 600,
-                    color: 'var(--color-text-secondary)',
-                  }}
-                >
-                  <span
-                    style={{ width: 8, height: 8, borderRadius: 2.5, background: v.color, flexShrink: 0 }}
-                  />
-                  <span
+              {/* `initial={false}` keeps the first paint (and history replay)
+                  instant; only annotations that arrive while the pinned card is
+                  already mounted animate in, so the legend grows smoothly as the
+                  agent draws. */}
+              <AnimatePresence initial={false}>
+                {shownVisuals.map((v, i) => (
+                  <motion.span
+                    key={annotations[i]?.annotation_id || `legend-${i}`}
+                    initial={reduceMotion ? false : { opacity: 0, y: 3, scale: 0.96 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -3, scale: 0.96 }}
+                    transition={{ duration: reduceMotion ? 0 : 0.2, ease: 'easeOut' }}
                     style={{
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                      maxWidth: 130,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      fontSize: 11.5,
+                      fontWeight: 600,
+                      color: 'var(--color-text-secondary)',
                     }}
                   >
-                    {v.label}
-                  </span>
-                </span>
-              ))}
+                    <span
+                      style={{ width: 8, height: 8, borderRadius: 2.5, background: v.color, flexShrink: 0 }}
+                    />
+                    <span
+                      style={{
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        maxWidth: 130,
+                      }}
+                    >
+                      {v.label}
+                    </span>
+                  </motion.span>
+                ))}
+              </AnimatePresence>
               {extraCount > 0 && (
                 <span style={{ fontSize: 11.5, fontWeight: 600, color: TEXT_COLOR }}>+{extraCount}</span>
               )}
@@ -536,7 +540,11 @@ export function InlineChartAnnotationCard({
             }}
           >
             <DialogTitle className="sr-only">
-              {t('chat.chartAnnotationCard.dialogTitle', { symbol, timeframe, count })}
+              {t('chat.chartAnnotationCard.dialogTitle', {
+                symbol,
+                timeframe: INTERVAL_LABEL[timeframe] ?? timeframe,
+                count,
+              })}
             </DialogTitle>
 
             {/* Slim modal chrome — keeps the close + "Open in MarketView"
