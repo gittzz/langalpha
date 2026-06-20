@@ -194,11 +194,27 @@ function MarketViewInner() {
   const [flashWorkspaceId, setFlashWorkspaceId] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
-    getOrFetchFlashWorkspaceId().then((id) => {
-      if (!cancelled) setFlashWorkspaceId(id);
-    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // A transient null (e.g. a failed first fetch) would otherwise leave
+    // Fast-mode annotations unscoped for the whole session, so retry a few
+    // times. getOrFetchFlashWorkspaceId clears its cache on failure, so each
+    // call re-attempts the request.
+    const attempt = (remaining: number) => {
+      getOrFetchFlashWorkspaceId().then((id) => {
+        if (cancelled) return;
+        if (id) {
+          setFlashWorkspaceId(id);
+          return;
+        }
+        if (remaining > 0) {
+          timer = setTimeout(() => attempt(remaining - 1), 1500);
+        }
+      });
+    };
+    attempt(3);
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   }, []);
 

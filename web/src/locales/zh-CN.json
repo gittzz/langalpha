@@ -1183,6 +1183,7 @@
     "offloadedNotification": "上下文已转存 · {{args}} 个工具参数, {{reads}} 个读取",
     "compactionError": "上下文压缩失败",
     "compactBusy": "当前轮次还在流式输出中，请等结束后再压缩。",
+    "offloadBusy": "当前轮次还在流式输出中，请等结束后再转存。",
     "modelSelector": {
       "manageModels": "管理模型",
       "moreModels": "更多模型",

@@ -273,7 +273,7 @@ export function AgentEventOverlay({
       cancelAnimationFrame(raf);
       if (scheduled) cancelAnimationFrame(scheduled);
     };
-  }, [recompute, symbol, theme, visible, events, chartData, chartRef]);
+  }, [recompute, symbol, theme, visible, chartData, chartRef]);
 
   return (
     <div ref={hostRef} className="agent-event-overlay" aria-hidden={placed.length === 0}>

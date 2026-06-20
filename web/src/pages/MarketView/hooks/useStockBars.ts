@@ -50,7 +50,7 @@ export function useStockBars(
   interval: string,
   { enabled = true }: UseStockBarsOptions = {},
 ): UseStockBarsResult {
-  const sym = (symbol || '').toUpperCase();
+  const sym = (symbol || '').trim().toUpperCase();
   const active = enabled && !!sym;
 
   const query = useQuery({

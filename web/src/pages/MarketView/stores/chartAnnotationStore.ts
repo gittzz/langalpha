@@ -434,6 +434,7 @@ export const chartAnnotationStore = {
     clearedKeys = new Set();
     mutationSeq = 0;
     keyMutatedAt.clear();
+    liveAddListeners.clear();
     emit();
   },
 };
@@ -461,10 +462,10 @@ const VALID_MARKER_SHAPES: ReadonlySet<string> = new Set([
 
 /** Resolve the chart_id from a payload, deriving it if only symbol+tf given. */
 function resolveChartId(payload: Record<string, unknown>): string | null {
-  const chartId = payload.chart_id as string | undefined;
-  if (chartId) return chartId;
-  const symbol = payload.symbol as string | undefined;
-  if (!symbol) return null;
+  const chartId = payload.chart_id;
+  if (typeof chartId === 'string' && chartId) return chartId;
+  const symbol = payload.symbol;
+  if (typeof symbol !== 'string' || !symbol) return null;
   return makeChartId(symbol, normalizeTimeframe(payload.timeframe as string | undefined));
 }
 

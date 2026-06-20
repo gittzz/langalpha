@@ -21,7 +21,11 @@ export interface ChartSurface {
   chartPresent: boolean;
   /** Symbol currently shown on the adjacent live chart (MarketView only). */
   activeSymbol?: string;
-  /** Normalized timeframe currently shown on the adjacent live chart. */
+  /**
+   * Raw interval currently shown on the adjacent live chart (NOT normalized) —
+   * so a view-only interval like `1s` doesn't read as "active" for a `1day`
+   * annotation.
+   */
   activeTimeframe?: string;
   /** Switch the adjacent live chart to a symbol+timeframe (MarketView only). */
   onJumpToChart?: (symbol: string, timeframe: string) => void;

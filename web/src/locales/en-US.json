@@ -1183,6 +1183,7 @@
     "offloadedNotification": "Context offloaded · {{args}} tool args, {{reads}} reads",
     "compactionError": "Context compaction failed",
     "compactBusy": "Can only compact when the current turn has finished streaming.",
+    "offloadBusy": "Can only offload when the current turn has finished streaming.",
     "modelSelector": {
       "manageModels": "Manage models",
       "moreModels": "More models",

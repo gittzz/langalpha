@@ -509,12 +509,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const handleAction = useCallback((cmd: ActionCommandLike) => {
     if (!threadId || threadId === '__default__') return;
 
-    const surfaceActionError = (err: unknown, fallbackKey: string) => {
+    const surfaceActionError = (err: unknown, fallbackKey: string, busyKey = 'chat.compactBusy') => {
       const resp = (err as { response?: { status?: number; data?: unknown } } | undefined)?.response;
       const detail = ((resp?.data ?? undefined) as { detail?: unknown } | undefined)?.detail;
       if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
         const obj = detail as { code?: string; message?: string };
-        if (obj.code === 'workflow_active') { insertNotification(t('chat.compactBusy'), 'warning'); return; }
+        if (obj.code === 'workflow_active') { insertNotification(t(busyKey), 'warning'); return; }
         if (typeof obj.message === 'string' && obj.message.length > 0) { insertNotification(obj.message, 'warning'); return; }
         insertNotification(t(fallbackKey), 'warning');
         return;
@@ -542,7 +542,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
             reads: (data.offloaded_reads as number) || 0,
           }));
         })
-        .catch((err: unknown) => { surfaceActionError(err, 'chat.compactionError'); setIsCompacting?.(false); });
+        .catch((err: unknown) => { surfaceActionError(err, 'chat.compactionError', 'chat.offloadBusy'); setIsCompacting?.(false); });
     }
   }, [threadId, setIsCompacting, insertNotification, t]);
 

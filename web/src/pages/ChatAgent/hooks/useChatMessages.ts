@@ -59,7 +59,7 @@ import {
 // shared MarketView store so the desktop MarketView chat panel (which uses
 // this engine for both flash and PTC) renders them live. Harmless on the
 // standalone /chat page — the store simply has no chart consumer there.
-import { applyAnnotationArtifact } from '../../MarketView/stores/chartAnnotationStore';
+import { applyAnnotationArtifact } from '@/pages/MarketView/stores/chartAnnotationStore';
 
 // --- Internal types for useChatMessages ---
 
