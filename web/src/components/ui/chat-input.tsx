@@ -112,6 +112,12 @@ export interface ChatInputProps {
   onRemoveChartImage?: (() => void) | null;
   prefillMessage?: string;
   onClearPrefill?: (() => void) | null;
+  /**
+   * External context attached by the host (e.g. a confirmed chart selection
+   * rendered outside this input). When true, an empty text box still counts as
+   * sendable — the selection carries its own instruction.
+   */
+  hasExternalContext?: boolean;
   tokenUsage?: TokenUsageData | null;
   onAction?: ((cmd: SlashCommand) => void) | null;
   initialModel?: string | null;
@@ -334,6 +340,8 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   // Prefill (trading)
   prefillMessage = '',
   onClearPrefill = null,
+  // Host-attached context (e.g. a chart selection pill) that makes an empty box sendable
+  hasExternalContext = false,
   // Token usage (context window progress)
   tokenUsage = null,
   // Action commands (e.g. /compact) — fired immediately on selection
@@ -1004,7 +1012,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   }, []);
 
   // --- Send ---
-  const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || mentionedFiles.some((f) => f.snippet) || widgetSnapshots.length > 0;
+  const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || mentionedFiles.some((f) => f.snippet) || widgetSnapshots.length > 0 || hasExternalContext;
 
   const handleSend = useCallback(() => {
     if (!hasContent || disabled) return;

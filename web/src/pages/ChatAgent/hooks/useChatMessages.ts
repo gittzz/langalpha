@@ -183,6 +183,11 @@ interface ModelOptions {
    * below the user bubble (like attachments).
    */
   widgetSnapshots?: import('@/pages/Dashboard/widgets/framework/contextSnapshot').WidgetContextSnapshot[];
+  /**
+   * Chart selections attached to this send. Stored on the UserMessage so the
+   * chat renders read-only pills below the user bubble (like widgetSnapshots).
+   */
+  chartSelections?: import('@/pages/MarketView/stores/chartSelectionStore').ChartSelectionSnapshot[];
 }
 
 /** Offload batch ref state. */
@@ -4073,7 +4078,7 @@ export function useChatMessages(
     }
   };
 
-  const handleSendMessage = async (message: string, planMode: boolean = false, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots }: ModelOptions = {}) => {
+  const handleSendMessage = async (message: string, planMode: boolean = false, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections }: ModelOptions = {}) => {
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0);
     if (!workspaceId || !hasContent) {
       return;
@@ -4118,6 +4123,7 @@ export function useChatMessages(
       message,
       attachmentMeta as AttachmentMeta[] | null,
       widgetSnapshots ?? null,
+      chartSelections ?? null,
     );
     recentlySentTrackerRef.current.track(message.trim(), userMessage.timestamp, userMessage.id);
 

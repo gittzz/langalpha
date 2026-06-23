@@ -37,12 +37,18 @@ import { useChartOverlays } from '../hooks/useChartOverlays';
 import { useAgentAnnotations } from '../hooks/useAgentAnnotations';
 import { AgentEventOverlay } from './AgentEventOverlay';
 import { chartAnnotationStore, makeChartId, normalizeTimeframe, useAnnotationsForView, useDisplayCleared } from '../stores/chartAnnotationStore';
-import { SlidersHorizontal, Settings2, Maximize2, Minimize2, ChevronDown, Plus, Minus, RotateCcw, Menu, X } from 'lucide-react';
+import { chartSelectionStore, useChartSelections } from '../stores/chartSelectionStore';
+import { SelectionPrimitive, type CommittedSelection } from '../utils/selectionPrimitive';
+import { SelectionCommentOverlay } from './SelectionCommentOverlay';
+import { snapToNearestBar, toUnixSeconds } from '../utils/annotationGeometry';
+import { downsampleBars } from '../utils/downsampleBars';
+import { SlidersHorizontal, Settings2, Maximize2, Minimize2, ChevronDown, Plus, Minus, RotateCcw, Menu, X, SquareDashedMousePointer, Ruler } from 'lucide-react';
 
 import { loadPref, savePref } from '../utils/prefs';
 import type { SnapshotData } from '@/types/market';
 import type { BarData } from '../hooks/useMarketDataWS';
 import { useOnClickOutside } from '@/hooks/useOnClickOutside';
+import { useIsMobile } from '@/hooks/useIsMobile';
 
 interface ChartDataBar {
   time: number;
@@ -102,6 +108,18 @@ export interface MarketChartHandle {
   getChartMetadata: () => Record<string, unknown> | null;
 }
 
+/** Max OHLCV bars sent with a region selection (downsampled past this). */
+const MAX_SELECTION_BARS = 300;
+
+/** A drag smaller than this (px, either axis) is treated as a click, not a region. */
+const MIN_DRAG_PX = 4;
+
+/**
+ * Container widths (px, descending) at which the toolbar sheds actions into the
+ * overflow menu. `toolbarLevel` is the count of breakpoints the width is below:
+ * 0 = widest (all inline) … 4 = narrowest. Driven by a ResizeObserver.
+ */
+const TOOLBAR_WIDTH_BREAKPOINTS = [1180, 880, 710, 560] as const;
 
 const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>(({
   symbol,
@@ -139,6 +157,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   const maSeriesRefs = useRef<Record<number, any>>({});
   const baselineSeriesRef = useRef<any>(null);
   const extHoursBgRef = useRef<ExtendedHoursBgPrimitive | null>(null);
+  const selectionPrimitiveRef = useRef<SelectionPrimitive | null>(null);
   const extCloseLineRef = useRef<any>(null);
   const currentExtTypeRef = useRef<string | null>(null);
   const quoteDataRef = useRef(quoteData);
@@ -157,27 +176,48 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
 
   // Chart mode: 'custom' (our lightweight-charts) or 'tradingview' (full TV widget) (persisted)
   const [chartMode, setChartMode] = useState<string>(() => loadPref('chartMode', 'custom'));
+  // Mobile only ever shows the Light chart — the Advanced (TradingView) embed is
+  // dropped on phones. `effectiveChartMode` is what every behavioural consumer
+  // reads so the light chart stays fully live on mobile, while the raw
+  // `chartMode` (and its toggle/pref) is preserved for the desktop switcher.
+  const isMobile = useIsMobile();
+  const effectiveChartMode = isMobile ? 'custom' : chartMode;
 
   // Chart feature toggles (persisted)
   const [priceScaleMode, setPriceScaleMode] = useState<number>(() => loadPref('priceScaleMode', PriceScaleMode.Normal));
   const [magnetMode, setMagnetMode] = useState<boolean>(() => loadPref('magnetMode', false));
   const [showBaseline, setShowBaseline] = useState<boolean>(false);
   const [annotationsVisible, setAnnotationsVisible] = useState<boolean>(() => loadPref('annotationsVisible', false));
+  // User chart-selection tool: drag a region or click a price level to ask the agent.
+  const [selectMode, setSelectMode] = useState<'off' | 'region' | 'price_level'>('off');
+  const selectModeRef = useRef<'off' | 'region' | 'price_level'>('off');
+  const selectDragRef = useRef<{ startX: number; startY: number } | null>(null);
+  useEffect(() => { selectModeRef.current = selectMode; }, [selectMode]);
   const [overlayVisibility, setOverlayVisibility] = useState<OverlayVisibility>(
     () => loadPref('overlayVisibility', { earnings: false, grades: false, priceTargets: false }),
   );
 
   // Responsive compact mode — based on actual chart container width, not viewport
-  const [isCompact, setIsCompact] = useState<boolean>(false);
+  // Toolbar collapse tier by container width. As space shrinks the toolbar
+  // sacrifices items in priority order (least → most important): indicator
+  // values (1) → scale/view tools (2) → indicators + tools dropdowns (3) →
+  // mode switch into the menu + Clear icon-only (4, phone widths). The interval
+  // selector, Clear and the selection tools always stay inline. Hidden
+  // actionable items move into the overflow menu.
+  const [toolbarLevel, setToolbarLevel] = useState<0 | 1 | 2 | 3 | 4>(0);
   useEffect(() => {
     const el = rootRef.current;
     if (!el) return;
     const ro = new ResizeObserver(([entry]) => {
-      setIsCompact(entry.contentRect.width < 925);
+      const w = entry.contentRect.width;
+      const below = TOOLBAR_WIDTH_BREAKPOINTS.findIndex((min) => w >= min);
+      setToolbarLevel((below === -1 ? TOOLBAR_WIDTH_BREAKPOINTS.length : below) as 0 | 1 | 2 | 3 | 4);
     });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+  // Close the overflow menu if the chart widens enough to unmount it.
+  useEffect(() => { if (toolbarLevel < 2) setViewOpen(false); }, [toolbarLevel]);
 
   // Toolbar dropdown state
   const [indicatorsOpen, setIndicatorsOpen] = useState<boolean>(false);
@@ -270,6 +310,8 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   // normalized timeframe (e.g. '1s' -> '1day'). Look annotations up under the
   // same normalized key, or they are invisible on non-agent-writable intervals.
   const annotationInterval = normalizeTimeframe(interval);
+  const selectionSymbol = symbol ? symbol.toUpperCase() : '';
+  const { selections: userSelections, activeId: editorOpenId } = useChartSelections();
   const agentAnnotations = useAnnotationsForView(workspaceId ?? null, symbol, annotationInterval);
   const hasAgentAnnotations = agentAnnotations.length > 0;
   const agentAnnotationsCleared = useDisplayCleared(workspaceId ?? null, symbol, annotationInterval);
@@ -277,7 +319,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     chartRef,
     candlestickSeriesRef,
     symbol,
-    chartMode,
+    effectiveChartMode,
     chartDataForHooks as any,
     workspaceId ?? null,
     annotationInterval,
@@ -288,11 +330,183 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   // --- Series markers via hook (earnings + grades + agent markers) ---
   useChartOverlays(candlestickSeriesRef, chartDataForHooks as any, earningsData as any, overlayData as any, overlayVisibility as any, symbol, agentMarkers);
 
+  // --- User chart selection (region / price level → agent) ---
+  // Keep the selection primitive's theme in sync.
+  useEffect(() => {
+    selectionPrimitiveRef.current?.setTheme(theme === 'dark' ? 'dark' : 'light');
+  }, [theme]);
+
+  // Render every selection drawn on the current instance (pending + confirmed),
+  // emphasizing the one whose editor is open.
+  useEffect(() => {
+    const prim = selectionPrimitiveRef.current;
+    if (!prim) return;
+    const items: CommittedSelection[] = [];
+    for (const sel of userSelections) {
+      if (sel.symbol !== selectionSymbol || sel.timeframe !== annotationInterval) continue;
+      const active = sel.id === editorOpenId;
+      if (sel.selectionType === 'price_level') {
+        items.push({ type: 'price_level', priceLow: sel.priceLow, priceHigh: sel.priceLow, active });
+        continue;
+      }
+      const t1 = sel.timeStart ? toUnixSeconds(sel.timeStart) : null;
+      const t2 = sel.timeEnd ? toUnixSeconds(sel.timeEnd) : null;
+      if (t1 == null || t2 == null) continue;
+      items.push({ type: 'region', time1: t1, time2: t2, priceLow: sel.priceLow, priceHigh: sel.priceHigh, active });
+    }
+    prim.setCommitted(items);
+  }, [userSelections, editorOpenId, selectionSymbol, annotationInterval]);
+
+  // Disable drag-pan while a select tool is armed so the drag draws a box.
+  useEffect(() => {
+    try {
+      chartRef.current?.applyOptions({ handleScroll: { pressedMouseMove: selectMode === 'off' } } as any);
+    } catch { /* chart disposed */ }
+    return () => {
+      try {
+        chartRef.current?.applyOptions({ handleScroll: { pressedMouseMove: true } } as any);
+      } catch { /* chart disposed */ }
+    };
+  }, [selectMode]);
+
+  // Switching the viewed instance drops selections drawn on the old one.
+  useEffect(() => {
+    const stale = chartSelectionStore
+      .getAll()
+      .some((s) => s.symbol !== selectionSymbol || s.timeframe !== annotationInterval);
+    if (stale) chartSelectionStore.clearAll();
+    setSelectMode('off');
+  }, [selectionSymbol, annotationInterval]);
+
+  // While a select tool is armed, Esc disarms it (unless the note editor has
+  // focus — it handles Esc itself and stops propagation).
+  useEffect(() => {
+    if (selectMode === 'off') return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && chartSelectionStore.getActiveId() == null) setSelectMode('off');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectMode]);
+
+  const commitRegionSelection = useCallback((x1: number, y1: number, x2: number, y2: number) => {
+    const chart = chartRef.current;
+    const series = candlestickSeriesRef.current;
+    const container = chartContainerRef.current;
+    if (!chart || !series || !container) return;
+    const leftX = Math.min(x1, x2);
+    const rightX = Math.max(x1, x2);
+    const topY = Math.min(y1, y2);
+    const bottomY = Math.max(y1, y2);
+    if (rightX - leftX < MIN_DRAG_PX || bottomY - topY < MIN_DRAG_PX) return; // ignore a click / micro-drag
+
+    const priceHigh = series.coordinateToPrice(topY);
+    const priceLow = series.coordinateToPrice(bottomY);
+    if (priceHigh == null || priceLow == null || !Number.isFinite(priceHigh) || !Number.isFinite(priceLow)) return;
+
+    const allBars = allDataRef.current;
+    const ts = chart.timeScale();
+    const rawL = ts.coordinateToTime(leftX);
+    const rawR = ts.coordinateToTime(rightX);
+    const secL = typeof rawL === 'number' ? rawL : null;
+    const secR = typeof rawR === 'number' ? rawR : null;
+    const t1 = secL != null ? (snapToNearestBar(allBars as any, secL) ?? secL) : (allBars[0]?.time ?? null);
+    const t2 = secR != null ? (snapToNearestBar(allBars as any, secR) ?? secR) : (allBars[allBars.length - 1]?.time ?? null);
+    if (t1 == null || t2 == null) return;
+    const startSec = Math.min(t1, t2);
+    const endSec = Math.max(t1, t2);
+
+    const inRange = allBars.filter((b) => b.time >= startSec && b.time <= endSec);
+    const { bars: chosen, truncated } = downsampleBars(inRange, MAX_SELECTION_BARS);
+    const selBars = chosen.map((b) => ({
+      time: new Date(b.time * 1000).toISOString(),
+      open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume,
+    }));
+
+    chartSelectionStore.beginDraft({
+      symbol: selectionSymbol,
+      timeframe: annotationInterval,
+      selectionType: 'region',
+      timeStart: new Date(startSec * 1000).toISOString(),
+      timeEnd: new Date(endSec * 1000).toISOString(),
+      priceLow: Math.min(priceLow, priceHigh),
+      priceHigh: Math.max(priceLow, priceHigh),
+      bars: selBars,
+      barsTruncated: truncated,
+    });
+  }, [selectionSymbol, annotationInterval]);
+
+  const handleSelectPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const mode = selectModeRef.current;
+    if (mode === 'off') return;
+    const container = chartContainerRef.current;
+    const prim = selectionPrimitiveRef.current;
+    if (!container || !prim) return;
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* unsupported */ }
+    const rect = container.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    selectDragRef.current = { startX: x, startY: y };
+    prim.setDraft(
+      mode === 'price_level'
+        ? { type: 'price_level', x1: 0, y1: y, x2: rect.width, y2: y }
+        : { type: 'region', x1: x, y1: y, x2: x, y2: y },
+    );
+  }, []);
+
+  const handleSelectPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = selectDragRef.current;
+    if (!drag) return;
+    const container = chartContainerRef.current;
+    const prim = selectionPrimitiveRef.current;
+    if (!container || !prim) return;
+    const rect = container.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    prim.setDraft(
+      selectModeRef.current === 'price_level'
+        ? { type: 'price_level', x1: 0, y1: y, x2: rect.width, y2: y }
+        : { type: 'region', x1: drag.startX, y1: drag.startY, x2: x, y2: y },
+    );
+  }, []);
+
+  const handleSelectPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = selectDragRef.current;
+    selectDragRef.current = null;
+    selectionPrimitiveRef.current?.setDraft(null);
+    if (!drag) return; // stray pointerup with no draw — stay armed
+    const mode = selectModeRef.current;
+    const container = chartContainerRef.current;
+    const series = candlestickSeriesRef.current;
+    if (container && series) {
+      const rect = container.getBoundingClientRect();
+      const endX = e.clientX - rect.left;
+      const endY = e.clientY - rect.top;
+      try {
+        if (mode === 'price_level') {
+          const price = series.coordinateToPrice(endY);
+          if (price != null && Number.isFinite(price)) {
+            chartSelectionStore.beginDraft({
+              symbol: selectionSymbol,
+              timeframe: annotationInterval,
+              selectionType: 'price_level',
+              priceLow: price, priceHigh: price,
+              bars: [], barsTruncated: false,
+            });
+          }
+        } else {
+          commitRegionSelection(drag.startX, drag.startY, endX, endY);
+        }
+      } catch { /* ignore */ }
+    }
+    // Tool stays armed so the user can keep drawing; Esc / the tool button disarms.
+  }, [commitRegionSelection, selectionSymbol, annotationInterval]);
+
   // --- Live tick updates from WS (1s and 1min intervals, custom/Light mode only) ---
   useEffect(() => {
     if (!liveTick || !candlestickSeriesRef.current) return;
     // Only apply live updates for 1s/1min interval in custom (Light) mode
-    if ((interval !== '1s' && interval !== '1min') || chartMode !== 'custom') return;
+    if ((interval !== '1s' && interval !== '1min') || effectiveChartMode !== 'custom') return;
 
     const { time, open, high, low, close, volume } = liveTick;
     if (!time || close == null) return;
@@ -448,7 +662,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
         setRsiValue(value.toFixed(0));
       }
     }
-  }, [liveTick, interval, chartMode]);
+  }, [liveTick, interval, effectiveChartMode]);
 
   // Temporarily reveal the hidden Light chart for capture, then restore.
   // Since it's behind the TV widget (z-index: -1), no visual flash occurs.
@@ -541,7 +755,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
       const lastCandle = data[data.length - 1];
 
       return {
-        chartMode: chartMode === 'tradingview' ? 'Advanced (TradingView)' : 'Light',
+        chartMode: effectiveChartMode === 'tradingview' ? 'Advanced (TradingView)' : 'Light',
         dateRange: { from: formatDate(firstTime), to: formatDate(lastTime) },
         dataPoints: data.length,
         enabledMAs,
@@ -887,6 +1101,11 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     // Extended-hours background shading primitive
     extHoursBgRef.current = new ExtendedHoursBgPrimitive();
     candlestickSeriesRef.current.attachPrimitive(extHoursBgRef.current);
+
+    // User chart-selection primitive (draft + committed region / price level)
+    selectionPrimitiveRef.current = new SelectionPrimitive();
+    candlestickSeriesRef.current.attachPrimitive(selectionPrimitiveRef.current);
+    selectionPrimitiveRef.current.setTheme(theme === 'dark' ? 'dark' : 'light');
 
     // Volume histogram series
     volumeSeriesRef.current = chart.addHistogramSeries({
@@ -1444,7 +1663,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   useEffect(() => {
     const is1sPolling = interval === '1s';
     const is1mPolling = interval === '1min';
-    if ((!is1sPolling && !is1mPolling) || chartMode !== 'custom') return;
+    if ((!is1sPolling && !is1mPolling) || effectiveChartMode !== 'custom') return;
 
     let timer = null;
     let aborted = false;
@@ -1510,7 +1729,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
       aborted = true;
       if (timer) clearInterval(timer);
     };
-  }, [interval, symbol, chartMode, updateSeriesData]);
+  }, [interval, symbol, effectiveChartMode, updateSeriesData]);
 
   // --- Effect 3: TimeScale options per interval ---
   useEffect(() => {
@@ -1585,7 +1804,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     setPriceScaleMode((prev) => prev === mode ? PriceScaleMode.Normal : mode);
   }, []);
 
-  const isTV = chartMode === 'tradingview';
+  const isTV = effectiveChartMode === 'tradingview';
 
   // --- Toolbar render helpers (shared between wide & compact layouts) ---
 
@@ -1679,6 +1898,52 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     </>
   );
 
+  // Region / price-level selection — first-class toolbar buttons (kept out of
+  // the secondary Tools dropdown so the agent hand-off is one click away).
+  const renderSelectionButtons = () => (
+    <>
+      <button
+        type="button"
+        className={`chart-tool-btn${selectMode === 'region' ? ' chart-tool-btn-active' : ''}`}
+        onClick={() => setSelectMode((m) => (m === 'region' ? 'off' : 'region'))}
+        title={t('marketView.selection.toolRegion')}
+        aria-label={t('marketView.selection.toolRegion')}
+      >
+        <SquareDashedMousePointer size={14} />
+      </button>
+      <button
+        type="button"
+        className={`chart-tool-btn${selectMode === 'price_level' ? ' chart-tool-btn-active' : ''}`}
+        onClick={() => setSelectMode((m) => (m === 'price_level' ? 'off' : 'price_level'))}
+        title={t('marketView.selection.toolPriceLevel')}
+        aria-label={t('marketView.selection.toolPriceLevel')}
+      >
+        <Ruler size={14} />
+      </button>
+    </>
+  );
+
+  // Light / Advanced (custom vs TradingView) mode toggle. Inline by default;
+  // tucked into the overflow menu at the narrowest tier (phone widths).
+  const renderModeButtons = () => (
+    <div className="interval-selector">
+      <button
+        type="button"
+        className={`interval-btn${!isTV ? ' interval-btn-active' : ''}`}
+        onClick={() => { setChartMode('custom'); setIndicatorsOpen(false); setToolsOpen(false); setViewOpen(false); }}
+      >
+        Light
+      </button>
+      <button
+        type="button"
+        className={`interval-btn${isTV ? ' interval-btn-active' : ''}`}
+        onClick={() => { setChartMode('tradingview'); setIndicatorsOpen(false); setToolsOpen(false); setViewOpen(false); }}
+      >
+        Advanced
+      </button>
+    </div>
+  );
+
   const renderViewButtons = () => (
     <>
       <button
@@ -1698,7 +1963,10 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   );
 
   return (
-    <div className={`market-chart-container${isCompact ? ' chart--compact' : ''}`} ref={rootRef}>
+    <div
+      className={`market-chart-container${toolbarLevel >= 1 ? ' chart--c1' : ''}${toolbarLevel >= 2 ? ' chart--c2' : ''}${toolbarLevel >= 3 ? ' chart--c3' : ''}${toolbarLevel >= 4 ? ' chart--c4' : ''}`}
+      ref={rootRef}
+    >
       {/* ---- Toolbar: intervals, indicator dropdown, values, tools dropdown, mode switcher ---- */}
       <div className="chart-tools">
         <div className="chart-tools-left">
@@ -1763,8 +2031,8 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
           </div>
           {!isTV && (
             <>
-              {/* Indicators dropdown — wide only */}
-              <div className="toolbar-dropdown toolbar--wide-only" ref={indicatorsDropdownRef}>
+              {/* Indicators dropdown — inline until tier 3, then into the menu */}
+              <div className="toolbar-dropdown toolbar-item--indicators" ref={indicatorsDropdownRef}>
                 <button
                   type="button"
                   className={`chart-tool-btn${indicatorsOpen ? ' chart-tool-btn-active' : ''}`}
@@ -1779,8 +2047,8 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
                   </div>
                 )}
               </div>
-              {/* Indicator values — wide only */}
-              <div className="chart-indicators toolbar--wide-only">
+              {/* Indicator values — read-only readouts; dropped first (tier 1) */}
+              <div className="chart-indicators toolbar-item--values">
                 {MA_CONFIGS.filter(({ period }) => enabledMaPeriods.includes(period)).map(({ period, color, label }) => (
                   <span className="indicator-item" key={period}>
                     <span className="indicator-color" style={{ backgroundColor: color }} />
@@ -1807,13 +2075,20 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
                   className="chart-tool-btn chart-clear-annotations-btn"
                   onClick={handleClearAgentAnnotations}
                   title={t('marketView.chart.clearAnnotationsTitle')}
+                  aria-label={t('marketView.chart.clearAnnotations')}
                 >
                   <X size={14} />
-                  {t('marketView.chart.clearAnnotations')}
+                  <span className="clear-label">{t('marketView.chart.clearAnnotations')}</span>
                 </button>
               )}
-              {/* Tools dropdown — wide only */}
-              <div className="toolbar-dropdown toolbar--wide-only" ref={toolsDropdownRef}>
+              {/* Selection tools — first-class, both layouts. Primary entry
+                  point for the chart → agent hand-off, so not buried in a
+                  dropdown. Only meaningful on the Light chart (custom mode). */}
+              <div className="chart-tool-buttons">
+                {renderSelectionButtons()}
+              </div>
+              {/* Tools dropdown — inline until tier 3, then into the menu */}
+              <div className="toolbar-dropdown toolbar-item--tools" ref={toolsDropdownRef}>
                 <button
                   type="button"
                   className={`chart-tool-btn${toolsOpen ? ' chart-tool-btn-active' : ''}`}
@@ -1830,65 +2105,72 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
                   </div>
                 )}
               </div>
-              {/* Zoom, fit, navigation — inline, wide only */}
-              <div className="chart-tool-buttons toolbar--wide-only">
+              {/* Zoom, fit, navigation (scale/view tools) — inline until tier 2 */}
+              <div className="chart-tool-buttons toolbar-item--view">
                 {renderViewButtons()}
               </div>
-              {/* Combined menu — compact only (merges indicators + tools + view) */}
-              <div className="toolbar-dropdown toolbar--compact-only" ref={viewDropdownRef}>
-                <button
-                  type="button"
-                  className={`chart-tool-btn${viewOpen ? ' chart-tool-btn-active' : ''}`}
-                  onClick={() => { setViewOpen((v) => !v); setIndicatorsOpen(false); setToolsOpen(false); }}
-                  title="Chart Settings"
-                >
-                  <Menu size={14} />
-                </button>
-                {viewOpen && (
-                  <div className="toolbar-dropdown-panel toolbar-dropdown-panel--right compact-menu-panel">
-                    {/* Indicators section */}
-                    <div className="compact-menu-section-label">Indicators</div>
-                    {renderIndicatorsContent()}
-                    {/* Tools section */}
-                    <div className="compact-menu-divider" />
-                    <div className="compact-menu-section-label">Tools</div>
-                    <div className="dropdown-tool-grid">
-                      {renderToolsContent()}
+              {/* Overflow menu — appears once anything actionable collapses
+                  (tier 2+). Holds only what's been pulled off the row: View at
+                  tier 2; + Indicators + Tools at tier 3; + Mode at tier 4. */}
+              {toolbarLevel >= 2 && (
+                <div className="toolbar-dropdown toolbar-item--menu" ref={viewDropdownRef}>
+                  <button
+                    type="button"
+                    className={`chart-tool-btn${viewOpen ? ' chart-tool-btn-active' : ''}`}
+                    onClick={() => { setViewOpen((v) => !v); setIndicatorsOpen(false); setToolsOpen(false); }}
+                    title="Chart Settings"
+                  >
+                    <Menu size={14} />
+                  </button>
+                  {viewOpen && (
+                    <div className="toolbar-dropdown-panel toolbar-dropdown-panel--right compact-menu-panel">
+                      {toolbarLevel >= 4 && !isMobile && (
+                        <>
+                          {/* Mode section */}
+                          <div className="compact-menu-section-label">{t('marketView.chart.modeLabel')}</div>
+                          {renderModeButtons()}
+                          <div className="compact-menu-divider" />
+                        </>
+                      )}
+                      {toolbarLevel >= 3 && (
+                        <>
+                          {/* Indicators section */}
+                          <div className="compact-menu-section-label">Indicators</div>
+                          {renderIndicatorsContent()}
+                          {/* Tools section */}
+                          <div className="compact-menu-divider" />
+                          <div className="compact-menu-section-label">Tools</div>
+                          <div className="dropdown-tool-grid">
+                            {renderToolsContent()}
+                          </div>
+                          <div className="compact-menu-divider" />
+                        </>
+                      )}
+                      {/* View section */}
+                      <div className="compact-menu-section-label">View</div>
+                      <div className="dropdown-tool-grid compact-menu-view-grid">
+                        {renderViewButtons()}
+                      </div>
                     </div>
-                    {/* View section */}
-                    <div className="compact-menu-divider" />
-                    <div className="compact-menu-section-label">View</div>
-                    <div className="dropdown-tool-grid compact-menu-view-grid">
-                      {renderViewButtons()}
-                    </div>
-                  </div>
-                )}
-              </div>
+                  )}
+                </div>
+              )}
             </>
           )}
-          <div className="chart-mode-switcher">
-            {/* TV embed-terms attribution. Sibling of the pill so the pill's
-                own background stays symmetric. Only shown when Advanced is
-                active — anchors the attribution to the mode that actually
-                renders TV content. */}
-            {isTV && <TradingViewAttribution />}
-            <div className="interval-selector">
-              <button
-                type="button"
-                className={`interval-btn${!isTV ? ' interval-btn-active' : ''}`}
-                onClick={() => { setChartMode('custom'); setIndicatorsOpen(false); setToolsOpen(false); setViewOpen(false); }}
-              >
-                Light
-              </button>
-              <button
-                type="button"
-                className={`interval-btn${isTV ? ' interval-btn-active' : ''}`}
-                onClick={() => { setChartMode('tradingview'); setIndicatorsOpen(false); setToolsOpen(false); setViewOpen(false); }}
-              >
-                Advanced
-              </button>
+          {/* Mode switch. Hidden entirely on mobile — phones only ever show the
+              Light chart. On desktop, Light (custom) mode tucks it into the
+              overflow menu at tier 4 to save room; Advanced (TV) mode keeps it
+              inline so the required TV attribution is never hidden. */}
+          {!isMobile && (
+            <div className={`chart-mode-switcher${!isTV ? ' toolbar-item--mode' : ''}`}>
+              {/* TV embed-terms attribution. Sibling of the pill so the pill's
+                  own background stays symmetric. Only shown when Advanced is
+                  active — anchors the attribution to the mode that actually
+                  renders TV content. */}
+              {isTV && <TradingViewAttribution />}
+              {renderModeButtons()}
             </div>
-          </div>
+          )}
         </div>
       </div>
 
@@ -1919,7 +2201,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
                 containerWidth={chartContainerRef.current?.clientWidth}
                 containerHeight={chartContainerRef.current?.clientHeight}
               />
-              {chartMode === 'custom' && (
+              {effectiveChartMode === 'custom' && (
                 <AgentEventOverlay
                   chartRef={chartRef}
                   seriesRef={candlestickSeriesRef}
@@ -1929,6 +2211,33 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
                   workspaceId={workspaceId ?? null}
                   symbol={symbol}
                   timeframe={annotationInterval}
+                />
+              )}
+              {effectiveChartMode === 'custom' && (
+                <div
+                  className="chart-selection-capture"
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    zIndex: 15,
+                    // Off while an editor is open so its textarea is usable; the
+                    // user finishes the note (Add/Cancel) before drawing the next.
+                    pointerEvents: selectMode !== 'off' && editorOpenId == null ? 'auto' : 'none',
+                    cursor: selectMode !== 'off' && editorOpenId == null ? 'crosshair' : 'default',
+                    touchAction: selectMode !== 'off' && editorOpenId == null ? 'none' : 'auto',
+                  }}
+                  onPointerDown={handleSelectPointerDown}
+                  onPointerMove={handleSelectPointerMove}
+                  onPointerUp={handleSelectPointerUp}
+                />
+              )}
+              {effectiveChartMode === 'custom' && (
+                <SelectionCommentOverlay
+                  chartRef={chartRef}
+                  seriesRef={candlestickSeriesRef}
+                  symbol={selectionSymbol}
+                  timeframe={annotationInterval}
+                  theme={theme as 'light' | 'dark'}
                 />
               )}
               {scrollLoading && (

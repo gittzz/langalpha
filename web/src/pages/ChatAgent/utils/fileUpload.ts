@@ -1,4 +1,5 @@
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
+import type { ChartSelection } from '@/pages/MarketView/stores/chartSelectionStore';
 
 export const ACCEPTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 export const ACCEPTED_PDF_TYPES = ['application/pdf'];
@@ -113,6 +114,65 @@ export function widgetSnapshotsToContexts(
     }
   }
   return out;
+}
+
+interface ChartSelectionCtxItem {
+  type: 'chart_selection';
+  symbol: string;
+  timeframe: string;
+  selection_type: 'region' | 'price_level';
+  time_start?: string;
+  time_end?: string;
+  price_low: number;
+  price_high: number;
+  bars: ChartSelection['bars'];
+  bars_truncated: boolean;
+  label?: string;
+}
+
+/**
+ * Map a user's chart selection to `additional_context` items.
+ *
+ * Emits one structured `chart_selection` item (bounds + per-candle OHLCV the
+ * agent can analyze and draw back onto the exact region). The selection's chat
+ * representation is the inline pill/card built from this same data — no cropped
+ * screenshot rides along (it persisted as an empty preview-less attachment on
+ * history replay and added little over the exact OHLCV bars).
+ *
+ * Pass `liveSymbol`/`liveTimeframe` to drop a stale selection (the chart was
+ * switched to a different instance after the user drew it).
+ */
+export function chartSelectionToContext(
+  sel: ChartSelection,
+  live?: { symbol?: string | null; timeframe?: string | null },
+): ChartSelectionCtxItem[] {
+  if (live) {
+    const liveSym = (live.symbol ?? '').toUpperCase();
+    const liveTf = live.timeframe ?? '';
+    if ((liveSym && liveSym !== sel.symbol) || (liveTf && liveTf !== sel.timeframe)) {
+      return [];
+    }
+  }
+
+  const comment = sel.comment?.trim();
+  const item: ChartSelectionCtxItem = {
+    type: 'chart_selection',
+    symbol: sel.symbol,
+    timeframe: sel.timeframe,
+    selection_type: sel.selectionType,
+    price_low: sel.priceLow,
+    price_high: sel.priceHigh,
+    bars: sel.bars,
+    bars_truncated: sel.barsTruncated,
+  };
+  if (sel.selectionType === 'region') {
+    item.time_start = sel.timeStart;
+    item.time_end = sel.timeEnd;
+  }
+  // The user's per-selection note rides as `label`, separate from the message.
+  if (comment) item.label = comment;
+
+  return [item];
 }
 
 /**

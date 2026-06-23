@@ -96,6 +96,12 @@ interface LocationState {
    */
   widgetSnapshots?: WidgetContextSnapshot[];
   /**
+   * Chart selection snapshots forwarded from MarketView's PTC send so the
+   * auto-fired user message renders the selection cards live (they also persist
+   * to metadata, so replay re-renders them regardless).
+   */
+  chartSelections?: import('@/pages/MarketView/stores/chartSelectionStore').ChartSelectionSnapshot[];
+  /**
    * Skill names to preload as hidden skills (chart-annotation forwarding from
    * MarketView). Merged into `additionalContext` as `{type:'skills',name}` on
    * the auto-fire send so hidden skills stay active on the PTC side.
@@ -1848,26 +1854,26 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         // New thread - send immediately
         initialMessageSentRef.current = true;
         // Capture state values before clearing (navigate may update location ref)
-        const { initialMessage, planMode, additionalContext, attachmentMeta, model, reasoningEffort, widgetSnapshots, skills } = location.state;
+        const { initialMessage, planMode, additionalContext, attachmentMeta, model, reasoningEffort, widgetSnapshots, chartSelections, skills } = location.state;
         const mergedContext = mergeSkills(additionalContext, skills);
         // Clear navigation state to prevent re-sending on re-renders
         navigate(location.pathname, { replace: true, state: {} });
         // Small delay to ensure component is fully mounted
         setTimeout(() => {
-          handleSendMessage(initialMessage, planMode || false, mergedContext, attachmentMeta || null, { model, reasoningEffort, widgetSnapshots });
+          handleSendMessage(initialMessage, planMode || false, mergedContext, attachmentMeta || null, { model, reasoningEffort, widgetSnapshots, chartSelections });
         }, 100);
       } else if (!isLoadingHistory && !isLoading) {
         // Existing thread - wait for history to load, then send
         // This ensures we don't send duplicate messages
         initialMessageSentRef.current = true;
         // Capture state values before clearing (navigate may update location ref)
-        const { initialMessage, planMode, additionalContext, attachmentMeta, model, reasoningEffort, widgetSnapshots, skills } = location.state;
+        const { initialMessage, planMode, additionalContext, attachmentMeta, model, reasoningEffort, widgetSnapshots, chartSelections, skills } = location.state;
         const mergedContext = mergeSkills(additionalContext, skills);
         // Clear navigation state to prevent re-sending on re-renders
         navigate(location.pathname, { replace: true, state: {} });
         // Small delay to ensure component is fully mounted
         setTimeout(() => {
-          handleSendMessage(initialMessage, planMode || false, mergedContext, attachmentMeta || null, { model, reasoningEffort, widgetSnapshots });
+          handleSendMessage(initialMessage, planMode || false, mergedContext, attachmentMeta || null, { model, reasoningEffort, widgetSnapshots, chartSelections });
         }, 100);
       }
     }

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, RefreshCw, MessageSquare, Loader2, ScrollText } from 'lucide-react';
+import { ArrowLeft, RefreshCw, MessageSquare, Loader2, ScrollText, X } from 'lucide-react';
 import { queryKeys } from '@/lib/queryKeys';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import LogoLoading from '@/components/ui/logo-loading';
@@ -25,6 +25,8 @@ import MarketChatHistoryButton from './MarketChatHistoryButton';
 import MarketDetailDialog, { type DialogPayload } from './MarketDetailDialog';
 import { getMarketThreadId, setMarketThreadId, clearMarketThreadId } from '../utils/threadPersistence';
 import { normalizeTimeframe } from '../stores/chartAnnotationStore';
+import { chartSelectionStore, useChartSelections, isConfirmedFor } from '../stores/chartSelectionStore';
+import { buildChartSelectionSend } from '../utils/selectionSend';
 import { marketViewAnnotationContext } from '../constants/annotationPrompt';
 import './MarketPanel.css';
 
@@ -279,6 +281,17 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const isNarrowChat = useNarrowContainer(messagesContainerRef, 640);
 
+  // The user's confirmed chart selections (region / price level). Render a chip
+  // per selection that still matches the live chart instance — selections drawn
+  // on another ticker/timeframe are stale and dropped on send anyway.
+  const { selections } = useChartSelections();
+  const liveSym = symbol ? symbol.toUpperCase() : '';
+  const liveTf = normalizeTimeframe(interval);
+  const chips = useMemo(
+    () => selections.filter((s) => isConfirmedFor(s, liveSym, liveTf)),
+    [selections, liveSym, liveTf],
+  );
+
   // PTC zero-state — disable PTC option if user has no non-flash workspaces.
   const ptcDisabledReason = ptcWorkspaces.length === 0
     ? t('marketView.chatPanel.ptcDisabledReason')
@@ -482,11 +495,23 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         });
       }
 
+      // Append every confirmed chart selection (region/price level + note) for
+      // the live (sym, tf); a stale one is dropped. The same set is snapshotted
+      // for the sent message's cards, and a lone note becomes the message text
+      // when the user typed nothing (so the bubble isn't empty).
+      const { contexts: selectionContexts, snapshots: selectionSnapshots, outgoingMessage } =
+        buildChartSelectionSend(sym, tf, message);
+      contexts.push(...selectionContexts);
+
       const additionalContext = contexts.length > 0 ? contexts : null;
       const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
-      handleSendMessage(message, planMode, additionalContext, attachmentMeta, modelOptions);
+      handleSendMessage(outgoingMessage, planMode, additionalContext, attachmentMeta, {
+        ...modelOptions,
+        ...(selectionSnapshots.length > 0 ? { chartSelections: selectionSnapshots } : {}),
+      });
       onClearChartImage();
+      chartSelectionStore.clearAll();
     },
     [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage],
   );
@@ -810,6 +835,82 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         </div>
       )}
 
+      {/* Chart selection chips — the regions / price levels the user picked on
+          the chart, each with its note, ready to attach to the next send. Click
+          a chip to re-open its note editor on the chart; ✕ removes it. Sits
+          directly above the input, matching the status-banner layout. */}
+      {chips.length > 0 && (
+        <div style={{ padding: '0 12px', marginBottom: 6, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {chips.map((c) => {
+            const baseLabel = c.selectionType === 'region'
+              ? t('marketView.selection.chipRegion', { symbol: c.symbol, timeframe: c.timeframe })
+              : t('marketView.selection.chipPriceLevel', {
+                  price: Number.isFinite(c.priceLow) ? c.priceLow.toFixed(2) : '—',
+                  symbol: c.symbol,
+                  timeframe: c.timeframe,
+                });
+            const label = c.comment ? `${baseLabel} · "${c.comment}"` : baseLabel;
+            return (
+              <span
+                key={c.id}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  maxWidth: '100%',
+                  padding: '4px 6px 4px 10px',
+                  borderRadius: 6,
+                  background: 'var(--color-accent-soft)',
+                  border: '1px solid var(--color-accent-overlay)',
+                  color: 'var(--color-text-secondary)',
+                  fontSize: 12,
+                }}
+              >
+                <button
+                  type="button"
+                  title={t('marketView.selection.editChip')}
+                  onClick={() => chartSelectionStore.openEditor(c.id)}
+                  style={{
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    maxWidth: 240,
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'inherit',
+                    font: 'inherit',
+                    padding: 0,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {label}
+                </button>
+                <button
+                  type="button"
+                  aria-label={t('marketView.selection.removeChip')}
+                  onClick={() => chartSelectionStore.remove(c.id)}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    flexShrink: 0,
+                    width: 16,
+                    height: 16,
+                    padding: 0,
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'var(--color-text-tertiary)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <X style={{ width: 12, height: 12 }} />
+                </button>
+              </span>
+            );
+          })}
+        </div>
+      )}
+
       {/* Input */}
       <ChatInput
         ref={chatInputRef}
@@ -829,6 +930,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         onRemoveChartImage={onClearChartImage}
         prefillMessage={prefillMessage}
         onClearPrefill={onClearPrefill}
+        hasExternalContext={chips.length > 0}
         placeholder={
           wasStopped && !isLoading && !pendingInterrupt && !pendingRejection
             ? t('chat.placeholderStopped')

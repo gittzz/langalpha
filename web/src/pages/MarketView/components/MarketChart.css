@@ -416,14 +416,33 @@
   opacity: 0.9;
 }
 
-/* ===== Responsive toolbar: compact mode driven by container width ===== */
-.toolbar--compact-only { display: none; }
+/* ===== Responsive toolbar: progressive collapse by container width =====
+   Cumulative tiers (chart--c1 ⊂ c2 ⊂ c3) sacrifice items least-important first:
+   indicator values → scale/view tools → indicators + tools dropdowns. The
+   interval selector, Clear, selection tools and Light/Advanced always stay
+   inline; collapsed actionable items move into the overflow menu, which the
+   component only renders from tier 2 on. */
 
-.chart--compact .chart-tools { padding: 8px 12px; }
-.chart--compact .chart-tools-left { gap: 8px; }
-.chart--compact .chart-tools-right { gap: 6px; }
-.chart--compact .toolbar--wide-only { display: none !important; }
-.chart--compact .toolbar--compact-only { display: flex; }
+/* Tier 1: drop the read-only indicator values. */
+.chart--c1 .toolbar-item--values { display: none; }
+
+/* Tier 2: collapse the scale / view buttons into the overflow menu + tighten. */
+.chart--c2 .chart-tools { padding: 8px 12px; }
+.chart--c2 .chart-tools-left { gap: 8px; }
+.chart--c2 .chart-tools-right { gap: 6px; }
+.chart--c2 .toolbar-item--view { display: none; }
+
+/* Tier 3: collapse the indicators + tools dropdowns into the menu too. */
+.chart--c3 .toolbar-item--indicators,
+.chart--c3 .toolbar-item--tools { display: none; }
+
+/* Tier 4 (phone): tuck the Light/Advanced switch into the menu and drop the
+   Clear button's label so it goes icon-only. Keeps the interval selector, Clear
+   and the selection tools on a single row at the narrowest widths. The mode
+   switch is only tagged collapsible in Light mode, so the required TradingView
+   attribution (Advanced mode) is never hidden. */
+.chart--c4 .toolbar-item--mode { display: none; }
+.chart--c4 .chart-clear-annotations-btn .clear-label { display: none; }
 
 .compact-menu-panel { min-width: 240px; }
 .compact-menu-section-label {
@@ -442,7 +461,7 @@
 
 /* Mobile: compact menu stretches under toolbar, tighter spacing */
 @media (max-width: 767px) {
-  .chart--compact .toolbar-dropdown.toolbar--compact-only {
+  .toolbar-dropdown.toolbar-item--menu {
     position: static;
   }
   .compact-menu-panel {

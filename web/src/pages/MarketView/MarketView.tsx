@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useToast } from '@/components/ui/use-toast';
 import './MarketView.css';
@@ -6,7 +6,7 @@ import DashboardHeader from '../Dashboard/components/DashboardHeader';
 import StockHeader from './components/StockHeader';
 import MarketChart from './components/MarketChart';
 import type { MarketChartHandle } from './components/MarketChart';
-import ChatInput from '../../components/ui/chat-input';
+import ChatInput, { type ChatInputHandle } from '../../components/ui/chat-input';
 import MarketChatPanel from './components/MarketChatPanel';
 import MarketSidebarPanel from './components/MarketSidebarPanel';
 import { INTERVALS, supports1sInterval } from './utils/chartConstants';
@@ -27,6 +27,8 @@ import { useChartAnnotationSync } from './hooks/useChartAnnotationSync';
 import { getOrFetchFlashWorkspaceId } from './utils/flashWorkspace';
 import { marketViewAnnotationContext } from './constants/annotationPrompt';
 import { normalizeTimeframe, subscribeLiveAnnotationAdd } from './stores/chartAnnotationStore';
+import { chartSelectionStore, isConfirmedFor, useChartSelections } from './stores/chartSelectionStore';
+import { buildChartSelectionSend } from './utils/selectionSend';
 
 interface SearchResult {
   name?: string;
@@ -126,6 +128,8 @@ function MarketViewInner() {
   const [chartMeta, setChartMeta] = useState<Record<string, unknown> | null>(null);
   const [selectedInterval, setSelectedInterval] = useState<string>(() => loadPref('interval', '1day'));
   const chartRef = useRef<MarketChartHandle>(null);
+  // Mobile FAB ChatInput handle.
+  const mobileChatInputRef = useRef<ChatInputHandle>(null);
   const [chartImage, setChartImage] = useState<string | null>(null);       // base64 data URL
   const [chartImageDesc, setChartImageDesc] = useState<string | null>(null); // text description for LLM
   const [showOverview, setShowOverview] = useState<boolean>(false);
@@ -333,6 +337,15 @@ function MarketViewInner() {
   const realTimePriceMatch = realTimePrice?.symbol === selectedStock ? realTimePrice : null;
   const displayPrice = wsPrices.get(selectedStock) || realTimePriceMatch;
 
+  // A confirmed chart selection for the live chart rides on send (even with an
+  // empty box), so let the mobile input treat it as sendable content.
+  const { selections: chartSelections } = useChartSelections();
+  const hasChartSelectionForChart = useMemo(() => {
+    const sym = (selectedStock || '').toUpperCase();
+    const tf = normalizeTimeframe(selectedInterval);
+    return chartSelections.some((s) => isConfirmedFor(s, sym, tf));
+  }, [chartSelections, selectedStock, selectedInterval]);
+
   // Fetch workspaces for the workspace selector (PTC mode)
   useEffect(() => {
     let cancelled = false;
@@ -439,6 +452,13 @@ function MarketViewInner() {
     if (attachments && attachments.length > 0) {
       contexts.push(...attachmentsToContexts(attachments as any));
     }
+    // Append every confirmed chart selection (region/price level + note) for
+    // the live (sym, tf); a stale one is dropped. The same set is snapshotted
+    // for the sent message's cards, and a lone note becomes the message text
+    // when the user typed nothing (so the bubble isn't empty).
+    const { contexts: selectionContexts, snapshots: selectionSnapshots, outgoingMessage } =
+      buildChartSelectionSend(sym, tf, message);
+    contexts.push(...selectionContexts);
     const imageContext = contexts.length > 0 ? contexts : null;
 
     // Build attachment metadata for display in user message bubble
@@ -466,7 +486,8 @@ function MarketViewInner() {
     const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
     if (mode === 'fast') {
-      handleFastModeSend(message, imageContext, attachmentMeta, model);
+      handleFastModeSend(outgoingMessage, imageContext, attachmentMeta, model);
+      chartSelectionStore.clearAll();
     } else {
       // PTC mode: use selected workspace or fall back to default
       try {
@@ -483,17 +504,19 @@ function MarketViewInner() {
         navigate(`/chat/t/__default__`, {
           state: {
             workspaceId,
-            initialMessage: message,
+            initialMessage: outgoingMessage,
             planMode: planMode || false,
             additionalContext: imageContext,
             // PTC side needs the same skill activated so the chart tools
             // are available without the LLM having to call LoadSkill.
             skills: ['chart-annotation'],
+            ...(selectionSnapshots.length > 0 ? { chartSelections: selectionSnapshots } : {}),
             ...(attachmentMeta ? { attachmentMeta } : {}),
             ...(model ? { model } : {}),
             ...(reasoningEffort ? { reasoningEffort } : {}),
           },
         });
+        chartSelectionStore.clearAll();
       } catch (error) {
         console.error('Error setting up PTC mode:', error);
         toast({
@@ -611,6 +634,7 @@ function MarketViewInner() {
             className="market-mobile-chat-float"
           >
             <ChatInput
+              ref={mobileChatInputRef}
               onSend={(...args: any[]) => { (handleSendMessage as any)(...args); setChatExpanded(false); }}
               isLoading={isLoading}
               mode={mode}
@@ -623,6 +647,7 @@ function MarketViewInner() {
               onRemoveChartImage={() => { setChartImage(null); setChartImageDesc(null); }}
               prefillMessage={prefillMessage}
               onClearPrefill={() => setPrefillMessage('')}
+              hasExternalContext={hasChartSelectionForChart}
               placeholder="Ask about this stock..."
             />
           </MobileFabChat>

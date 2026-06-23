@@ -2125,7 +2125,34 @@
     "chart": {
       "clearAnnotations": "Clear",
       "clearAnnotationsTitle": "Clear annotations from the chart (kept in chat — click the artifact to restore)",
+      "modeLabel": "Mode",
       "newsEventAria": "News event: {{title}}"
+    },
+    "selection": {
+      "toolTooltip": "Select a region or price level to ask the agent",
+      "toolRegion": "Region",
+      "toolPriceLevel": "Price level",
+      "commentPlaceholder": "Add a comment…",
+      "commentAdd": "Add",
+      "commentSave": "Save",
+      "cardRegionTitle": "Selected region",
+      "cardPriceTitle": "Selected price level",
+      "cardOpenPreview": "View what the agent sees",
+      "previewSubtitle": "The context the agent received for this selection",
+      "previewKind": "Selection",
+      "previewTimeRange": "Time range",
+      "previewPrice": "Price",
+      "previewNote": "Your note",
+      "previewBars": "OHLCV bars",
+      "previewBarsCount": "{{count}} bar",
+      "previewBarsCount_other": "{{count}} bars",
+      "previewBarsShown": "Showing {{shown}} of {{total}} bars",
+      "previewBarsTruncated": "downsampled to fit",
+      "previewDrawBack": "The agent can analyze this and draw its read back onto the same region of the chart.",
+      "editChip": "Edit note",
+      "chipRegion": "Region · {{symbol}} {{timeframe}}",
+      "chipPriceLevel": "Price ${{price}} · {{symbol}} {{timeframe}}",
+      "removeChip": "Remove selection"
     }
   },
   "onboarding": {

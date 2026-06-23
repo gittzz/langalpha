@@ -144,6 +144,14 @@ export function handleHistoryUserMessage({
         userMessage.widgetSnapshots = event.metadata!.widget_contexts;
       }
 
+      // Restore chart-selection summaries so the selection cards re-render
+      // below this user message on replay. Backend persists them already in
+      // the camelCase snapshot shape the card reads.
+      const chartSelections = event.metadata?.chart_selections as unknown[] | undefined;
+      if (chartSelections && chartSelections.length > 0) {
+        userMessage.chartSelections = event.metadata!.chart_selections;
+      }
+
       setMessages((prev: MessageRecord[]) => {
         const insertIndex = newMessagesStartIndexRef.current;
         const newMessages = [

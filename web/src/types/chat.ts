@@ -294,6 +294,14 @@ export interface UserMessage {
    * backend via `additional_context`.
    */
   widgetSnapshots?: import('@/pages/Dashboard/widgets/framework/contextSnapshot').WidgetContextSnapshot[];
+  /**
+   * Chart selections (region / price level) the user attached to this message.
+   * Rendered as read-only pills below the user bubble (like widget snapshots)
+   * and forwarded to the backend via `additional_context`. A compact camelCase
+   * summary is persisted to the turn's query metadata, so history replay
+   * re-renders these cards (see serialize_chart_selections_for_metadata).
+   */
+  chartSelections?: import('@/pages/MarketView/stores/chartSelectionStore').ChartSelectionSnapshot[];
   steeringDelivered?: boolean;
   steering?: boolean;
 }

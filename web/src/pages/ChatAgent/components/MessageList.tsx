@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo, memo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Bot, User, FileText, FileSearch, ImageIcon, Pencil, RefreshCw, RotateCcw, Copy, Check, Info, ThumbsUp, ThumbsDown, StopCircle } from 'lucide-react';
+import { Bot, User, FileText, FileSearch, ImageIcon, Pencil, RefreshCw, RotateCcw, Copy, Check, Info, ThumbsUp, ThumbsDown, StopCircle, SquareDashedMousePointer, Ruler } from 'lucide-react';
 import { type WidgetContextPreviewShape } from '@/pages/Dashboard/widgets/framework/WidgetContextPreview';
 import { WidgetContextDeck } from '@/pages/Dashboard/widgets/framework/WidgetContextDeck';
+import { SelectionContextPreview, type SelectionPreviewShape } from './SelectionContextPreview';
 import { useIsMobile } from '@/hooks/useIsMobile';
 
 import ThumbDownModal from './ThumbDownModal';
@@ -134,6 +135,11 @@ export function normalizeSubagentText(content: string | null | undefined): strin
     .join('\n\n');
 }
 
+/** Selection price with 2 decimals (matching StockHeader); `—` when absent. */
+function fmtSelectionPrice(n: number | null | undefined): string {
+  return n == null || !Number.isFinite(n) ? '—' : n.toFixed(2);
+}
+
 /** Map artifact type -> inline artifact component */
 const INLINE_ARTIFACT_MAP: Record<string, React.ComponentType<{ artifact: Record<string, unknown>; onClick?: () => void }>> = {
   stock_prices: InlineStockPriceCard,
@@ -199,6 +205,82 @@ function InlineWidgetDeck({ snapshots }: { snapshots: WidgetChipShape[] }) {
         paddingBottom: 0,
       }}
     />
+  );
+}
+
+/**
+ * Read-only cards below the user bubble summarizing the chart selections
+ * (region / price level + note) attached to this send. Styled like the
+ * widget-context cards: an icon thumb plus a title and a note/bounds snippet.
+ * Clicking a card opens a "how the agent sees it" preview of its context.
+ */
+function InlineSelectionCards({ selections }: { selections: SelectionPreviewShape[] }) {
+  const { t } = useTranslation();
+  const [previewed, setPreviewed] = useState<SelectionPreviewShape | null>(null);
+  return (
+    <div className="flex flex-col items-end gap-1.5">
+      {selections.map((s, idx) => {
+        const Icon = s.selectionType === 'region' ? SquareDashedMousePointer : Ruler;
+        const title = s.selectionType === 'region'
+          ? t('marketView.selection.cardRegionTitle')
+          : t('marketView.selection.cardPriceTitle');
+        const bounds = s.selectionType === 'region'
+          ? `$${fmtSelectionPrice(s.priceLow)} – $${fmtSelectionPrice(s.priceHigh)}`
+          : `$${fmtSelectionPrice(s.priceLow)}`;
+        // Prefer the user's note as the snippet; fall back to the bounds.
+        const snippet = s.comment ? `“${s.comment}”` : bounds;
+        return (
+          <button
+            key={idx}
+            type="button"
+            onClick={() => setPreviewed(s)}
+            title={t('marketView.selection.cardOpenPreview')}
+            className="flex items-center gap-2.5 text-left transition-colors hover:brightness-105"
+            style={{
+              width: 280,
+              maxWidth: '100%',
+              padding: '8px 12px',
+              borderRadius: 10,
+              background: 'var(--color-bg-elevated)',
+              border: '1px solid var(--color-border-muted)',
+              boxShadow: 'var(--shadow-card)',
+              cursor: 'pointer',
+            }}
+          >
+            <div
+              className="flex items-center justify-center flex-shrink-0"
+              style={{
+                width: 34,
+                height: 34,
+                borderRadius: 8,
+                background: 'var(--color-accent-soft)',
+                color: 'var(--color-accent-light)',
+              }}
+            >
+              <Icon className="h-4 w-4" />
+            </div>
+            <div className="min-w-0 flex flex-col">
+              <div
+                className="truncate"
+                style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}
+              >
+                {title}
+                <span style={{ fontWeight: 400, color: 'var(--color-text-tertiary)' }}>
+                  {' · '}{s.symbol} {s.timeframe}
+                </span>
+              </div>
+              <div
+                className="truncate"
+                style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}
+              >
+                {snippet}
+              </div>
+            </div>
+          </button>
+        );
+      })}
+      <SelectionContextPreview selection={previewed} onClose={() => setPreviewed(null)} />
+    </div>
   );
 }
 
@@ -513,6 +595,8 @@ const MessageBubble = memo(function MessageBubble({ message, isLoading, hideAvat
   const hasAttachments = isUser && attachments && attachments.length > 0;
   const widgetSnapshots = message.widgetSnapshots as WidgetChipShape[] | undefined;
   const hasWidgetSnapshots = isUser && widgetSnapshots && widgetSnapshots.length > 0;
+  const chartSelections = message.chartSelections as SelectionPreviewShape[] | undefined;
+  const hasChartSelections = isUser && chartSelections && chartSelections.length > 0;
 
   // Edit mode state
   const [isEditing, setIsEditing] = useState(false);
@@ -848,6 +932,12 @@ const MessageBubble = memo(function MessageBubble({ message, isLoading, hideAvat
             scoped to the message that attached them. */}
         {hasWidgetSnapshots && (
           <InlineWidgetDeck snapshots={widgetSnapshots!} />
+        )}
+
+        {/* Chart selection cards -- the regions / price levels the user picked
+            on the chart and attached to this send. Read-only summary. */}
+        {hasChartSelections && (
+          <InlineSelectionCards selections={chartSelections!} />
         )}
         </>
         )}
