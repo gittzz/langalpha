@@ -1132,3 +1132,35 @@ class TestResolveTimezone:
 
         mock_locale.assert_called_once_with("en-US", "en")
         assert result == "UTC"
+
+
+class TestInjectInlineReminders:
+    def _inject(self, messages, reminders, prefix="TEST"):
+        from src.server.handlers.chat._common import inject_inline_reminders
+
+        return inject_inline_reminders(messages, reminders, log_prefix=prefix)
+
+    def test_none_messages_is_noop(self):
+        # HITL-resume / checkpoint-replay path: no target list, must not raise.
+        self._inject(None, [("\nreminder", "detail")])
+
+    def test_empty_messages_is_noop(self):
+        msgs = []
+        self._inject(msgs, [("\nreminder", "detail")])
+        assert msgs == []
+
+    def test_appends_present_reminders_in_order(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        self._inject(msgs, [("\nA", "a"), ("\nB", "b")])
+        assert msgs[-1]["content"] == "hi\nA\nB"
+
+    def test_skips_absent_reminders(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        self._inject(msgs, [(None, "skip"), ("", "skip2"), ("\nX", "x")])
+        assert msgs[-1]["content"] == "hi\nX"
+
+    def test_logs_only_for_present_reminders(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        with patch(f"{COMMON}.logger") as mock_logger:
+            self._inject(msgs, [("\nA", "a injected"), (None, "skipped")], prefix="PTC_CHAT")
+        mock_logger.info.assert_called_once_with("[PTC_CHAT] a injected")

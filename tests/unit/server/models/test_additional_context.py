@@ -9,8 +9,10 @@ from pydantic import TypeAdapter, ValidationError
 
 from src.server.models.additional_context import (
     AdditionalContext,
+    ChartSelectionContext,
     DirectiveContext,
     MultimodalContext,
+    SelectionBar,
     SkillContext,
     WidgetContext,
 )
@@ -62,6 +64,103 @@ class TestDiscriminator:
         assert isinstance(ctx, WidgetContext)
         assert ctx.widget_type == "markets.chart"
         assert ctx.label == "NVDA"
+
+    def test_chart_selection_routes_to_chart_selection_context(self):
+        ctx = _adapter.validate_python(
+            {
+                "type": "chart_selection",
+                "symbol": "NVDA",
+                "timeframe": "1day",
+                "selection_type": "region",
+                "time_start": "2024-01-03T00:00:00.000Z",
+                "time_end": "2024-02-15T00:00:00.000Z",
+                "price_low": 180.5,
+                "price_high": 195.0,
+            }
+        )
+        assert isinstance(ctx, ChartSelectionContext)
+        assert ctx.symbol == "NVDA"
+        assert ctx.selection_type == "region"
+
+
+class TestChartSelectionContextValidation:
+    def test_region_requires_both_times(self):
+        with pytest.raises(ValidationError):
+            _adapter.validate_python(
+                {
+                    "type": "chart_selection",
+                    "symbol": "NVDA",
+                    "timeframe": "1day",
+                    "selection_type": "region",
+                    "time_start": "2024-01-03T00:00:00.000Z",
+                    "price_low": 180.5,
+                    "price_high": 195.0,
+                }
+            )
+
+    def test_price_range_normalized(self):
+        ctx = _adapter.validate_python(
+            {
+                "type": "chart_selection",
+                "symbol": "NVDA",
+                "timeframe": "1day",
+                "selection_type": "price_level",
+                "price_low": 195.0,
+                "price_high": 180.5,
+            }
+        )
+        assert ctx.price_low == 180.5
+        assert ctx.price_high == 195.0
+
+    def test_bad_timeframe_rejected(self):
+        with pytest.raises(ValidationError):
+            _adapter.validate_python(
+                {
+                    "type": "chart_selection",
+                    "symbol": "NVDA",
+                    "timeframe": "2day",
+                    "selection_type": "price_level",
+                    "price_low": 200.0,
+                    "price_high": 200.0,
+                }
+            )
+
+    def test_nan_price_rejected(self):
+        with pytest.raises(ValidationError):
+            _adapter.validate_python(
+                {
+                    "type": "chart_selection",
+                    "symbol": "NVDA",
+                    "timeframe": "1day",
+                    "selection_type": "price_level",
+                    "price_low": float("nan"),
+                    "price_high": float("nan"),
+                }
+            )
+
+
+class TestSelectionBar:
+    def test_nan_inf_open_rejected(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValidationError):
+                SelectionBar(time="2024-01-03T00:00:00.000Z", open=bad)
+
+    def test_unknown_keys_dropped(self):
+        bar = SelectionBar.model_validate(
+            {
+                "time": "2024-01-03T00:00:00.000Z",
+                "open": 1.0,
+                "vwap": 1.5,
+                "extra": "ignored",
+            }
+        )
+        assert bar.open == 1.0
+        assert not hasattr(bar, "vwap")
+        assert "vwap" not in bar.model_dump()
+
+    def test_oversize_time_rejected(self):
+        with pytest.raises(ValidationError):
+            SelectionBar(time="x" * 41)
 
 
 class TestWidgetContextValidation:
