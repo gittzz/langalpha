@@ -168,15 +168,17 @@ export function SelectionContextPreview({
                 <table className="w-full text-xs" style={{ borderCollapse: 'collapse' }}>
                   <thead>
                     <tr style={{ color: 'var(--color-text-tertiary)' }}>
-                      {['time', 'open', 'high', 'low', 'close', 'volume'].map((h) => (
-                        <th
-                          key={h}
-                          className="text-left font-medium px-2 py-1"
-                          style={{ borderBottom: '1px solid var(--color-border-muted)' }}
-                        >
-                          {h}
-                        </th>
-                      ))}
+                      {(['colTime', 'colOpen', 'colHigh', 'colLow', 'colClose', 'colVolume'] as const).map(
+                        (col) => (
+                          <th
+                            key={col}
+                            className="text-left font-medium px-2 py-1"
+                            style={{ borderBottom: '1px solid var(--color-border-muted)' }}
+                          >
+                            {t(`marketView.selection.${col}`)}
+                          </th>
+                        ),
+                      )}
                     </tr>
                   </thead>
                   <tbody style={{ color: 'var(--color-text-secondary)' }}>

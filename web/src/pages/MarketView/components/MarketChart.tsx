@@ -502,6 +502,14 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     // Tool stays armed so the user can keep drawing; Esc / the tool button disarms.
   }, [commitRegionSelection, selectionSymbol, annotationInterval]);
 
+  const handleSelectPointerCancel = useCallback(() => {
+    // Pointer sequence aborted (touch interrupted, capture stolen) before a
+    // pointerup — drop the in-progress draft and disarm the drag so the box
+    // doesn't stick on screen. Tool stays armed, like a stray pointerup.
+    selectDragRef.current = null;
+    selectionPrimitiveRef.current?.setDraft(null);
+  }, []);
+
   // --- Live tick updates from WS (1s and 1min intervals, custom/Light mode only) ---
   useEffect(() => {
     if (!liveTick || !candlestickSeriesRef.current) return;
@@ -2229,6 +2237,8 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
                   onPointerDown={handleSelectPointerDown}
                   onPointerMove={handleSelectPointerMove}
                   onPointerUp={handleSelectPointerUp}
+                  onPointerCancel={handleSelectPointerCancel}
+                  onLostPointerCapture={handleSelectPointerCancel}
                 />
               )}
               {effectiveChartMode === 'custom' && (

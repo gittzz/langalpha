@@ -10,6 +10,9 @@
  * so it works for both in-memory `ChartDataBar`s and serialized `SelectionBar`s.
  */
 export function downsampleBars<T>(bars: T[], max: number): { bars: T[]; truncated: boolean } {
+  if (!Number.isInteger(max) || max <= 0) {
+    throw new RangeError(`downsampleBars: max must be a positive integer, got ${max}`);
+  }
   if (bars.length <= max) {
     return { bars, truncated: false };
   }
