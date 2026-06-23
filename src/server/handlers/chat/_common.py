@@ -76,6 +76,28 @@ def _append_to_last_user_message(messages: list[dict], text: str) -> None:
         last_msg["content"].append({"type": "text", "text": text})
 
 
+def inject_inline_reminders(
+    messages: Optional[list[dict]],
+    reminders: list[tuple[Optional[str], str]],
+    *,
+    log_prefix: str,
+) -> None:
+    """Append each present reminder to the last user message, logging each.
+
+    ``reminders`` is an ordered list of ``(reminder_text, log_detail)``; falsy
+    reminders are skipped. No-op when ``messages`` is falsy — callers pass
+    ``None`` on HITL-resume / checkpoint-replay turns, where the appended list
+    is discarded downstream.
+    """
+    if not messages:
+        return
+    for reminder, detail in reminders:
+        if not reminder:
+            continue
+        _append_to_last_user_message(messages, reminder)
+        logger.info(f"[{log_prefix}] {detail}")
+
+
 def _resolve_timezone(request_timezone: Optional[str], locale: Optional[str]) -> str:
     """Validate request timezone, falling back to locale-based default."""
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError

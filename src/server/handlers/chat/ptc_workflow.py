@@ -43,6 +43,11 @@ from src.server.utils.widget_context import (
     parse_widget_contexts,
     serialize_widget_contexts_for_metadata,
 )
+from src.server.utils.chart_selection_context import (
+    build_chart_selection_reminder,
+    parse_chart_selection_contexts,
+    serialize_chart_selections_for_metadata,
+)
 from src.llms.llm import get_input_modalities
 from src.server.utils.multimodal_context import (
     build_attachment_metadata,
@@ -68,6 +73,7 @@ from ._common import (
     ensure_thread,
     handle_workflow_error,
     init_tracking,
+    inject_inline_reminders,
     inject_skills,
     logger,
     normalize_request_messages,
@@ -359,6 +365,11 @@ async def astream_ptc_workflow(
             if widget_ctxs:
                 query_metadata["widget_contexts"] = serialize_widget_contexts_for_metadata(
                     widget_ctxs
+                )
+            selection_ctxs = parse_chart_selection_contexts(request.additional_context)
+            if selection_ctxs:
+                query_metadata["chart_selections"] = serialize_chart_selections_for_metadata(
+                    selection_ctxs
                 )
 
         # Persist lightweight additional_context + slash command fallback
@@ -700,36 +711,38 @@ async def astream_ptc_workflow(
             logger.info(f"[PTC_CHAT] Plan mode enabled for thread_id={thread_id}")
 
         # =====================================================================
-        # Directive Context Injection (inline with user message)
+        # Inline Context Injection (directive + widget + chart selection)
         # =====================================================================
+        # Each appends a <system-reminder> to the last user message, in order.
+        # Widget image bytes ride MultimodalContext(type='image') above; chart
+        # selections carry structured bounds + OHLCV bars (no screenshot). The
+        # target is None on HITL-resume / checkpoint-replay (input_state is a
+        # Command / None there), so injection is skipped on those turns.
         directives = parse_directive_contexts(request.additional_context)
-        directive_reminder = build_directive_reminder(directives)
-        if directive_reminder and not request.hitl_response:
-            if isinstance(input_state, dict) and input_state.get("messages"):
-                _append_to_last_user_message(
-                    input_state["messages"], directive_reminder
-                )
-                logger.info(
-                    f"[PTC_CHAT] Directive context injected inline ({len(directives)} directives)"
-                )
-
-        # =====================================================================
-        # Widget Context Injection (inline with user message)
-        # =====================================================================
-        # Each WidgetContext carries pre-rendered <widget-context>...</widget-context>
-        # text. We concatenate them into one <system-reminder> envelope and append
-        # to the last user message. Image bytes for chart-type widgets travel as
-        # MultimodalContext(type='image') items above and use the existing modality
-        # gate — no special handling here.
-        widget_reminder = build_widget_context_reminder(widget_ctxs)
-        if widget_reminder and not request.hitl_response:
-            if isinstance(input_state, dict) and input_state.get("messages"):
-                _append_to_last_user_message(
-                    input_state["messages"], widget_reminder
-                )
-                logger.info(
-                    f"[PTC_CHAT] Widget context injected inline ({len(widget_ctxs)} widgets)"
-                )
+        chart_selections = parse_chart_selection_contexts(request.additional_context)
+        inline_target = (
+            input_state["messages"]
+            if isinstance(input_state, dict) and input_state.get("messages")
+            else None
+        )
+        inject_inline_reminders(
+            inline_target,
+            [
+                (
+                    build_directive_reminder(directives),
+                    f"Directive context injected inline ({len(directives)} directives)",
+                ),
+                (
+                    build_widget_context_reminder(widget_ctxs),
+                    f"Widget context injected inline ({len(widget_ctxs)} widgets)",
+                ),
+                (
+                    build_chart_selection_reminder(chart_selections),
+                    f"Chart selection injected inline ({len(chart_selections)} selections)",
+                ),
+            ],
+            log_prefix="PTC_CHAT",
+        )
 
         # =====================================================================
         # Save user request to system thread directory (non-critical)

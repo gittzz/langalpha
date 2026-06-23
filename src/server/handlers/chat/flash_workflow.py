@@ -36,6 +36,11 @@ from src.server.utils.widget_context import (
     parse_widget_contexts,
     serialize_widget_contexts_for_metadata,
 )
+from src.server.utils.chart_selection_context import (
+    build_chart_selection_reminder,
+    parse_chart_selection_contexts,
+    serialize_chart_selections_for_metadata,
+)
 from src.llms.llm import get_input_modalities
 from src.server.utils.multimodal_context import (
     build_attachment_metadata,
@@ -58,6 +63,7 @@ from ._common import (
     ensure_thread,
     handle_workflow_error,
     init_tracking,
+    inject_inline_reminders,
     inject_skills,
     logger,
     normalize_request_messages,
@@ -214,6 +220,11 @@ async def astream_flash_workflow(
                 query_metadata["widget_contexts"] = serialize_widget_contexts_for_metadata(
                     widget_ctxs
                 )
+            selection_ctxs = parse_chart_selection_contexts(request.additional_context)
+            if selection_ctxs:
+                query_metadata["chart_selections"] = serialize_chart_selections_for_metadata(
+                    selection_ctxs
+                )
 
         # Persist lightweight additional_context + slash command fallback
         serialize_context_metadata(request, query_metadata, user_input, mode="flash")
@@ -333,29 +344,31 @@ async def astream_flash_workflow(
         # Skill Context Injection (Flash mode)
         loaded_skill_names = inject_skills(messages, request, config, mode="flash")
 
-        # Directive + Widget Context Injection (inline with user message) --
+        # Inline context injection (directive + widget + chart selection) --
         # Flash-specific. Skip on HITL resumes and checkpoint replay because
         # `input_state` below replaces `messages` with `Command(resume=...)` /
         # `None`, so anything appended here would be silently discarded.
-        # Mirrors the PTC guard at `ptc_workflow.py:620,638`.
         skip_inline_injection = bool(request.hitl_response) or is_checkpoint_replay
-
         directives = parse_directive_contexts(request.additional_context)
-        directive_reminder = build_directive_reminder(directives)
-        if directive_reminder and not skip_inline_injection:
-            _append_to_last_user_message(messages, directive_reminder)
-            logger.info(
-                f"[FLASH_CHAT] Directive context injected inline "
-                f"({len(directives)} directives)"
-            )
-
-        widget_reminder = build_widget_context_reminder(widget_ctxs)
-        if widget_reminder and not skip_inline_injection:
-            _append_to_last_user_message(messages, widget_reminder)
-            logger.info(
-                f"[FLASH_CHAT] Widget context injected inline "
-                f"({len(widget_ctxs)} widgets)"
-            )
+        chart_selections = parse_chart_selection_contexts(request.additional_context)
+        inject_inline_reminders(
+            None if skip_inline_injection else messages,
+            [
+                (
+                    build_directive_reminder(directives),
+                    f"Directive context injected inline ({len(directives)} directives)",
+                ),
+                (
+                    build_widget_context_reminder(widget_ctxs),
+                    f"Widget context injected inline ({len(widget_ctxs)} widgets)",
+                ),
+                (
+                    build_chart_selection_reminder(chart_selections),
+                    f"Chart selection injected inline ({len(chart_selections)} selections)",
+                ),
+            ],
+            log_prefix="FLASH_CHAT",
+        )
 
         # Build input state or resume command -- Flash-specific (no
         # ``current_agent`` key)
