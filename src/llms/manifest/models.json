@@ -532,6 +532,23 @@
       "text"
     ]
   },
+  "glm-5.2": {
+    "model_id": "glm-5.2",
+    "provider": "z-ai",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 1000000,
+    "parameters": {
+      "max_tokens": 128000,
+      "thinking": {
+        "type": "enabled"
+      }
+    },
+    "input_modalities": [
+      "text"
+    ]
+  },
   "glm-5v-turbo": {
     "model_id": "glm-5v-turbo",
     "provider": "z-ai",
@@ -592,6 +609,23 @@
     "speed": 3,
     "intelligence": 4,
     "context": 200000,
+    "parameters": {
+      "max_tokens": 128000,
+      "thinking": {
+        "type": "enabled"
+      }
+    },
+    "input_modalities": [
+      "text"
+    ]
+  },
+  "glm-5.2-cn": {
+    "model_id": "glm-5.2",
+    "provider": "z-ai-cn",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 1000000,
     "parameters": {
       "max_tokens": 128000,
       "thinking": {
