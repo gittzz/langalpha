@@ -775,6 +775,34 @@ class TestBuildGraphConfig:
         config = self._build(timezone_str="UTC")
         assert config["configurable"]["timezone"] == "UTC"
 
+    def test_skill_contexts_and_dirs_threaded_to_configurable(self):
+        """The server→middleware handoff: both skill_contexts and skill_dirs must
+        land in ``configurable`` so SkillsMiddleware can inject + locate bodies."""
+        config = self._build(
+            skill_contexts=[{"name": "chart-annotation", "instruction": "AAPL:1d"}],
+            skill_dirs=["/skills"],
+        )
+        assert config["configurable"]["skill_contexts"] == [
+            {"name": "chart-annotation", "instruction": "AAPL:1d"}
+        ]
+        assert config["configurable"]["skill_dirs"] == ["/skills"]
+
+    def test_skill_contexts_without_dirs_omits_dirs(self):
+        """skill_dirs is nested under the skill_contexts gate; contexts may be
+        present while dirs default (middleware falls back to project_root/skills)."""
+        config = self._build(
+            skill_contexts=[{"name": "research"}], skill_dirs=None
+        )
+        assert config["configurable"]["skill_contexts"] == [{"name": "research"}]
+        assert "skill_dirs" not in config["configurable"]
+
+    def test_skill_dirs_without_contexts_is_dropped(self):
+        """No skills requested → neither key is set, even if skill_dirs is passed
+        (the ``if skill_contexts`` gate guards the whole block)."""
+        config = self._build(skill_contexts=None, skill_dirs=["/skills"])
+        assert "skill_contexts" not in config["configurable"]
+        assert "skill_dirs" not in config["configurable"]
+
 
 # ---------------------------------------------------------------------------
 # wait_or_steer

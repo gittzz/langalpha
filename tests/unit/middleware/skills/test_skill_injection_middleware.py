@@ -173,3 +173,18 @@ async def test_blank_skill_names_are_dropped():
     bsc.assert_not_called()
     cal.assert_not_called()
     assert out == {"discovered_skills": []}
+
+
+def test_runnable_callable_injects_config_into_abefore_agent():
+    """The whole feature hinges on LangGraph injecting per-request ``config`` into
+    ``abefore_agent`` (that's how skill_contexts reach the hook). RunnableCallable
+    only injects ``config`` when it can read the parameter's annotation — adding
+    ``from __future__ import annotations`` to the module would stringify it and
+    silently drop the injection, turning skill injection into a no-op in prod with
+    every direct-call unit test still green. This guards that regression.
+    """
+    from langgraph._internal._runnable import RunnableCallable
+
+    mw = SkillsMiddleware(mode="flash")
+    rc = RunnableCallable(None, mw.abefore_agent)
+    assert "config" in rc.func_accepts

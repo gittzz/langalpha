@@ -59,6 +59,25 @@ def test_fresh_skill_injects_full_body_and_instruction():
     assert "[Instruction: draw on AAPL:1day]" in result.content
 
 
+def test_fresh_skill_appends_tool_descriptions_block():
+    """When a skill has tools, the body block carries an **Available tools:**
+    section plus the 'call directly' note — the text the model uses to invoke
+    the skill's tools without a separate LoadSkill round-trip."""
+    with (
+        patch(f"{MOD}.load_skill_content", return_value="SKILL BODY"),
+        patch(
+            f"{MOD}.build_tool_descriptions",
+            return_value="- draw_chart_annotation: draw on the chart",
+        ),
+    ):
+        result = build_skill_content([_ctx("chart-annotation")])
+
+    assert result is not None
+    assert "**Available tools:**" in result.content
+    assert "- draw_chart_annotation: draw on the chart" in result.content
+    assert "without needing to call LoadSkill" in result.content
+
+
 def test_already_loaded_skill_skips_body_keeps_instruction():
     with (
         patch(f"{MOD}.load_skill_content", return_value="SKILL BODY") as load,
@@ -257,3 +276,26 @@ def test_compute_compaction_ignores_marker_inside_summary():
         },
     )
     assert result == set()
+
+
+def test_compute_compaction_scans_multimodal_list_content():
+    """Attachments produce list-content user turns, and the body is appended as a
+    ``{"type": "text"}`` part — so the marker scan must read list content, not
+    just plain strings, or a multimodal turn would falsely re-inject every time."""
+    result = compute_already_loaded(
+        ["chart-annotation"],
+        [
+            {"content": "pre-cutoff summarized turn"},
+            {
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:..."}},
+                    {
+                        "type": "text",
+                        "text": '<loaded-skill name="chart-annotation">body</loaded-skill>',
+                    },
+                ]
+            },
+        ],
+        {"cutoff_index": 1, "summary_message": {"content": "compacted summary"}},
+    )
+    assert result == {"chart-annotation"}
