@@ -2089,7 +2089,7 @@ requires-dist = [
     { name = "langchain-openai", specifier = ">=1.0.0" },
     { name = "langchain-qwq", specifier = ">=0.3.0" },
     { name = "langgraph", specifier = ">=1.2.2,<2" },
-    { name = "langgraph-checkpoint-postgres", specifier = ">=3.1" },
+    { name = "langgraph-checkpoint-postgres", specifier = ">=3.1,<4" },
     { name = "langgraph-cli", extras = ["inmem"], marker = "extra == 'dev'", specifier = ">=0.2.10" },
     { name = "langsmith-fetch", specifier = ">=0.3.1" },
     { name = "matplotlib" },

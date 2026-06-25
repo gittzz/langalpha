@@ -26,7 +26,9 @@ dependencies = [
     # before persistence — the mechanism that keeps reconstruction deterministic
     # paired with the non-minting reducer in ptc_agent.agent.state.
     "langgraph>=1.2.2,<2",
-    "langgraph-checkpoint-postgres>=3.1",
+    # ceiling mirrors langgraph<2 — the postgres saver serializes the same delta
+    # blobs and moves in lockstep with core, so it can't cross a major on its own.
+    "langgraph-checkpoint-postgres>=3.1,<4",
     # Other dependencies
     "python-dotenv>=1.0.1",
     # Pinned: we import from scrapling.engines._browsers._controllers /
