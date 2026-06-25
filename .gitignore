@@ -103,3 +103,5 @@ TODO.md
 # Per-developer skills (canonical) and Claude Code's symlinked mirror — both local-only.
 .agents/
 .claude/
+
+docs/pr_context/
