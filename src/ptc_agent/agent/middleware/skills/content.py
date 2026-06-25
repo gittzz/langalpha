@@ -16,12 +16,20 @@ from ptc_agent.agent.middleware.skills.registry import SkillMode, get_skill
 logger = logging.getLogger(__name__)
 
 
-def loaded_skill_marker(name: str) -> str:
+def loaded_skill_marker(name: str, message_id: str | None = None) -> str:
     """Opening tag marking a skill's injected SKILL.md body in the message history.
 
     Single source of truth shared by the writer (``build_skill_content``) and the
     scanner (``compute_already_loaded``) so the marker format can't drift between them.
+
+    The optional ``mid`` attribute binds the marker to the framework-assigned id of
+    the message the body is written into. The scanner only treats a marker as live
+    when its ``mid`` equals the id of the message it is found in, so neither user-typed
+    text nor a SKILL.md that documents this format can forge a "body still loaded"
+    match — the id is assigned by the framework, not by content anyone can author.
     """
+    if message_id:
+        return f'<loaded-skill name="{name}" mid="{message_id}">'
     return f'<loaded-skill name="{name}">'
 
 
@@ -128,6 +136,7 @@ def build_skill_content(
     skill_dirs: Optional[list[str]] = None,
     mode: SkillMode | None = None,
     already_loaded: Optional[set[str]] = None,
+    message_id: Optional[str] = None,
 ) -> Optional[SkillPrefixResult]:
     """Build skill content for inline injection into the user message.
 
@@ -148,6 +157,9 @@ def build_skill_content(
               mode are skipped.
         already_loaded: Skill names already active in the thread; their bodies are
               skipped (instruction still refreshed).
+        message_id: Framework id of the message this content is appended to. Embedded
+              in each block's marker so the dedup scanner can verify the marker really
+              belongs to that message (see ``loaded_skill_marker``).
 
     Returns:
         SkillPrefixResult with content string and freshly loaded skill names, or
@@ -190,7 +202,8 @@ def build_skill_content(
 
         block_content = "\n".join(block_parts)
         skill_blocks.append(
-            f"{loaded_skill_marker(skill_ctx.name)}\n{block_content}\n</loaded-skill>"
+            f"{loaded_skill_marker(skill_ctx.name, message_id)}\n"
+            f"{block_content}\n</loaded-skill>"
         )
 
         if skill_ctx.instruction:
@@ -227,6 +240,14 @@ def build_skill_content(
     )
 
 
+def _message_id(message: Any) -> Optional[str]:
+    """Framework-assigned id of a checkpoint message (object ``.id`` or dict ``id``)."""
+    mid = getattr(message, "id", None)
+    if mid is None and isinstance(message, dict):
+        mid = message.get("id")
+    return mid
+
+
 def _message_text(message: Any) -> str:
     """Best-effort plain text of a checkpoint message (str or multimodal list)."""
     content = getattr(message, "content", None)
@@ -261,6 +282,12 @@ def compute_already_loaded(
       that survives only inside the summary is gone verbatim and must be re-injected
       (its tools stay available via state regardless).
 
+    The marker scan is identity-bound: a skill counts as live only when its marker,
+    carrying ``mid`` equal to the scanned message's own framework id, is present in
+    that message. Content alone can't forge a match (a user-typed marker, or a
+    SKILL.md documenting the format, carries a ``mid`` that won't equal the id of the
+    message it sits in), so a spurious "still loaded" can't suppress a real body.
+
     Non-string skill names are filtered out; any unexpected shape degrades to an
     empty set so the caller re-injects in full.
     """
@@ -275,8 +302,13 @@ def compute_already_loaded(
     from ptc_agent.agent.middleware.compaction import get_effective_messages
 
     effective = get_effective_messages(messages or [], event)[1:]
-    return {
-        name
-        for name in loaded_set
-        if any(loaded_skill_marker(name) in _message_text(m) for m in effective)
-    }
+    live: set[str] = set()
+    for m in effective:
+        mid = _message_id(m)
+        if not mid:
+            continue
+        text = _message_text(m)
+        for name in loaded_set:
+            if name not in live and loaded_skill_marker(name, mid) in text:
+                live.add(name)
+    return live

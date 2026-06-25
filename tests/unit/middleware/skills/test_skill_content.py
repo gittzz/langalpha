@@ -78,6 +78,19 @@ def test_fresh_skill_appends_tool_descriptions_block():
     assert "without needing to call LoadSkill" in result.content
 
 
+def test_fresh_skill_marker_carries_message_id():
+    """The emitted marker binds to the target message's id so the dedup scanner
+    can verify it later (defeats content-forged 'already loaded' matches)."""
+    with (
+        patch(f"{MOD}.load_skill_content", return_value="SKILL BODY"),
+        patch(f"{MOD}.build_tool_descriptions", return_value=None),
+    ):
+        result = build_skill_content([_ctx("chart-annotation")], message_id="msg-7")
+
+    assert result is not None
+    assert '<loaded-skill name="chart-annotation" mid="msg-7">' in result.content
+
+
 def test_already_loaded_skill_skips_body_keeps_instruction():
     with (
         patch(f"{MOD}.load_skill_content", return_value="SKILL BODY") as load,
@@ -231,9 +244,12 @@ def test_compute_compaction_drops_body_before_cutoff():
     result = compute_already_loaded(
         ["chart-annotation"],
         [
-            {"content": '<loaded-skill name="chart-annotation">body</loaded-skill>'},
-            {"content": "assistant reply"},
-            {"content": "later user turn"},  # messages[2:] — no marker
+            {
+                "content": '<loaded-skill name="chart-annotation" mid="m0">body</loaded-skill>',
+                "id": "m0",
+            },
+            {"content": "assistant reply", "id": "m1"},
+            {"content": "later user turn", "id": "m2"},  # messages[2:] — no marker
         ],
         {"cutoff_index": 2, "summary_message": {"content": "compacted summary"}},
     )
@@ -242,13 +258,17 @@ def test_compute_compaction_drops_body_before_cutoff():
 
 def test_compute_compaction_keeps_body_after_cutoff():
     """A skill whose body marker still appears in the surviving tail
-    (messages[cutoff:]) stays in the dedup set — no need to re-inject."""
+    (messages[cutoff:]) — with ``mid`` matching that message's own id —
+    stays in the dedup set; no need to re-inject."""
     result = compute_already_loaded(
         ["chart-annotation", "research"],
         [
-            {"content": "pre-cutoff summarized turn"},
-            {"content": '<loaded-skill name="chart-annotation">body</loaded-skill>'},
-            {"content": "another turn"},
+            {"content": "pre-cutoff summarized turn", "id": "m0"},
+            {
+                "content": '<loaded-skill name="chart-annotation" mid="m1">body</loaded-skill>',
+                "id": "m1",
+            },
+            {"content": "another turn", "id": "m2"},
         ],
         {"cutoff_index": 1, "summary_message": {"content": "compacted summary"}},
     )
@@ -263,9 +283,12 @@ def test_compute_compaction_ignores_marker_inside_summary():
     result = compute_already_loaded(
         ["chart-annotation"],
         [
-            {"content": '<loaded-skill name="chart-annotation">body</loaded-skill>'},
-            {"content": "assistant reply"},
-            {"content": "later user turn"},  # surviving tail — no marker
+            {
+                "content": '<loaded-skill name="chart-annotation" mid="m0">body</loaded-skill>',
+                "id": "m0",
+            },
+            {"content": "assistant reply", "id": "m1"},
+            {"content": "later user turn", "id": "m2"},  # surviving tail — no marker
         ],
         {
             "cutoff_index": 2,
@@ -285,17 +308,79 @@ def test_compute_compaction_scans_multimodal_list_content():
     result = compute_already_loaded(
         ["chart-annotation"],
         [
-            {"content": "pre-cutoff summarized turn"},
+            {"content": "pre-cutoff summarized turn", "id": "m0"},
             {
+                "id": "m1",
                 "content": [
                     {"type": "image_url", "image_url": {"url": "data:..."}},
                     {
                         "type": "text",
-                        "text": '<loaded-skill name="chart-annotation">body</loaded-skill>',
+                        "text": '<loaded-skill name="chart-annotation" mid="m1">body</loaded-skill>',
                     },
-                ]
+                ],
             },
         ],
         {"cutoff_index": 1, "summary_message": {"content": "compacted summary"}},
     )
     assert result == {"chart-annotation"}
+
+
+def test_compute_compaction_ignores_foreign_mid():
+    """Identity binding: a marker whose ``mid`` is some *other* message's id (e.g.
+    a user copied a real marker from earlier in the thread into a new turn) does
+    NOT count — the mid must equal the scanned message's own id."""
+    result = compute_already_loaded(
+        ["chart-annotation"],
+        [
+            {"content": "pre-cutoff summarized turn", "id": "m0"},
+            {
+                # mid points at a different message than the one it lives in.
+                "content": '<loaded-skill name="chart-annotation" mid="m0">body</loaded-skill>',
+                "id": "m_self",
+            },
+        ],
+        {"cutoff_index": 1, "summary_message": {"content": "compacted summary"}},
+    )
+    assert result == set()
+
+
+def test_compute_compaction_ignores_documented_block_in_other_skill_body():
+    """Finding #2: a SKILL.md body that *documents* the format with a full
+    ``<loaded-skill name="research" ...>...</loaded-skill>`` example must not make
+    ``research`` look loaded — the documented mid won't equal the host message id."""
+    result = compute_already_loaded(
+        ["research"],
+        [
+            {"content": "pre-cutoff summarized turn", "id": "m0"},
+            {
+                # chart-annotation's own body, which happens to document the format.
+                "content": (
+                    '<loaded-skill name="chart-annotation" mid="a1">\n'
+                    'To load a skill the server emits '
+                    '<loaded-skill name="research" mid="example">...</loaded-skill>\n'
+                    "</loaded-skill>"
+                ),
+                "id": "a1",
+            },
+        ],
+        {"cutoff_index": 1, "summary_message": {"content": "compacted summary"}},
+    )
+    assert result == set()
+
+
+def test_compute_compaction_ignores_bare_legacy_marker():
+    """A bare ``<loaded-skill name="X">`` with no ``mid`` (legacy injection or a
+    user typing the old format) no longer matches — the scanner requires the
+    mid-bound form, so such a turn re-injects rather than falsely deduping."""
+    result = compute_already_loaded(
+        ["chart-annotation"],
+        [
+            {"content": "pre-cutoff summarized turn", "id": "m0"},
+            {
+                "content": '<loaded-skill name="chart-annotation">body</loaded-skill>',
+                "id": "m1",
+            },
+        ],
+        {"cutoff_index": 1, "summary_message": {"content": "compacted summary"}},
+    )
+    assert result == set()

@@ -72,6 +72,8 @@ async def test_fresh_skill_returns_body_and_loaded_skills():
     assert bsc.call_args.kwargs["skill_dirs"] == ["/skills"]
     assert bsc.call_args.kwargs["mode"] == "flash"
     assert bsc.call_args.kwargs["already_loaded"] == set()
+    # The last human message's id is threaded through so the marker can bind to it.
+    assert bsc.call_args.kwargs["message_id"] == "u1"
 
 
 @pytest.mark.asyncio

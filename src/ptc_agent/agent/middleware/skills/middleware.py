@@ -48,6 +48,7 @@ from typing_extensions import NotRequired
 from ptc_agent.agent.middleware._utils import append_to_system_message
 from ptc_agent.agent.middleware.skills.content import (
     SkillRequest,
+    _message_id,
     build_skill_content,
     compute_already_loaded,
     load_skill_content,
@@ -325,11 +326,19 @@ class SkillsMiddleware(AgentMiddleware):
         event = state.get("_summarization_event") if hasattr(state, "get") else None
         already_loaded = compute_already_loaded(loaded, messages, event)
 
+        # Bind the injected marker to the message the body lands on (the last user
+        # turn) so the dedup scanner can later verify it, not just pattern-match text.
+        last = messages[-1] if messages else None
+        target_id = (
+            _message_id(last) if last is not None and _is_human_message(last) else None
+        )
+
         result = build_skill_content(
             skills,
             skill_dirs=configurable.get("skill_dirs"),
             mode=self._mode,
             already_loaded=already_loaded,
+            message_id=target_id,
         )
         if not result:
             return None
