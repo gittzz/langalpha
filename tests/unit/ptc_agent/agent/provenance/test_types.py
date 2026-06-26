@@ -171,6 +171,51 @@ def test_build_event_has_full_key_set():
     assert set(event.keys()) == expected_keys
 
 
+def test_build_event_never_carries_result_body():
+    """The transient ``result_body`` is consumed live by the middleware and must
+    NEVER ride the SSE event — that keeps ``sse_events`` gaining 0 bytes. The
+    event key set stays exactly the pre-body shape even when the source carries
+    a large body."""
+    source = ProvenanceSource(
+        record_id="rec-1",
+        source_type="web_fetch",
+        identifier="https://example.test/a",
+        timestamp="2026-01-01T00:00:00+00:00",
+        result_sha256="deadbeef",
+        result_size=99999,
+        result_snippet="snip",
+        result_body="x" * 50000,  # a substantial full body
+    )
+
+    event = build_provenance_event(source)
+
+    assert "result_body" not in event
+    # No value in the event equals the body (it isn't smuggled under another key).
+    assert source.result_body not in event.values()
+    # The key set is unchanged vs. the documented pre-body shape.
+    assert set(event.keys()) == {
+        "type",
+        "record_id",
+        "source_type",
+        "identifier",
+        "title",
+        "detail",
+        "provider",
+        "tool_call_id",
+        "args_fingerprint",
+        "args",
+        "result_sha256",
+        "result_size",
+        "result_snippet",
+        "timestamp",
+        "agent",
+    }
+    # build_provenance_event takes no result_body kwarg (a TypeError guards the
+    # contract that the body can't be injected through the builder either).
+    with pytest.raises(TypeError):
+        build_provenance_event(result_body="leak")  # type: ignore[call-arg]
+
+
 # ----- redact_args: security-critical deny-list -----------------------------
 
 _REDACTED = "[redacted]"

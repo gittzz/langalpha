@@ -399,7 +399,11 @@ async def test_execute_code_one_mcp_tool_event_per_trace_entry(middleware):
     # Args are hashed, never stored raw (may carry secrets/PII).
     assert emitted[0]["args_fingerprint"] == hash_args({"symbol": "TST"})
     assert set(emitted[0]["args_fingerprint"]) == {"sha256"}
-    assert emitted[0]["result_sha256"] == "a" * 64
+    # These entries carry no result_body, so the integrity gate can't reproduce
+    # their (agent-authored) sha and nulls it rather than let a provenance record
+    # advertise an unverifiable content-address (closes poisoning + IDOR-by-
+    # content-address). Structure/identifiers still flow through.
+    assert emitted[0]["result_sha256"] is None
     assert emitted[0]["timestamp"] == "2026-01-01T00:00:00+00:00"
 
 
@@ -613,6 +617,93 @@ async def test_execute_code_records_despite_error_content(middleware):
     )
     assert len(emitted) == 1
     assert emitted[0]["source_type"] == "mcp_tool"
+
+
+# ----- Bash shares the mcp_trace pipeline (closes the bash provenance bypass) -
+
+
+@pytest.mark.asyncio
+async def test_bash_extracts_mcp_trace_like_execute_code(middleware):
+    # A script run via Bash (`python analysis.py`) surfaces the same mcp_trace
+    # artifact ExecuteCode does; it must produce identical mcp_tool provenance,
+    # attributed to the Bash tool call.
+    artifact = {
+        "mcp_trace": [
+            {
+                "server": "marketdata",
+                "tool": "quote",
+                "args": {"symbol": "TST"},
+                "result_sha256": "a" * 64,
+                "result_size": 12,
+                "result_snippet": "snip",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+    }
+    emitted = []
+    await _run(
+        middleware,
+        _make_request("Bash", {"command": "python analysis.py"}, tool_call_id="bash-1"),
+        _result(content="done", artifact=artifact),
+        emitted,
+    )
+    assert len(emitted) == 1
+    assert emitted[0]["identifier"] == "marketdata:quote"
+    assert emitted[0]["source_type"] == "mcp_tool"
+    assert emitted[0]["tool_call_id"] == "bash-1"
+
+
+@pytest.mark.asyncio
+async def test_bash_records_despite_error_content(middleware):
+    # Bash is exempt from the error-result skip like ExecuteCode: the command may
+    # exit non-zero (ERROR content) after an in-sandbox MCP call already succeeded.
+    artifact = {
+        "mcp_trace": [
+            {
+                "server": "finance",
+                "tool": "get_prices",
+                "args": {"symbol": "TST"},
+                "result_sha256": "abc",
+                "result_size": 10,
+                "result_snippet": "ok",
+            }
+        ]
+    }
+    emitted = []
+    await _run(
+        middleware,
+        _make_request("Bash", {"command": "python analysis.py"}, tool_call_id="bash-1"),
+        _result(content="ERROR: Command failed (exit code 1)", artifact=artifact),
+        emitted,
+    )
+    assert len(emitted) == 1
+    assert emitted[0]["source_type"] == "mcp_tool"
+
+
+@pytest.mark.asyncio
+async def test_bash_strips_mcp_trace_from_artifact(middleware):
+    """mcp_trace must not survive on the Bash artifact (it would ride tool_call_result)."""
+    artifact = {
+        "mcp_trace": [
+            {
+                "server": "marketdata",
+                "tool": "quote",
+                "args": {"symbol": "TST"},
+                "result_sha256": "a" * 64,
+                "result_size": 12,
+                "result_snippet": "snip",
+            }
+        ],
+        "other": "kept",
+    }
+    result = await _run(
+        middleware,
+        _make_request("Bash", {"command": "python analysis.py"}, tool_call_id="bash-1"),
+        _result(content="done", artifact=artifact),
+        [],
+    )
+    assert "mcp_trace" not in result.artifact
+    assert result.artifact["other"] == "kept"
 
 
 # ----- host-side caps on the untrusted in-sandbox trace ----------------------

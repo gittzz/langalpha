@@ -113,6 +113,45 @@ describe('SourcesPanel', () => {
     expect(screen.getByText('Checksum')).toBeInTheDocument();
   });
 
+  it('keeps two same-ticker, same-kind market_data snapshots with different content as distinct cards', () => {
+    // The native-tool analogue of the mcp_tool fix. Same ticker AND same
+    // data-kind, but the result changed between calls — live market data is
+    // time-varying, so an identical query seconds apart is a distinct snapshot.
+    // Each native call carries its own tool_call_id so both survive storage; the
+    // entity deck must then split them by result_sha256 (NOT by the shared kind
+    // label) on expand, or the earlier snapshot is silently dropped.
+    const records = asMap([
+      rec({ record_id: 'r1', source_type: 'market_data', identifier: 'AAPL', detail: 'daily_prices', result_sha256: 'a'.repeat(20), result_size: 512, provider: 'market_data_proxy' }),
+      rec({ record_id: 'r2', source_type: 'market_data', identifier: 'AAPL', detail: 'daily_prices', result_sha256: 'b'.repeat(20), result_size: 512, provider: 'market_data_proxy' }),
+    ]);
+    render(<SourcesPanel provenanceRecords={records} />);
+
+    // Grouped into one ticker row (visual stacking is fine)...
+    expect(screen.getByTestId('group-count-market_data')).toHaveTextContent('1');
+    // ...but the deck holds both snapshots, not one collapsed card.
+    expect(screen.getByText('2 sources')).toBeInTheDocument();
+
+    // On expand, each snapshot is its own card — two cards of the same kind.
+    fireEvent.click(screen.getByRole('button', { name: /AAPL — Expand/ }));
+    expect(screen.getAllByRole('button', { name: /Daily prices — View details/ })).toHaveLength(2);
+  });
+
+  it('collapses two same-ticker, same-kind market_data accesses with identical content to one card', () => {
+    // The inverse: a true re-fetch returning byte-identical bytes (same sha) is
+    // one access, not a phantom duplicate. The entity deck dedups by content
+    // hash, so it renders a single flat card rather than a 2-card deck.
+    const records = asMap([
+      rec({ record_id: 'r1', source_type: 'market_data', identifier: 'AAPL', detail: 'daily_prices', result_sha256: 'same'.repeat(5), provider: 'market_data_proxy' }),
+      rec({ record_id: 'r2', source_type: 'market_data', identifier: 'AAPL', detail: 'daily_prices', result_sha256: 'same'.repeat(5), provider: 'market_data_proxy' }),
+    ]);
+    render(<SourcesPanel provenanceRecords={records} />);
+
+    expect(screen.getByTestId('group-count-market_data')).toHaveTextContent('1');
+    expect(screen.queryByTestId('source-stack')).not.toBeInTheDocument();
+    expect(screen.queryByText(/sources$/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /AAPL — View details/ })).toBeInTheDocument();
+  });
+
   it('dedups display by (source_type, identifier)', () => {
     const records = asMap([
       rec({ record_id: 'r1', source_type: 'web_fetch', identifier: 'https://example.com/page', title: 'Page' }),

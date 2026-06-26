@@ -188,3 +188,22 @@ async def test_mcp_trace_empty_when_no_file(
 
     assert result.success is True
     assert result.mcp_trace == []
+
+
+@patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
+@pytest.mark.asyncio
+async def test_mcp_trace_skipped_when_file_over_read_cap(
+    mock_create_provider, mock_provider, mock_runtime
+):
+    # MCP_TRACE_FILE is writable by agent-authored sandbox code, so the host
+    # sizes it (wc -c) before reading. A file past the 16 MiB read cap is skipped
+    # entirely — never pulled into host memory — and yields no trace.
+    mock_create_provider.return_value = mock_provider
+    sandbox = _make_sandbox(mock_runtime)
+    over_cap = 16 * 1024 * 1024 + 1
+    mock_runtime.exec = AsyncMock(return_value=ExecResult(str(over_cap), "", 0))
+
+    trace = await sandbox._collect_mcp_trace(f"{WORK_DIR}/.system/trace/t.jsonl")
+
+    assert trace == []
+    sandbox.aread_file_text.assert_not_awaited()
