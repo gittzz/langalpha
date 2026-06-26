@@ -869,6 +869,11 @@ class TestWaitOrSteer:
             await wait_or_steer(manager, "t-1", "hello", "u-1")
 
         assert exc_info.value.status_code == 409
+        # Structured detail so handle_workflow_error can tag the SSE error code.
+        detail = exc_info.value.detail
+        assert isinstance(detail, dict)
+        assert detail["code"] == "stopping"
+        assert "t-1" not in detail["message"]
         mock_steer.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -891,6 +896,10 @@ class TestWaitOrSteer:
             await wait_or_steer(manager, "t-1", "hello", "u-1")
 
         assert exc_info.value.status_code == 409
+        detail = exc_info.value.detail
+        assert isinstance(detail, dict)
+        assert detail["code"] == "running"
+        assert "t-1" not in detail["message"]
 
     @pytest.mark.asyncio
     async def test_compacting_raises_409_without_steering(self):
@@ -936,29 +945,37 @@ class TestAdmissionConflictDetail:
         from src.server.handlers.chat._common import admission_conflict_detail
 
         detail = admission_conflict_detail("t-1", "compacting")
-        assert "compacting" in detail
-        assert "retry" in detail.lower()
+        # Structured detail (code + message) so handle_workflow_error can tag the
+        # SSE error with a code and the client can recognize a transient state.
+        assert isinstance(detail, dict)
+        assert detail["code"] == "compacting"
+        assert "compacting" in detail["message"].lower()
+        assert "retry" in detail["message"].lower() or "resend" in detail["message"].lower()
 
     def test_stopping_state_names_stopping(self):
         from src.server.handlers.chat._common import admission_conflict_detail
 
         detail = admission_conflict_detail("t-1", "stopping")
-        assert "stopping" in detail
-        assert "retry" in detail.lower()
+        assert isinstance(detail, dict)
+        assert detail["code"] == "stopping"
+        assert "stopping" in detail["message"].lower()
 
     def test_running_state_is_the_generic_fallback(self):
         from src.server.handlers.chat._common import admission_conflict_detail
 
         # Any other non-fresh state (e.g. "running") falls through to the
-        # "still running, could not be admitted" message.
+        # "still running" code.
         detail = admission_conflict_detail("t-1", "running")
-        assert "still running" in detail
-        assert "could not be admitted" in detail
+        assert isinstance(detail, dict)
+        assert detail["code"] == "running"
+        assert "still running" in detail["message"].lower()
 
     def test_unknown_state_falls_back_to_generic(self):
         from src.server.handlers.chat._common import admission_conflict_detail
 
-        assert "still running" in admission_conflict_detail("t-1", "wedged")
+        detail = admission_conflict_detail("t-1", "wedged")
+        assert detail["code"] == "running"
+        assert "still running" in detail["message"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1095,6 +1112,66 @@ class TestHandleWorkflowErrorHTTPException:
         persistence_service.persist_error.assert_awaited()
         tracker.mark_failed.assert_awaited()
         # ...and is never mislabeled as a transient admission conflict.
+        assert not any("admission_conflict" in ev for ev in events)
+
+    @pytest.mark.asyncio
+    async def test_409_without_admission_code_is_persisted_and_marked_failed(self):
+        """The skip path is keyed on the admission-conflict CODE, not the bare
+        409 status. A 409 raised elsewhere in the generator (no structured
+        admission code) is a genuine failure: it must persist + mark_failed, not
+        silently skip them — otherwise a future non-admission 409 would clobber a
+        peer turn the same way the original bug #2 did."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import handle_workflow_error
+
+        # A plain-string 409 (no {"code": ...}) — e.g. a future conflict raised
+        # by middleware — must NOT be treated as an admission conflict.
+        exc = HTTPException(status_code=409, detail="some unrelated conflict")
+
+        persistence_service = AsyncMock()
+        tracker = AsyncMock()
+        handler = MagicMock()
+        handler.get_tool_usage = MagicMock(return_value=None)
+        handler.get_sse_events = MagicMock(return_value=None)
+        handler._format_sse_event = MagicMock(
+            side_effect=lambda ev, data: f"event: {ev}\ndata: {data}\n\n"
+        )
+        request = MagicMock()
+        request.workspace_id = None
+        request.locale = None
+        request.timezone = None
+
+        with (
+            patch(
+                "src.server.handlers.chat._common.WorkflowTracker"
+            ) as mock_tracker_cls,
+            patch(
+                "src.server.handlers.chat._common.release_burst_slot",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tracker_cls.get_instance.return_value = tracker
+            events = [
+                ev
+                async for ev in handle_workflow_error(
+                    exc,
+                    thread_id="t-1",
+                    user_id="u-1",
+                    workspace_id="w-1",
+                    handler=handler,
+                    token_callback=None,
+                    persistence_service=persistence_service,
+                    start_time=0.0,
+                    request=request,
+                    is_byok=False,
+                    msg_type="ptc",
+                    log_prefix="PTC_TEST",
+                )
+            ]
+
+        persistence_service.persist_error.assert_awaited()
+        tracker.mark_failed.assert_awaited()
         assert not any("admission_conflict" in ev for ev in events)
 
 

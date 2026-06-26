@@ -533,11 +533,13 @@ async def astream_flash_workflow(
 
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    f"Workflow {thread_id} is still running. "
-                    "Wait a moment, or use /reconnect to continue streaming, "
-                    "or /cancel to stop it."
-                ),
+                detail={
+                    "code": "running",
+                    "message": (
+                        "The workflow is still running. Wait a moment, then "
+                        "retry — or use /reconnect to continue, /cancel to stop."
+                    ),
+                },
             )
         else:
             slot_owned = False  # Manager owns burst slot release from here
