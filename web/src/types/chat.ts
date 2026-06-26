@@ -159,21 +159,58 @@ export interface ProvenanceRecord {
 }
 
 /**
- * Live-UI dedup key for a provenance record: `(source_type, identifier)`.
+ * Per-access discriminator appended to a provenance dedup key — `mcp_tool` only.
  *
- * NOTE: the DB provenance endpoint dedups on `(source_type, identifier,
- * result_sha256)`. The live UI intentionally omits `result_sha256` because not
- * every record path carries a sha during streaming — so the same identifier
- * collapses to one row here even when the DB would keep distinct shas. This
- * divergence is intentional; do not try to make them identical.
+ * Web/SEC/file sources have a per-access-unique `identifier` (a URL or path), so
+ * the identifier alone separates two accesses. `market_data` repeats its ticker
+ * identifier across calls, but each native tool call carries its own
+ * `tool_call_id`, so the storage key stays distinct and the panel deck splits the
+ * row by `result_sha256` on expand. An `mcp_tool` source has neither safeguard:
+ * its identifier is `"server:tool"` (shared by every call to that tool) AND all
+ * in-sandbox calls in one execute_code/bash block share that block's outer
+ * `tool_call_id` — so two parts are added here to discriminate:
+ *  1. `args_fingerprint` — separates calls with different inputs: get_stock_data
+ *     for AAPL vs NVDA, or the same ticker over a different date range/interval.
+ *  2. `result_sha256` — separates calls with IDENTICAL inputs that returned
+ *     DIFFERENT data. Market data is time-varying, so the same query seconds
+ *     apart is a distinct snapshot the agent reasoned over and earns its own
+ *     card; collapsing on args alone would silently drop the earlier snapshot.
+ *
+ * This mirrors the backend persist dedup, which already keys on `result_sha256`.
+ * Returns '' for non-mcp_tool (web sources keep their collapse-by-URL behavior).
+ * When an mcp_tool body is too large to hash (sha nulled), it falls back to args.
+ */
+export function provenanceMcpKey(
+  record: Pick<ProvenanceRecord, 'source_type' | 'args_fingerprint' | 'result_sha256'>,
+): string {
+  if (record.source_type !== 'mcp_tool') return '';
+  const args = record.args_fingerprint ? JSON.stringify(record.args_fingerprint) : '';
+  const sha = record.result_sha256 ?? '';
+  return args || sha ? `${args}#${sha}` : '';
+}
+
+/**
+ * Live-UI dedup key for a provenance record: `(source_type, identifier)`, plus
+ * the per-access mcp_tool discriminator (args fingerprint + result hash; see
+ * {@link provenanceMcpKey}), since an mcp_tool identifier is shared across calls.
+ *
+ * NOTE: web sources intentionally omit `result_sha256` here — the same URL
+ * collapses to one row even when the DB keeps distinct shas. `mcp_tool` does
+ * NOT omit it, because identical args can still return different data (live
+ * market data). This per-source-type divergence is intentional.
  */
 export function provenanceDisplayKey(
-  record: Pick<ProvenanceRecord, 'source_type' | 'identifier'> & {
+  record: Pick<
+    ProvenanceRecord,
+    'source_type' | 'identifier' | 'args_fingerprint' | 'result_sha256'
+  > & {
     source_type?: ProvenanceRecord['source_type'];
     identifier?: string;
   },
 ): string {
-  return `${record.source_type ?? ''} ${record.identifier ?? ''}`;
+  const base = `${record.source_type ?? ''} ${record.identifier ?? ''}`;
+  const mcp = provenanceMcpKey(record);
+  return mcp ? `${base} ${mcp}` : base;
 }
 
 /**
@@ -182,7 +219,10 @@ export function provenanceDisplayKey(
  * the displayed count and grouped rows can never silently diverge.
  */
 export function countDedupedSources(
-  records?: Record<string, Pick<ProvenanceRecord, 'source_type' | 'identifier'>> | null,
+  records?: Record<
+    string,
+    Pick<ProvenanceRecord, 'source_type' | 'identifier' | 'args_fingerprint' | 'result_sha256'>
+  > | null,
 ): number {
   if (!records) return 0;
   const seen = new Set<string>();

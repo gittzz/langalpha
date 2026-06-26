@@ -7,6 +7,7 @@ import { normalizeAction } from './eventUtils';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from './types';
 import type { ProvenanceEvent } from '@/types/sse';
 import type { ProvenanceRecord } from '@/types/chat';
+import { provenanceMcpKey } from '@/types/chat';
 
 /**
  * Builds the immutable `provenanceRecords` key for a provenance record.
@@ -14,14 +15,25 @@ import type { ProvenanceRecord } from '@/types/chat';
  * web_search emits multiple records that share one `tool_call_id` (one per
  * result URL), so the key prefixes the tool_call_id with `source_type` +
  * `identifier` to keep every distinct source — grouping by tool_call_id while
- * never dropping a sibling URL.
+ * never dropping a sibling URL. For `mcp_tool` the identifier is `"server:tool"`
+ * (shared across calls), so the per-access discriminator (args fingerprint +
+ * result hash, see {@link provenanceMcpKey}) is appended too — otherwise two
+ * calls to one tool with different args (get_stock_data for AAPL vs NVDA), or
+ * even the same args returning different data (live market data), collide and
+ * the last silently overwrites the first.
  */
 export function provenanceRecordKey(record: {
   tool_call_id?: string;
   source_type: string;
   identifier: string;
+  args_fingerprint?: Record<string, unknown> | null;
+  result_sha256?: string | null;
 }): string {
-  return `${record.tool_call_id || ''}:${record.source_type}:${record.identifier}`;
+  const base = `${record.tool_call_id || ''}:${record.source_type}:${record.identifier}`;
+  const mcp = provenanceMcpKey(
+    record as Pick<ProvenanceRecord, 'source_type' | 'args_fingerprint' | 'result_sha256'>,
+  );
+  return mcp ? `${base}:${mcp}` : base;
 }
 
 /**
