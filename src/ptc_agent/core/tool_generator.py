@@ -982,9 +982,12 @@ _sse_sessions: dict[str, bool] = {{}}  # server_name -> initialized
 # MCP server configurations
 _SERVER_CONFIGS = {servers_dict}
 {vault_block}
-# Per-execution running sum of emitted result_body bytes. The generated client
-# module is imported once per sandbox process, so this module-global accumulates
-# across every MCP call in one execute_code run. Caps interpolated at codegen
+# Per-execution running sum of emitted result_body bytes. Each execute_code runs
+# in a FRESH interpreter process — both the Daytona and Docker providers spawn a
+# new `python` per code_run (a one-shot run, NOT a persistent kernel/session), so
+# this module is re-imported and the counter resets to 0 every run. It therefore
+# accumulates only across the MCP calls within ONE execute_code, never session-
+# wide. Caps interpolated at codegen
 # time from agent/provenance/types.py (RESULT_BODY_MAX_BYTES = per-call body cap;
 # the budget is the aggregate ceiling): once the running sum crosses the budget
 # we stop emitting result_body (snippet/sha/size still recorded) to keep a

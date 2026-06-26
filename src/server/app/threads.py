@@ -1502,7 +1502,10 @@ async def get_provenance_record_body(
 
         byte_len = meta["byte_len"]
         if full:
-            body = await fetch_full_body(sha) or ""
+            # meta already carries body_inline + object_key from the fetch above,
+            # so pass it through — fetch_full_body skips a second connection and
+            # only does the spilled-object read when there's an object_key.
+            body = await fetch_full_body(sha, row=meta) or ""
             # byte_len is the full stored-body length; the read is incomplete
             # exactly when we returned fewer bytes than that — the spilled object
             # exceeded the read cap, or a head was kept with no bucket to spill to.

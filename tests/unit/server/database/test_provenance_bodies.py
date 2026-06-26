@@ -562,6 +562,34 @@ class TestFetchFullBody:
             out = await fetch_full_body(SHA)
         assert len(out.encode()) == FULL_BODY_READ_MAX_BYTES
 
+    @pytest.mark.asyncio
+    async def test_preloaded_row_inline_skips_db_query(self, patched_db, mock_cursor):
+        # A caller that already holds the row (e.g. from fetch_result_bodies)
+        # passes it via row= — fetch_full_body must not open a second connection.
+        row = {"body_inline": "the full small body", "object_key": None}
+        with patch(f"{MOD}._storage_get_bytes") as get_bytes:
+            out = await fetch_full_body(SHA, row=row)
+        assert out == "the full small body"
+        mock_cursor.execute.assert_not_called()
+        get_bytes.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_preloaded_row_still_reads_spilled_object(
+        self, patched_db, mock_cursor
+    ):
+        # With a preloaded row the DB query is skipped, but a spilled object_key
+        # still triggers the object read (the only work left for full=true).
+        row = {"body_inline": "h" * RESULT_BODY_MAX_BYTES, "object_key": "provenance/x"}
+        full = "full body " * 100000
+        with (
+            patch(f"{MOD}.is_storage_enabled", return_value=True),
+            patch(f"{MOD}._storage_get_bytes", return_value=full.encode()) as get_bytes,
+        ):
+            out = await fetch_full_body(SHA, row=row)
+        assert out == full
+        mock_cursor.execute.assert_not_called()
+        get_bytes.assert_called_once_with("provenance/x")
+
 
 class TestSweepOrphanBodies:
     @pytest.mark.asyncio

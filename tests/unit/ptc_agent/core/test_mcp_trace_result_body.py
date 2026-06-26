@@ -187,8 +187,11 @@ def test_aggregate_guard_counter_is_per_module_instance(
     tmp_path, monkeypatch
 ) -> None:
     """A fresh module exec resets the budget — the counter is a module-global,
-    so each execute_code run (one module import) starts from zero. This is the
-    invariant the host relies on for the per-execution (not per-process) bound."""
+    so each execute_code run starts from zero. This holds in production because
+    every execute_code spawns a fresh interpreter (both providers run code_run as
+    a one-shot `python`, not a persistent kernel), so the module is re-imported
+    per run and the counter never accumulates session-wide — the per-execution
+    bound the host relies on."""
     monkeypatch.setenv("MCP_TRACE_FILE", str(tmp_path / "a.jsonl"))
     ns1 = _exec_module(_render())
     assert ns1["_result_body_emitted_bytes"] == 0

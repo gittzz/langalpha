@@ -276,7 +276,10 @@ async def fetch_result_bodies(conn, shas: list[str]) -> dict[str, dict]:
 
 
 async def fetch_full_body(
-    sha256: str, max_bytes: int = FULL_BODY_READ_MAX_BYTES
+    sha256: str,
+    max_bytes: int = FULL_BODY_READ_MAX_BYTES,
+    *,
+    row: dict | None = None,
 ) -> str | None:
     """Return the full body for one sha, reading the spilled object if present.
 
@@ -284,23 +287,28 @@ async def fetch_full_body(
     stays bounded even for a ~10 MiB spilled object); an over-cap body comes back
     head-only and the caller's ``truncated`` check flips on the true ``byte_len``.
     Best-effort: returns None on any failure or when the sha is unknown.
+
+    Pass ``row`` (a dict carrying ``body_inline`` + ``object_key``, e.g. from
+    :func:`fetch_result_bodies`) to skip the row lookup — the caller already holds
+    those columns, so the only work left is the optional spilled-object read.
     """
     if not sha256:
         return None
     try:
-        async with get_db_connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT body_inline, object_key
-                    FROM provenance_result_bodies
-                    WHERE result_sha256 = %s
-                    """,
-                    (sha256,),
-                )
-                row = await cur.fetchone()
         if row is None:
-            return None
+            async with get_db_connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT body_inline, object_key
+                        FROM provenance_result_bodies
+                        WHERE result_sha256 = %s
+                        """,
+                        (sha256,),
+                    )
+                    row = await cur.fetchone()
+            if row is None:
+                return None
         object_key = row["object_key"]
         if object_key and is_storage_enabled():
             data = await asyncio.to_thread(_storage_get_bytes, object_key)

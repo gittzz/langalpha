@@ -3609,7 +3609,7 @@ except OSError as e:
                 # wrappers records its mcp_trace too — harvested on completion in
                 # get_background_command_status. The audit .sh stays clean; only
                 # the executed command carries the exports.
-                bg_trace_path, bg_command = await self._build_trace_env_command(
+                bg_trace_path, bg_command = self._build_trace_env_command(
                     bash_id, full_command
                 )
                 # Track immediately so cleanup() can find it if execute fails
@@ -3666,7 +3666,7 @@ except OSError as e:
             # (preserving any existing value). The audit .sh above stays clean;
             # only the executed command carries the exports.
             assert self.runtime is not None
-            trace_path, exec_command = await self._build_trace_env_command(
+            trace_path, exec_command = self._build_trace_env_command(
                 bash_id, full_command
             )
             exec_result = await self._runtime_call(
@@ -3773,7 +3773,7 @@ except OSError as e:
                         error=str(e),
                     )
 
-    async def _build_trace_env_command(
+    def _build_trace_env_command(
         self, bash_id: str, full_command: str
     ) -> tuple[str, str]:
         """Wrap a bash command with the MCP-provenance trace env.
