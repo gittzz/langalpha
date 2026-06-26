@@ -334,3 +334,34 @@ async def get_provenance_for_thread(
             )
             rows = await cur.fetchall()
             return [dict(row) for row in rows]
+
+
+async def get_provenance_record(
+    conversation_thread_id: str,
+    provenance_record_id: str,
+) -> dict[str, Any] | None:
+    """Return one provenance row by (thread, record_id), or None.
+
+    Targeted lookup for the single-record body endpoint so it fetches just the one
+    row instead of loading the whole thread's provenance and scanning in Python.
+    Compares the id as text, so a malformed id simply finds no row (404) rather
+    than raising on a uuid cast.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT
+                    provenance_record_id, conversation_response_id,
+                    conversation_thread_id, turn_index, tool_call_id,
+                    source_type, identifier, title, detail, args_fingerprint,
+                    args, result_sha256, result_size, result_snippet, agent,
+                    provider, source_timestamp, created_at
+                FROM provenance_records
+                WHERE conversation_thread_id = %s
+                  AND provenance_record_id::text = %s
+                """,
+                (conversation_thread_id, provenance_record_id),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None

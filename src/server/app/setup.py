@@ -387,10 +387,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start NewsRefreshService: {e}")
 
+    # Start ProvenanceGCService (daily mark-sweep of orphaned result bodies)
+    try:
+        from src.server.services.provenance_gc import ProvenanceGCService
+
+        provenance_gc = ProvenanceGCService.get_instance()
+        await provenance_gc.start()
+        logger.info("ProvenanceGCService started")
+    except Exception as e:
+        logger.warning(f"Failed to start ProvenanceGCService: {e}")
+
     yield  # Server is running
 
     # Shutdown
     logger.info("Application shutdown started...")
+
+    # 0. Shutdown ProvenanceGCService
+    try:
+        from src.server.services.provenance_gc import ProvenanceGCService
+
+        await ProvenanceGCService.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error shutting down ProvenanceGCService: {e}")
 
     # 0. Shutdown NewsRefreshService
     try:

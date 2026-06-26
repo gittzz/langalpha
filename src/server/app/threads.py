@@ -4,6 +4,7 @@ Unified Thread Router — all thread-related endpoints under /api/v1/threads.
 Route definitions are thin; business logic lives in handlers/.
 """
 
+import hashlib
 import json
 import logging
 import secrets
@@ -50,7 +51,10 @@ from src.server.database.conversation import (
     delete_feedback,
     get_replay_thread_data,
 )
-from src.server.database.provenance import get_provenance_for_thread
+from src.server.database.provenance import (
+    get_provenance_for_thread,
+    get_provenance_record,
+)
 from psycopg_pool import PoolTimeout
 from src.server.dependencies.usage_limits import ChatRateLimited
 
@@ -1363,3 +1367,173 @@ async def get_provenance(thread_id: str, x_user_id: CurrentUserId):
     except Exception as e:
         logger.exception(f"Error getting provenance for thread {thread_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to get provenance")
+
+
+def _body_hashes_to(body: str, sha256: str | None) -> bool:
+    """True iff ``body`` reproduces the content-address ``sha256``.
+
+    The verifier's integrity check: a present body that hashes to its advertised
+    sha is the exact content the agent reasoned over. A mismatch means the body was
+    redacted (a secret was stripped) or is otherwise not the hashed bytes — the
+    caller distinguishes the two via the ``truncated`` flag.
+    """
+    if not body or not sha256:
+        return False
+    return hashlib.sha256(body.encode("utf-8")).hexdigest() == sha256
+
+
+@router.get("/{thread_id}/provenance/bodies")
+async def get_provenance_bodies(
+    thread_id: str,
+    x_user_id: CurrentUserId,
+    limit: int = Query(
+        100,
+        ge=1,
+        le=200,
+        description="Max bodies returned; a long thread is capped (see `capped`).",
+    ),
+):
+    """Return stored result bodies (inline head only) for a thread's provenance records.
+
+    Sibling to ``/provenance`` (which stays snippet-only): joins each record's
+    ``result_sha256`` to the content-addressed body store and returns the inline
+    head plus ``truncated`` and ``verified`` flags. Spilled objects are never
+    fetched here — use the per-record ``/body?full=true`` endpoint for the full body.
+
+    The response is bounded: each inline head is up to 64 KiB, so a long thread is
+    capped at ``limit`` bodies (``capped: true`` when more were available) to keep
+    one request from materializing tens of MB.
+    """
+    try:
+        await require_thread_owner(thread_id, x_user_id)
+        rows = await get_provenance_for_thread(thread_id)
+
+        from src.server.database.conversation import get_db_connection
+        from src.server.database.provenance_bodies import (
+            RESULT_BODY_MAX_BYTES,
+            fetch_result_bodies,
+        )
+
+        eligible = [row for row in rows if row.get("result_sha256")]
+        capped = len(eligible) > limit
+        eligible = eligible[:limit]
+        shas = [row["result_sha256"] for row in eligible]
+        async with get_db_connection() as conn:
+            bodies = await fetch_result_bodies(conn, shas)
+
+        records = []
+        for row in eligible:
+            sha = row["result_sha256"]
+            body = bodies.get(sha)
+            if body is None:
+                continue
+            body_inline = body["body_inline"] or ""
+            byte_len = body["byte_len"]
+            # Incomplete iff the body spilled to an object or its true length
+            # exceeded the inline cap — NOT a raw-vs-inline length compare, which
+            # mislabels a redaction-shortened (but complete) body as truncated.
+            truncated = body["object_key"] is not None or byte_len > RESULT_BODY_MAX_BYTES
+            records.append(
+                {
+                    "provenance_record_id": str(row["provenance_record_id"]),
+                    "result_sha256": sha,
+                    "body_inline": body_inline,
+                    "byte_len": byte_len,
+                    "truncated": truncated,
+                    # The stored body hashes to result_sha256 (untruncated + not
+                    # redacted). False on a truncated head or a redaction-modified
+                    # body — the signal that "these bytes != the advertised hash."
+                    "verified": (not truncated) and _body_hashes_to(body_inline, sha),
+                }
+            )
+
+        return {"thread_id": thread_id, "records": records, "capped": capped}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            f"Error getting provenance bodies for thread {thread_id}: {e}"
+        )
+        raise HTTPException(status_code=500, detail="Failed to get provenance bodies")
+
+
+@router.get("/{thread_id}/provenance/{provenance_record_id}/body")
+async def get_provenance_record_body(
+    thread_id: str,
+    provenance_record_id: str,
+    x_user_id: CurrentUserId,
+    full: bool = Query(
+        False,
+        description="When true, read the full body (pulls the spilled object if any).",
+    ),
+):
+    """Return the body for a single provenance record.
+
+    With ``full=true`` the full body is read via ``fetch_full_body`` (pulling the
+    spilled object when present, capped at ``FULL_BODY_READ_MAX_BYTES`` so one
+    request can't serialize a ~10 MiB object — an over-cap body returns truncated);
+    otherwise only the inline head is returned. The record must belong to the
+    caller's thread.
+    """
+    try:
+        await require_thread_owner(thread_id, x_user_id)
+        row = await get_provenance_record(thread_id, provenance_record_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Provenance record not found")
+
+        sha = row.get("result_sha256")
+        if not sha:
+            raise HTTPException(
+                status_code=404, detail="Provenance record has no stored body"
+            )
+
+        from src.server.database.conversation import get_db_connection
+        from src.server.database.provenance_bodies import (
+            FULL_BODY_READ_MAX_BYTES,
+            RESULT_BODY_MAX_BYTES,
+            fetch_full_body,
+            fetch_result_bodies,
+        )
+
+        async with get_db_connection() as conn:
+            bodies = await fetch_result_bodies(conn, [sha])
+        meta = bodies.get(sha)
+        if meta is None:
+            raise HTTPException(
+                status_code=404, detail="Provenance record has no stored body"
+            )
+
+        byte_len = meta["byte_len"]
+        object_key = meta["object_key"]
+        if full:
+            body = await fetch_full_body(sha) or ""
+            # A full read is incomplete only if the spilled object exceeded the
+            # read cap, or the body was over the inline cap but never spilled (no
+            # bucket) so there was nothing more to read back. Keyed off byte_len +
+            # object_key, not a raw-vs-redacted length compare.
+            truncated = byte_len > FULL_BODY_READ_MAX_BYTES or (
+                object_key is None and byte_len > RESULT_BODY_MAX_BYTES
+            )
+        else:
+            body = meta["body_inline"] or ""
+            # The inline head is incomplete iff the body spilled or exceeded the
+            # cap but couldn't spill — independent of redaction shortening it.
+            truncated = object_key is not None or byte_len > RESULT_BODY_MAX_BYTES
+
+        return {
+            "provenance_record_id": str(row["provenance_record_id"]),
+            "result_sha256": sha,
+            "body": body,
+            "byte_len": byte_len,
+            "truncated": truncated,
+            # With full=true and no truncation, a true value attests the body is the
+            # exact bytes behind result_sha256; false means redacted or head-only.
+            "verified": (not truncated) and _body_hashes_to(body, sha),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            f"Error getting provenance body for record {provenance_record_id}: {e}"
+        )
+        raise HTTPException(status_code=500, detail="Failed to get provenance body")
