@@ -347,7 +347,7 @@ async def astream_flash_workflow(
         if not request.hitl_response and not is_checkpoint_replay:
             skill_contexts = prepare_skill_contexts(messages, request, mode="flash")
         else:
-            skill_contexts = []
+            skill_contexts = None
         skill_dirs = (
             [local_dir for local_dir, _ in config.skills.local_skill_dirs_with_sandbox()]
             if skill_contexts

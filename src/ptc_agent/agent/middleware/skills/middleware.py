@@ -77,12 +77,13 @@ def _union_loaded_skills(left: list[str], right: list[str]) -> list[str]:
     ``loaded_skills`` is semantically a set — every consumer reads it via
     ``set(...)``. Plain ``operator.add`` lets the same name accumulate (a turn
     re-seeding an already-loaded skill, or the agent re-reading a skill file),
-    bloating the persisted state on long threads. Deduping here keeps the
-    channel bounded while staying append-compatible.
+    bloating the persisted state on long threads. Normalizing both operands keeps
+    the channel bounded and also re-bounds threads that already carried duplicate
+    names from the old ``operator.add`` reducer (which would otherwise persist).
     """
-    merged = list(left or [])
-    seen = set(merged)
-    for name in right or []:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for name in (*(left or []), *(right or [])):
         if name not in seen:
             merged.append(name)
             seen.add(name)
@@ -280,13 +281,13 @@ class SkillsMiddleware(AgentMiddleware):
                 s for name, s in all_skills.items() if name not in self.skill_registry
             ]
 
-        skill_update = self._inject_requested_skills(state, config)
+        skill_update = await self._inject_requested_skills(state, config)
         if skill_update:
             update.update(skill_update)
 
         return update
 
-    def _inject_requested_skills(
+    async def _inject_requested_skills(
         self, state: Any, config: RunnableConfig | None
     ) -> dict | None:
         """Inject SKILL.md bodies for skills requested via config this turn.
@@ -296,6 +297,9 @@ class SkillsMiddleware(AgentMiddleware):
         thread, appends fresh bodies to the last user message, and returns the
         ``messages``/``loaded_skills`` state update (or None when there's nothing
         to inject — e.g. HITL/replay turns where the server omits skill_contexts).
+
+        The SKILL.md disk reads run in a worker thread so this turn-entry hook
+        doesn't block the event loop before the first model call.
         """
         if not config:
             return None
@@ -333,7 +337,8 @@ class SkillsMiddleware(AgentMiddleware):
             _message_id(last) if last is not None and _is_human_message(last) else None
         )
 
-        result = build_skill_content(
+        result = await asyncio.to_thread(
+            build_skill_content,
             skills,
             skill_dirs=configurable.get("skill_dirs"),
             mode=self._mode,

@@ -1095,6 +1095,61 @@ class TestPrepareSkillContexts:
         mock_detect.assert_not_called()
         assert result == []
 
+    def test_slash_detection_on_multimodal_list_content(self):
+        """A supported attachment rewrites content into a block list; the slash
+        command must still activate, be stripped in its own text block, and leave
+        the attachment blocks intact."""
+        from src.server.handlers.chat._common import prepare_skill_contexts
+
+        request = MagicMock()
+        request.additional_context = None
+        request.hitl_response = None
+        image_block = {"type": "image_url", "image_url": {"url": "data:image/png;x"}}
+        text_block = {"type": "text", "text": "/research market analysis"}
+        messages = [{"role": "user", "content": [image_block, text_block]}]
+
+        ctx = SkillContext(type="skills", name="research")
+        with (
+            patch(f"{COMMON}.parse_skill_contexts", return_value=[]),
+            patch(
+                f"{COMMON}.detect_slash_commands",
+                return_value=("market analysis", [ctx]),
+            ),
+        ):
+            result = prepare_skill_contexts(messages, request, mode="flash")
+
+        assert result == [{"name": "research", "instruction": None}]
+        # Prefix stripped in the text block; the image block survives untouched.
+        assert messages[0]["content"][0] is image_block
+        assert messages[0]["content"][1]["text"] == "market analysis"
+
+    def test_list_content_without_slash_block_skips_detection(self):
+        """List content whose text blocks don't lead with `/` activates nothing."""
+        from src.server.handlers.chat._common import prepare_skill_contexts
+
+        request = MagicMock()
+        request.additional_context = None
+        request.hitl_response = None
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Attached image: chart.png]"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;x"}},
+                    {"type": "text", "text": "what do you see"},
+                ],
+            }
+        ]
+
+        with (
+            patch(f"{COMMON}.parse_skill_contexts", return_value=[]),
+            patch(f"{COMMON}.detect_slash_commands") as mock_detect,
+        ):
+            result = prepare_skill_contexts(messages, request, mode="flash")
+
+        mock_detect.assert_not_called()
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
 # _resolve_timezone

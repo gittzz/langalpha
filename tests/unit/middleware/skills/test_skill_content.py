@@ -91,6 +91,41 @@ def test_fresh_skill_marker_carries_message_id():
     assert '<loaded-skill name="chart-annotation" mid="msg-7">' in result.content
 
 
+def test_same_skill_twice_in_one_request_emits_body_once():
+    """Intra-request dedup: a duplicate name (e.g. duplicate additional_context
+    entries) must not paste the body or count the skill as loaded twice."""
+    with (
+        patch(f"{MOD}.load_skill_content", return_value="SKILL BODY") as load,
+        patch(f"{MOD}.build_tool_descriptions", return_value=None),
+    ):
+        result = build_skill_content(
+            [_ctx("chart-annotation", "AAPL:1d"), _ctx("chart-annotation", "TSLA:4h")],
+            message_id="m1",
+        )
+
+    assert result is not None
+    assert result.loaded_skill_names == ["chart-annotation"]
+    assert result.content.count('<loaded-skill name="chart-annotation"') == 1
+    load.assert_called_once()  # the second occurrence is skipped before disk I/O
+
+
+def test_same_already_loaded_skill_twice_refreshes_instruction_once():
+    """A duplicate name on the already-loaded path must not double the instruction."""
+    with (
+        patch(f"{MOD}.load_skill_content", return_value="SKILL BODY"),
+        patch(f"{MOD}.build_tool_descriptions", return_value=None),
+    ):
+        result = build_skill_content(
+            [_ctx("chart-annotation", "AAPL:1d"), _ctx("chart-annotation", "TSLA:4h")],
+            already_loaded={"chart-annotation"},
+        )
+
+    assert result is not None
+    # First occurrence wins; the duplicate is dropped before it can re-emit.
+    assert result.content.count("AAPL:1d") == 1
+    assert "TSLA:4h" not in result.content
+
+
 def test_already_loaded_skill_skips_body_keeps_instruction():
     with (
         patch(f"{MOD}.load_skill_content", return_value="SKILL BODY") as load,

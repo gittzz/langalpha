@@ -172,8 +172,17 @@ def build_skill_content(
     newly_loaded: list[str] = []
     skill_blocks: list[str] = []
     instructions: list[tuple[str, str]] = []
+    seen_names: set[str] = set()
 
     for skill_ctx in skills:
+        # Same skill named twice in one request: emit it once. ``already_loaded``
+        # only guards prior turns; this guards intra-turn duplication (e.g.
+        # duplicate additional_context entries) so a body/instruction can't be
+        # pasted twice in the same message.
+        if skill_ctx.name in seen_names:
+            continue
+        seen_names.add(skill_ctx.name)
+
         # Already active this thread AND still exposed in this mode: tools persist
         # in state, so skip the body and only refresh the instruction (cheap, may
         # carry per-turn context). The mode re-check keeps this branch consistent

@@ -29,3 +29,10 @@ def test_union_handles_none_operands():
 
 def test_union_dedupes_within_right():
     assert _union_loaded_skills([], ["x", "x", "y"]) == ["x", "y"]
+
+
+def test_union_dedupes_within_left():
+    # Threads persisted under the old operator.add reducer can carry left-side
+    # duplicates; the reducer must re-bound them, not pass them through forever.
+    assert _union_loaded_skills(["a", "a", "b"], []) == ["a", "b"]
+    assert _union_loaded_skills(["a", "b", "a"], ["b", "c"]) == ["a", "b", "c"]

@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import psycopg
 from fastapi import HTTPException
@@ -523,6 +523,28 @@ async def persist_or_skip_replay(
         )
 
 
+def _slash_text_target(content: Any) -> tuple[str, dict | None]:
+    """Locate the leading-slash text for command detection in a user message.
+
+    Returns ``(text, block)`` where ``block`` is the content-list element to
+    rewrite when stripping the prefix (``None`` for plain-string content). User
+    content is a block list when a supported attachment rewrites it
+    (``inject_multimodal_context``) or the client sends a multi-part message;
+    without scanning it, slash commands on those turns would be invisible. Only a
+    block whose text starts with ``/`` is considered, so attachment-label blocks
+    never false-match.
+    """
+    if isinstance(content, str):
+        return content, None
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "") or ""
+                if text.startswith("/"):
+                    return text, block
+    return "", None
+
+
 def prepare_skill_contexts(
     messages: list[dict],
     request: ChatRequest,
@@ -539,16 +561,21 @@ def prepare_skill_contexts(
     """
     skill_contexts = parse_skill_contexts(request.additional_context)
 
-    # Detect slash commands from message text (fallback for missing additional_context)
+    # Detect slash commands from message text (fallback for missing additional_context).
+    # Handles both plain-string content and the content-block list a supported
+    # attachment leaves behind, so `/cmd` + an image/PDF still activates the skill.
     if not skill_contexts and not request.hitl_response and messages:
         last_msg = messages[-1]
-        msg_text = last_msg.get("content", "") if isinstance(last_msg.get("content"), str) else ""
+        msg_text, text_block = _slash_text_target(last_msg.get("content"))
         if msg_text:
             cleaned_text, detected = detect_slash_commands(msg_text, mode=mode)
             if detected:
                 skill_contexts = detected
                 if cleaned_text != msg_text:
-                    last_msg["content"] = cleaned_text
+                    if text_block is None:
+                        last_msg["content"] = cleaned_text
+                    else:
+                        text_block["text"] = cleaned_text
 
     if skill_contexts:
         logger.info(
