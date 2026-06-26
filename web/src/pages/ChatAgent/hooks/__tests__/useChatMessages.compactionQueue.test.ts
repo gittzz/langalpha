@@ -347,9 +347,15 @@ describe('useChatMessages – queued send during compaction', () => {
     ).toBe(false);
 
     // Proof of no cross-thread replay: a fresh compaction cycle on thread B
-    // must not flush thread A's stranded payload.
+    // must not flush thread A's stranded payload. Separate act blocks so the
+    // intermediate 'summarize' state is committed before resetting to false —
+    // otherwise the two updates batch into one commit and the flush effect
+    // (keyed on isCompacting) never fires, making this check vacuous.
     await act(async () => {
       result.current.setIsCompacting('summarize');
+      await Promise.resolve();
+    });
+    await act(async () => {
       result.current.setIsCompacting(false);
       await Promise.resolve();
       await Promise.resolve();

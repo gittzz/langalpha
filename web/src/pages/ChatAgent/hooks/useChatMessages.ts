@@ -4470,8 +4470,11 @@ export function useChatMessages(
     } else {
       handleSendMessage(message, planMode, additionalContext, attachmentMeta, modelOptions);
     }
-    // Fires only on isCompacting transitions; handlers + isLoading are read at
-    // flush time, so they are intentionally not in the dependency array.
+    // Fires on isCompacting transitions. isLoading and the send handlers are
+    // captured from the render where isCompacting went false — that render is
+    // the correct moment to decide steer-vs-fresh. Handlers are omitted from
+    // deps because the values they actually close over (workspaceId/threadId)
+    // don't change mid-compaction, so a stale closure here isn't possible.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCompacting]);
 
