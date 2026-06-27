@@ -14,6 +14,7 @@ from the LangGraph namespace.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -29,12 +30,12 @@ from ptc_agent.agent.provenance import (
     ProvenanceSource,
     build_provenance_event,
     fingerprint_result,
+    fingerprint_result_with_body,
     hash_args,
     redact_args,
 )
 from ptc_agent.agent.provenance.types import (
     RESULT_BODY_MAX_BYTES,
-    _canonicalize,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,13 @@ _MAX_TRACE_ENTRIES = 200
 # event unclamped (the DB writer already coerces a bad value to NULL).
 _TIMESTAMP_MAX_CHARS = 64
 
+# Max concurrent in-flight background body-store writes per middleware instance.
+# A backpressure valve: once this many flushes are outstanding, awrap_tool_call
+# waits for one to finish before scheduling the next, so a burst of source-bearing
+# tool calls can't spawn unbounded tasks or exhaust the DB pool. Keep it below the
+# pool's comfortable concurrency.
+_BODY_FLUSH_TASK_LIMIT = 16
+
 # A tool result whose content begins with one of these is treated as failed, so
 # we don't record a "source accessed" for data the tool never actually returned.
 # Each prefix is qualified (not a bare verb) so legit content isn't misread as an
@@ -121,16 +129,6 @@ _TIMESTAMP_MAX_CHARS = 64
 # and "failed to " not "failed" ("Failed Q4 earnings beat ..."). The real string
 # errors that reach here are web_fetch's "Failed to fetch/process ...".
 _ERROR_CONTENT_PREFIXES = ("[error]", "error:", "failed to ", "exception:", "exception ")
-
-
-def _canonical_body(value: Any) -> str:
-    """Full canonical string of a fingerprinted value — the raw per-access body.
-
-    Must equal the exact string ``fingerprint_result`` hashes for ``value`` so
-    the stored body is hash-consistent with ``result_sha256`` (it is the full
-    body, NOT the snippet-truncated form).
-    """
-    return _canonicalize(value)
 
 
 def _now_iso() -> str:
@@ -256,6 +254,10 @@ class ProvenanceMiddleware(AgentMiddleware):
     ) -> None:
         super().__init__()
         self._redactor = redactor
+        # Background body-store writes in flight (strong refs so they aren't GC'd
+        # mid-flush). Drained best-effort at agent end; see _schedule_body_flush.
+        self._body_flush_tasks: set[asyncio.Task[None]] = set()
+        self._max_body_flush_tasks = _BODY_FLUSH_TASK_LIMIT
         # tool name -> extractor(request, result) -> Iterable[ProvenanceSource]
         self._extractors: dict[
             str, Callable[[Any, Any], Iterable[ProvenanceSource]]
@@ -337,13 +339,11 @@ class ProvenanceMiddleware(AgentMiddleware):
             # One batched write per TOOL CALL, after this call's emits (best-effort,
             # never on the SSE event): collapses this call's per-source fan-out —
             # web_search's N URLs, the market fan-out's duplicate shas,
-            # execute_code's N mcp_trace entries — into a single chunked upsert, so
-            # a slow or failed body write can't delay or break the provenance
-            # events. Per call, not per turn: awrap_tool_call wraps one tool call,
-            # so a turn with many source-bearing calls does one flush each. A
-            # turn-level sink would batch further but needs cross-call buffering in
-            # shared middleware state (concurrency-sensitive) — deferred.
-            await self._flush_bodies(body_batch)
+            # execute_code's N mcp_trace entries — into a single chunked upsert.
+            # Scheduled OFF the tool-call critical path (background task, drained at
+            # agent end) so a DB/object-store write never delays the tool result or
+            # the next LLM step; the provenance events above already went out.
+            await self._schedule_body_flush(body_batch)
         except Exception:
             # WARNING, not DEBUG: a broken extractor silently degrades the
             # feature to "no provenance"; surface it so it's observable.
@@ -420,7 +420,8 @@ class ProvenanceMiddleware(AgentMiddleware):
 
         Returns None unless the source carries both a body and the
         ``result_sha256`` it hashes to, or if redaction itself fails (we never
-        store an unredacted body). Pure — no DB; the batch is flushed once per turn.
+        store an unredacted body). Pure — no DB; the batch is flushed by a
+        background task scheduled once per tool call.
 
         ``byte_len`` is the length of the body we actually store (post-redaction),
         NOT the raw pre-redaction ``result_size``. The read side derives truncation
@@ -461,6 +462,78 @@ class ProvenanceMiddleware(AgentMiddleware):
                 e,
             )
 
+    async def _schedule_body_flush(self, items: list[tuple]) -> None:
+        """Run one tool call's body flush OFF the tool-call critical path.
+
+        Schedules ``_flush_bodies`` as a tracked background task instead of
+        awaiting it inline, so the tool result returns without waiting on the DB /
+        object-store write. Bounded by ``_max_body_flush_tasks``: when saturated we
+        wait for one to drain before scheduling, which is the only inline wait on
+        the common path. The set is per-instance task ownership, NOT a per-run body
+        buffer, so concurrent subagents on this shared instance can't mix data.
+        """
+        if not items:
+            return
+        self._reap_body_flush_tasks()
+        while len(self._body_flush_tasks) >= self._max_body_flush_tasks:
+            done, _ = await asyncio.wait(
+                self._body_flush_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                self._body_flush_tasks.discard(task)
+                self._consume_body_flush_task(task)
+        task = asyncio.create_task(
+            self._flush_bodies(items), name="provenance_body_flush"
+        )
+        self._body_flush_tasks.add(task)
+        task.add_done_callback(self._on_body_flush_done)
+
+    def _on_body_flush_done(self, task: asyncio.Task[None]) -> None:
+        self._body_flush_tasks.discard(task)
+        self._consume_body_flush_task(task)
+
+    def _consume_body_flush_task(self, task: asyncio.Task[None]) -> None:
+        """Retrieve a finished flush's result so its exception is never orphaned."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.debug("[PROVENANCE] background body flush cancelled")
+        except Exception:
+            # _flush_bodies already swallows; this is belt-and-suspenders so a
+            # background task can't surface as an "exception never retrieved" warning.
+            logger.warning("[PROVENANCE] background body flush failed", exc_info=True)
+
+    def _reap_body_flush_tasks(self) -> None:
+        for task in tuple(self._body_flush_tasks):
+            if task.done():
+                self._body_flush_tasks.discard(task)
+                self._consume_body_flush_task(task)
+
+    async def _drain_body_flushes(self) -> None:
+        """Await body flushes already scheduled at entry (idempotent best-effort).
+
+        Snapshots the currently-tracked tasks and awaits them; writes a still-running
+        subagent schedules afterward stay tracked for the next drain. ``shield`` keeps
+        an in-flight DB write from being cancelled if this drain is itself cancelled
+        (e.g. a hard turn stop) mid-transaction.
+        """
+        self._reap_body_flush_tasks()
+        pending = tuple(self._body_flush_tasks)
+        if not pending:
+            return
+        try:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in pending),
+                return_exceptions=True,
+            )
+        finally:
+            self._reap_body_flush_tasks()
+
+    async def aafter_agent(self, state: Any, runtime: Any) -> dict | None:
+        """Drain background body writes at agent end (best-effort quiescence)."""
+        await self._drain_body_flushes()
+        return None
+
     # ----- per-tool extractors ------------------------------------------
 
     def _extract_web_search(
@@ -478,7 +551,7 @@ class ProvenanceMiddleware(AgentMiddleware):
             url = item.get("url")
             if not url:
                 continue
-            sha256, size, snippet = fingerprint_result(item)
+            sha256, size, snippet, body = fingerprint_result_with_body(item)
             yield ProvenanceSource(
                 record_id=_new_id(),
                 source_type="web_search",
@@ -492,7 +565,7 @@ class ProvenanceMiddleware(AgentMiddleware):
                 result_size=size,
                 result_snippet=snippet,
                 # Body = the same per-item value that produced result_sha256.
-                result_body=_canonical_body(item),
+                result_body=body,
             )
 
     def _extract_web_fetch(
@@ -503,7 +576,7 @@ class ProvenanceMiddleware(AgentMiddleware):
         if not url:
             return
         content = getattr(result, "content", result)
-        sha256, size, snippet = fingerprint_result(content)
+        sha256, size, snippet, body = fingerprint_result_with_body(content)
         yield ProvenanceSource(
             record_id=_new_id(),
             source_type="web_fetch",
@@ -514,7 +587,7 @@ class ProvenanceMiddleware(AgentMiddleware):
             result_sha256=sha256,
             result_size=size,
             result_snippet=snippet,
-            result_body=_canonical_body(content),
+            result_body=body,
         )
 
     def _extract_sec_filing(
@@ -536,7 +609,7 @@ class ProvenanceMiddleware(AgentMiddleware):
                 url = filing.get("source_url")
                 if not url:
                     continue
-                sha256, size, snippet = fingerprint_result(filing)
+                sha256, size, snippet, body = fingerprint_result_with_body(filing)
                 yield ProvenanceSource(
                     record_id=_new_id(),
                     source_type="sec_filing",
@@ -549,14 +622,14 @@ class ProvenanceMiddleware(AgentMiddleware):
                     result_sha256=sha256,
                     result_size=size,
                     result_snippet=snippet,
-                    result_body=_canonical_body(filing),
+                    result_body=body,
                 )
             return
 
         source_url = artifact.get("source_url")
         if not source_url:
             return
-        sha256, size, snippet = fingerprint_result(artifact)
+        sha256, size, snippet, body = fingerprint_result_with_body(artifact)
         yield ProvenanceSource(
             record_id=_new_id(),
             source_type="sec_filing",
@@ -569,7 +642,7 @@ class ProvenanceMiddleware(AgentMiddleware):
             result_sha256=sha256,
             result_size=size,
             result_snippet=snippet,
-            result_body=_canonical_body(artifact),
+            result_body=body,
         )
 
     def _extract_market_data(
@@ -611,8 +684,7 @@ class ProvenanceMiddleware(AgentMiddleware):
         fingerprint_target = (
             artifact if artifact is not None else getattr(result, "content", result)
         )
-        sha256, size, snippet = fingerprint_result(fingerprint_target)
-        body = _canonical_body(fingerprint_target)
+        sha256, size, snippet, body = fingerprint_result_with_body(fingerprint_target)
         for identifier in identifiers:
             yield ProvenanceSource(
                 record_id=_new_id(),

@@ -33,7 +33,11 @@ async def _run(middleware, request, result, emitted):
         return result
 
     with patch(_WRITER_PATH, return_value=emitted.append):
-        return await middleware.awrap_tool_call(request, handler)
+        out = await middleware.awrap_tool_call(request, handler)
+        # Body flush is now scheduled in the background; drain it so emission
+        # assertions see a settled state (mirrors the runtime's aafter_agent).
+        await middleware._drain_body_flushes()
+        return out
 
 
 @pytest.fixture
@@ -514,6 +518,9 @@ async def test_emit_failure_does_not_break_tool_call(middleware):
         result = await middleware.awrap_tool_call(
             _make_request("WebSearch", {"query": "q"}), handler
         )
+    # A flush was scheduled despite the writer failure; drain it so no task is
+    # left pending at loop close (best-effort store swallows its own errors).
+    await middleware._drain_body_flushes()
 
     assert result is sentinel
 

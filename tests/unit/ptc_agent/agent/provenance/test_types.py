@@ -11,6 +11,7 @@ from ptc_agent.agent.provenance import (
     ProvenanceSource,
     build_provenance_event,
     fingerprint_result,
+    fingerprint_result_with_body,
     hash_args,
     redact_args,
 )
@@ -79,6 +80,25 @@ def test_fingerprint_handles_odd_inputs_without_raising():
         assert isinstance(sha, str) and len(sha) == 64
         assert isinstance(size, int) and size >= 0
         assert isinstance(snippet, str)
+
+
+def test_fingerprint_with_body_matches_fingerprint_and_is_hash_consistent():
+    # The 4-tuple's sha/size/snippet must equal fingerprint_result's, and the
+    # returned body must be byte-identical to the string that produced the sha —
+    # that identity is the whole point (a verifier hashes the stored body).
+    for value in (
+        {"gamma": {"y": 2, "x": 1}, "alpha": 1},
+        [1, {"k": "v"}, None],
+        "plain string result",
+        "x" * 5000,
+        None,
+    ):
+        sha, size, snippet = fingerprint_result(value)
+        sha_b, size_b, snippet_b, body = fingerprint_result_with_body(value)
+        assert (sha_b, size_b, snippet_b) == (sha, size, snippet)
+        assert hashlib.sha256(body.encode("utf-8")).hexdigest() == sha
+        assert len(body.encode("utf-8")) == size
+        assert body[:500] == snippet  # snippet is the canonical body's head
 
 
 def test_build_event_generates_record_id_and_timestamp_when_omitted():

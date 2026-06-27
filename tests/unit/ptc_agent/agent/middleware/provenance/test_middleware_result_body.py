@@ -64,7 +64,11 @@ async def _run(middleware, request, result, emitted, *, store=None):
     with patch(_WRITER_PATH, return_value=emitted.append), patch(
         _STORE_PATH, store
     ):
-        return await middleware.awrap_tool_call(request, handler)
+        out = await middleware.awrap_tool_call(request, handler)
+        # The flush is scheduled in the background; drain inside the patch so the
+        # task's lazy store_result_bodies import resolves to the mock above.
+        await middleware._drain_body_flushes()
+        return out
 
 
 def _stored_items(store):
@@ -631,3 +635,52 @@ def test_result_body_cap_matches_across_layers():
     )
 
     assert RESULT_BODY_MAX_BYTES == SERVER_CAP
+
+
+# ---------------------------------------------------------------------------
+# Body store runs OFF the tool-call critical path: scheduled in the background
+# during awrap_tool_call, settled at agent end (aafter_agent / _drain).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_body_flush_is_deferred_then_drained(middleware):
+    """awrap_tool_call returns WITHOUT awaiting the store write; the write lands
+    once the background task is drained. This is the latency win: the tool result
+    (and the next LLM step) no longer waits on the DB/object-store write."""
+    request = _make_request("WebFetch", {"url": "https://x.test/doc"})
+    result = _result(content="external document body")
+    emitted: list = []
+    store = AsyncMock()
+
+    async def handler(_req):
+        return result
+
+    with patch(_WRITER_PATH, return_value=emitted.append), patch(_STORE_PATH, store):
+        out = await middleware.awrap_tool_call(request, handler)
+        # Scheduled, not yet executed — the tool result already returned.
+        store.assert_not_awaited()
+        await middleware._drain_body_flushes()
+        store.assert_awaited_once()
+
+    assert out is result
+    # The drain is idempotent and leaves no dangling tasks.
+    assert middleware._body_flush_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_aafter_agent_drains_pending_flush(middleware):
+    """The runtime drain point (aafter_agent) awaits in-flight body writes."""
+    request = _make_request("WebFetch", {"url": "https://x.test/doc"})
+    result = _result(content="external document body")
+    store = AsyncMock()
+
+    async def handler(_req):
+        return result
+
+    with patch(_WRITER_PATH, return_value=[].append), patch(_STORE_PATH, store):
+        await middleware.awrap_tool_call(request, handler)
+        store.assert_not_awaited()
+        await middleware.aafter_agent(state=None, runtime=None)
+        store.assert_awaited_once()
+    assert middleware._body_flush_tasks == set()

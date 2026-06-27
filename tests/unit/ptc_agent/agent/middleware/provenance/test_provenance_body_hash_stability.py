@@ -1,8 +1,8 @@
 """Hash-stability of the content-addressed body store on the SAFE FREQUENT PATH.
 
-The body handed to ``store_result_body`` is ``_canonical_body(value)`` — the exact
-string ``fingerprint_result(value)`` hashes into ``result_sha256`` — after passing
-through ``_redact_body``. So for content carrying NO secret value and NO
+The body handed to ``store_result_body`` is the ``canonical`` string from
+``fingerprint_result_with_body(value)`` — the exact string hashed into
+``result_sha256`` — after passing through ``_redact_body``. So for content carrying NO secret value and NO
 ``gxsa_/gxsr_`` sandbox token (SEC filings, market-data snapshots, static docs —
 the very content the GLOBAL dedup store exists to share across users/threads),
 redaction is the identity and ``sha256(stored_body) == result_sha256`` exactly.
@@ -83,6 +83,9 @@ async def _run(middleware, request, result):
         _STORE_PATH, store
     ):
         await middleware.awrap_tool_call(request, handler)
+        # Drain the background flush inside the patch so the task's lazy
+        # store_result_bodies import resolves to the mock.
+        await middleware._drain_body_flushes()
     return emitted, store
 
 
