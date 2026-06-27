@@ -481,6 +481,75 @@ describe('useChatMessages — report-back watch (PTC → flash report-back)', ()
     expect(mockWatch).toHaveBeenCalledTimes(1);
   });
 
+  it('drains N concurrent report-backs in order on ONE persistent watch, then stops', async () => {
+    // A flash thread dispatched several PTC analyses. Their report-backs arrive
+    // as separate ordered turns (the backend serializes them, clearing one
+    // flash_watch member at a time). The watch must attach each head run in
+    // turn — NOT stop after the first — on a single persistent watch, then tear
+    // down when /status reports nothing pending.
+    mockStatus.mockResolvedValue({
+      can_reconnect: false,
+      status: 'completed',
+      pending_report_back: true,
+      active_tasks: [],
+    });
+    mockReconnect.mockResolvedValue({ disconnected: false, aborted: false });
+
+    const watchCalls: Array<{ tid: string; cb: (p?: { run_id?: string | null }) => void | Promise<void> }> = [];
+    mockWatch.mockImplementation((tid: string, cb: (p?: { run_id?: string | null }) => void | Promise<void>) => {
+      watchCalls.push({ tid, cb });
+      return { abort: new AbortController() };
+    });
+
+    renderHookWithProviders(() => useChatMessages('ws-rb', 'th-rb'));
+    await waitFor(() => expect(mockWatch).toHaveBeenCalledTimes(1));
+
+    // Report-back #1: the wake names run-1 → attach it (fast path).
+    await act(async () => {
+      await watchCalls[0].cb({ run_id: 'rb-1' });
+    });
+    expect(mockReconnect).toHaveBeenCalledTimes(1);
+    expect(mockReconnect.mock.calls[0][1]).toBe('rb-1');
+
+    // Backend drained #1 and advanced to the next head: /status now names run-2,
+    // still pending. A later reconcile (poll/payload-less wake) must attach run-2
+    // on the SAME watch — the captured run id was cleared so reconcile re-queries
+    // /status rather than re-streaming run-1.
+    mockStatus.mockResolvedValue({
+      can_reconnect: false,
+      status: 'completed',
+      pending_report_back: true,
+      report_back_run_id: 'rb-2',
+      active_tasks: [],
+    });
+    await act(async () => {
+      await watchCalls[0].cb();
+    });
+    expect(mockReconnect).toHaveBeenCalledTimes(2);
+    expect(mockReconnect.mock.calls[1][1]).toBe('rb-2');
+    expect(mockWatch).toHaveBeenCalledTimes(1); // persistent — never re-armed
+
+    // All report-backs drained: /status reports not pending. The next reconcile
+    // tears the watch down without attaching anything.
+    mockStatus.mockResolvedValue({
+      can_reconnect: false,
+      status: 'completed',
+      pending_report_back: false,
+      report_back_run_id: null,
+      active_tasks: [],
+    });
+    await act(async () => {
+      await watchCalls[0].cb();
+    });
+    expect(mockReconnect).toHaveBeenCalledTimes(2);
+
+    // Watch is down: a stray late wake naming another run is a no-op.
+    await act(async () => {
+      await watchCalls[0].cb({ run_id: 'rb-late' });
+    });
+    expect(mockReconnect).toHaveBeenCalledTimes(2);
+  });
+
   it('does NOT arm the watch when pending_report_back is false', async () => {
     mockStatus.mockResolvedValue({
       can_reconnect: false,
