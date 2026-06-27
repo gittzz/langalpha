@@ -458,6 +458,16 @@ describe('ChatAgent API utilities', () => {
       expect(await runWatch()).toEqual({ run_id: null });
     });
 
+    it('joins multiple data: lines per the SSE spec before parsing', async () => {
+      // A wake whose JSON spans multiple data: lines must concatenate with a
+      // newline (SSE spec). The old single-line regex captured only the first
+      // line, truncating the JSON and forcing a /status fallback.
+      mockWatchResponse([
+        'event: workflow_started\ndata: {"thread_id":"flash-1",\ndata: "run_id":"rb-7"}\n\n',
+      ]);
+      expect(await runWatch()).toEqual({ run_id: 'rb-7' });
+    });
+
     it('cancels the reader once the wake is consumed', async () => {
       const { reader } = mockWatchResponse([
         'event: workflow_started\ndata: {"run_id":"rb-1"}\n\n',
