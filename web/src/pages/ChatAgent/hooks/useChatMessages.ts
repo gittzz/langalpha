@@ -598,6 +598,11 @@ export function useChatMessages(
   // the client-side reader stops immediately (instant stop) — the matching POST
   // /cancel tears down the backend run. Null when no main stream is in flight.
   const mainStreamAbortRef = useRef<AbortController | null>(null);
+  // The reconnect that currently owns the "Reconnecting…" spinner. Its finally
+  // clears the spinner only if it's still the owner — a newer reconnect takes
+  // ownership and manages its own spinner, so a stale/superseded reconnect can
+  // neither clobber the new one's spinner nor strand its own.
+  const isReconnectingOwnerRef = useRef<AbortController | null>(null);
   // The thread a reconnect stream is attached to (set when reconnectToStream
   // marks isStreamingRef). Lets the thread-load effect tell "this thread is
   // streaming" (skip the load) from "a DIFFERENT thread is streaming" (e.g. a
@@ -2237,6 +2242,8 @@ export function useChatMessages(
     // stop already tore everything down.
     const abortController = new AbortController();
     mainStreamAbortRef.current = abortController;
+    // This reconnect now owns the spinner set above (setIsReconnecting(true)).
+    isReconnectingOwnerRef.current = abortController;
 
     try {
       // Replay buffered events first — this processes artifact{task,spawned} events
@@ -2316,8 +2323,6 @@ export function useChatMessages(
         setMessageError((err as Error).message || 'Failed to reconnect to stream');
       }
     } finally {
-      setIsReconnecting(false);
-
       // Clean up empty reconnect messages (no content segments = nothing was
       // streamed). Skip on a user stop: finalizeStreamingMessage just stamped
       // this bubble `stopped: true` (with the "⏹ Stopped" chip) but left it
@@ -2342,6 +2347,15 @@ export function useChatMessages(
       // loading and re-open the report-back watch after the stop.
       if (stillActive && !wasInterruptedRef.current && !wasStoppedRef.current) {
         cleanupAfterStreamEnd(assistantMessageId);
+      }
+      // Clear the spinner only if THIS reconnect still owns it. A newer reconnect
+      // (cross-thread nav) took ownership and manages its own spinner — clobbering
+      // it would hide the new thread's reconnect. Any other teardown that swapped
+      // the stream out from under us (user stop, steering demoted to a new turn)
+      // leaves ownership with us, so we still clear and never strand the spinner.
+      if (isReconnectingOwnerRef.current === abortController) {
+        setIsReconnecting(false);
+        isReconnectingOwnerRef.current = null;
       }
       if (stillActive) {
         mainStreamAbortRef.current = null;
@@ -3091,6 +3105,8 @@ export function useChatMessages(
     // Stopping mid-bringup or mid-compaction must clear these too — otherwise a
     // stuck "starting sandbox" / "compacting" indicator outlives the stop.
     // cleanupAfterStreamEnd resets them, but the stop path skips that cleanup.
+    // (isReconnecting is handled by the reconnect finally's ownership check: the
+    // abort above unwinds the reader, whose finally still owns and clears it.)
     setWorkspaceStarting(false);
     setIsCompacting(false);
     // Drop any message queued during compaction: the user just cancelled, so it

@@ -566,7 +566,7 @@ export async function getWorkflowStatus(threadId: string) {
  */
 export function watchThread(
   threadId: string,
-  onWorkflowStarted: (payload?: { run_id?: string | null }) => void,
+  onWorkflowStarted: (payload?: { run_id?: string | null }) => void | Promise<void>,
 ): { abort: AbortController } {
   const abort = new AbortController();
   const MAX_RETRIES = 2;
@@ -624,7 +624,7 @@ export function watchThread(
                 /* payload-less / malformed wake — caller falls back to /status */
               }
             }
-            onWorkflowStarted({ run_id: payload.run_id ?? null });
+            await onWorkflowStarted({ run_id: payload.run_id ?? null });
             return;
           }
         }
