@@ -90,7 +90,11 @@ def _track_task(task: asyncio.Task) -> None:
 
 
 async def _consume_background_gen(
-    gen, label: str, thread_id: str, run_id: str
+    gen,
+    label: str,
+    thread_id: str,
+    run_id: str,
+    report_back_ptc_thread_id: str | None = None,
 ) -> bool:
     """Drain an async generator in the background, cleaning up Redis on failure."""
     _ok = True
@@ -113,14 +117,22 @@ async def _consume_background_gen(
 
             cache = get_cache_client()
             if cache.enabled and cache.client:
-                # Only the PTC generator crashing reaches this with a real
-                # ptc_origin: a flash-dispatch crash looks up
-                # ptc_origin:{flash_thread_id} (wrong key) -> no-op, so the
-                # report-back keys survive for reload recovery.
-                origin = await cache.get(f"ptc_origin:{thread_id}")
+                # Resolve the PTC thread whose report-back watch this crash should
+                # tear down. The origin is keyed by the *PTC* thread id:
+                #   - PTC_DISPATCH crash: thread_id IS the ptc thread -> direct hit,
+                #     clear (the watched run just died).
+                #   - report-back run crash: report_back_ptc_thread_id names the
+                #     completed PTC -> clear, else a never-finishing report-back
+                #     leaves /status reporting a stale pending run until TTL.
+                #   - ordinary flash-dispatch crash: no report_back id and thread_id
+                #     is the flash thread -> ptc_origin:{flash_tid} misses -> no-op,
+                #     so a still-running dispatched PTC's keys survive for reload
+                #     recovery.
+                ptc_thread_id = report_back_ptc_thread_id or thread_id
+                origin = await cache.get(f"ptc_origin:{ptc_thread_id}")
                 if origin:
                     flash_tid = origin.get("flash_thread_id")
-                    await clear_flash_report_back(cache, thread_id, flash_tid)
+                    await clear_flash_report_back(cache, ptc_thread_id, flash_tid)
                     if flash_tid:
                         await cache.client.publish(
                             f"thread:wake:{flash_tid}",
@@ -637,7 +649,13 @@ async def _handle_send_message(
                 await manager.pre_register(thread_id, run_id)
             _track_task(asyncio.create_task(
                 observe_background_chat_turn(
-                    _consume_background_gen(flash_gen, "FLASH_DISPATCH", thread_id, run_id),
+                    _consume_background_gen(
+                        flash_gen,
+                        "FLASH_DISPATCH",
+                        thread_id,
+                        run_id,
+                        report_back_ptc_thread_id=request.report_back_ptc_thread_id,
+                    ),
                     mode="flash",
                     model=_model,
                     user_id=user_id,
