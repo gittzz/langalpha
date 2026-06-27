@@ -2523,7 +2523,14 @@ export function useChatMessages(
     }
   };
 
-  // Drive the flash thread to the PTC report-back turn once the PTC completes.
+  // Drive the flash thread to each PTC report-back turn as the PTCs complete.
+  //
+  // A single flash thread can dispatch N concurrent PTC analyses; the backend
+  // serializes their report-backs into ordered, non-overlapping turns (one
+  // flash_watch member cleared at a time). So the watch is a PERSISTENT poller,
+  // not single-shot: it attaches the current head run, and on the next reconcile
+  // (after that turn's stream ends) discovers and attaches the next head, until
+  // /status reports pending_report_back=false.
   //
   // The watch is KEYED to the flash thread (`flashThreadId`), not the visible
   // thread, and persists across navigation. When the user jumps into the
@@ -2568,10 +2575,15 @@ export function useChatMessages(
     // screen (the dispatch turn, or a report-back run we already attached to).
     const attach = async (runId: string | null, activeTasks: string[]) => {
       if (!runId || runId === currentRunIdRef.current) return false;
-      consumed = true;
-      awaitingReportBackRef.current = false;
+      // We consumed THIS run id, but the watch stays armed: a flash thread can
+      // dispatch N concurrent PTC analyses, and the backend drains their
+      // report-backs one ordered turn at a time. Clear the captured id so the
+      // next reconcile falls through to /status and discovers the NEXT head run
+      // (the render gate + isStreamingRef keep us from double-attaching while
+      // this one streams). The watch tears down only once /status reports
+      // pending_report_back=false (flash_watch drained) or the stuck-poll cap.
       reportBackRunIdRef.current = null;
-      stopReportBackWatch();
+      polls = 0; // progress made — reset the stuck-poll budget for the next gap
       await reconnectToStream({ activeTasks, runId, resetCursor: true });
       return true;
     };
@@ -2616,9 +2628,20 @@ export function useChatMessages(
       if (status.report_back_run_id) reportBackRunIdRef.current = status.report_back_run_id;
       if (await attach(reportBackRunIdRef.current, status.active_tasks || [])) return;
 
-      // No report-back run named yet (still pending) or none is coming (the PTC
-      // dispatch failed). Keep polling, but give up after a bounded window so a
-      // never-arriving report-back doesn't poll forever.
+      // flash_watch is empty -> every dispatched report-back has drained
+      // (including the case where the only one was just consumed). Tear down.
+      if (status.pending_report_back === false) {
+        consumed = true;
+        awaitingReportBackRef.current = false;
+        stopReportBackWatch();
+        return;
+      }
+
+      // Still pending but no report-back run named yet (the next one hasn't been
+      // posted), or none is coming (the PTC dispatch failed). Keep polling, but
+      // give up after a bounded idle window so a never-arriving report-back
+      // doesn't poll forever. The budget resets on each successful attach, so a
+      // long chain of report-backs isn't capped as long as each makes progress.
       if (source === 'poll' && ++polls >= REPORT_BACK_MAX_POLLS) {
         consumed = true;
         awaitingReportBackRef.current = false;
