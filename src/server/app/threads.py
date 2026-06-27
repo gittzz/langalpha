@@ -107,19 +107,21 @@ async def _consume_background_gen(
         )
         try:
             from src.utils.cache.redis_cache import get_cache_client
+            from src.server.handlers.chat.ptc_workflow import (
+                clear_flash_report_back,
+            )
 
             cache = get_cache_client()
             if cache.enabled and cache.client:
+                # Only the PTC generator crashing reaches this with a real
+                # ptc_origin: a flash-dispatch crash looks up
+                # ptc_origin:{flash_thread_id} (wrong key) -> no-op, so the
+                # report-back keys survive for reload recovery.
                 origin = await cache.get(f"ptc_origin:{thread_id}")
                 if origin:
                     flash_tid = origin.get("flash_thread_id")
-                    await cache.delete(f"ptc_origin:{thread_id}")
+                    await clear_flash_report_back(cache, thread_id, flash_tid)
                     if flash_tid:
-                        watch_key = f"flash_watch:{flash_tid}"
-                        await cache.client.srem(watch_key, thread_id)
-                        remaining = await cache.client.scard(watch_key)
-                        if remaining == 0:
-                            await cache.client.delete(watch_key)
                         await cache.client.publish(
                             f"thread:wake:{flash_tid}",
                             '{"error": "background_workflow_failed"}',
@@ -560,9 +562,16 @@ async def _handle_send_message(
         _svc_token = _get_service_token()
         is_internal = bool(_svc_token and _req_token and hmac.compare_digest(_req_token, _svc_token))
 
-        # Strip query_type from non-internal requests (prevent spoofing system messages)
-        if not is_internal and request.query_type:
-            request = request.model_copy(update={"query_type": None})
+        # Strip internal-only fields from non-internal requests (prevent
+        # spoofing system messages / forging report-back watch cleanup).
+        if not is_internal:
+            internal_overrides = {}
+            if request.query_type:
+                internal_overrides["query_type"] = None
+            if request.report_back_ptc_thread_id:
+                internal_overrides["report_back_ptc_thread_id"] = None
+            if internal_overrides:
+                request = request.model_copy(update=internal_overrides)
     except BaseException:
         await release_burst_slot(user_id)
         raise
