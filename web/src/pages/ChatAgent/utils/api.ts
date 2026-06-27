@@ -607,12 +607,19 @@ export function watchThread(
             if (!frame.includes('event: workflow_started')) continue;
             reader.cancel();
             // Pull the run_id out of the event's data line so the caller can
-            // attach to that exact run without a /status round-trip.
+            // attach to that exact run without a /status round-trip. Per the SSE
+            // spec, multiple data: lines join with a newline — collect them all
+            // (mirroring streamFetch above) so a multi-line payload stays
+            // parseable instead of truncating to the first line and corrupting
+            // the JSON. The backend wake is single-line today; this is resilience.
             let payload: { run_id?: string | null } = {};
-            const m = frame.match(/data: (.*)/);
-            if (m) {
+            const dataLines: string[] = [];
+            for (const raw of frame.split('\n')) {
+              if (raw.startsWith('data:')) dataLines.push(raw.slice(5).trim());
+            }
+            if (dataLines.length) {
               try {
-                payload = JSON.parse(m[1].trim());
+                payload = JSON.parse(dataLines.join('\n'));
               } catch {
                 /* payload-less / malformed wake — caller falls back to /status */
               }
