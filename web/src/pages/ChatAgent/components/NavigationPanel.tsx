@@ -540,7 +540,9 @@ function NavigationPanel({
                                 const isMainAgent = agent.isMainAgent;
                                 const isSelected = activeAgentId === agent.id;
                                 const status = getAgentStatus(agent);
-                                const isActive = status === 'active';
+                                // Narrow agent-running flag; named distinctly from the
+                                // component's isActive prop (panel visibility) to avoid shadowing.
+                                const isAgentActive = status === 'active';
                                 const isCompleted = status === 'completed';
 
                                 const trimmedDescription = typeof agent.description === 'string' ? agent.description.trim() : '';
@@ -553,7 +555,7 @@ function NavigationPanel({
                                     key={agent.id}
                                     data-testid="agent-row"
                                     data-agent-role={isMainAgent ? 'main' : 'sub'}
-                                    className={`nav-panel-agent-row group ${isActive && !isMainAgent ? 'nav-panel-agent-pulse' : ''}${isSelected ? ' is-selected' : ''}`}
+                                    className={`nav-panel-agent-row group ${isAgentActive && !isMainAgent ? 'nav-panel-agent-pulse' : ''}${isSelected ? ' is-selected' : ''}`}
                                     style={{
                                       backgroundColor: isSelected ? 'var(--color-border-muted)' : undefined,
                                     }}
@@ -578,7 +580,7 @@ function NavigationPanel({
                                       <span className="flex-shrink-0 ml-auto flex items-center">
                                         {isCompleted ? (
                                           <Check className="h-3 w-3" style={{ color: 'var(--color-text-tertiary)' }} />
-                                        ) : isActive ? (
+                                        ) : isAgentActive ? (
                                           <Loader2 className="h-3 w-3 animate-spin" style={{ color: 'var(--color-text-tertiary)' }} />
                                         ) : (
                                           <Circle className="h-3 w-3" style={{ color: 'var(--color-icon-muted)' }} />
