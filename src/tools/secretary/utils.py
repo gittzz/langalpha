@@ -9,6 +9,15 @@ logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 8000
 
+# Ceiling on how many turns a single read pulls from the DB. Output is truncated
+# to MAX_OUTPUT_CHARS regardless, so fetching more rows than this only wastes
+# memory on a long thread.
+_MAX_HISTORY_TURNS = 50
+
+# Inserted between turns when more than one turn is returned so distinct turns'
+# outputs don't run together into one ambiguous blob.
+_TURN_SEPARATOR = "\n\n---\n\n"
+
 # File extensions recognized as workspace file references (mirrors frontend KNOWN_EXTS)
 _FILE_EXTS = (
     r"md|txt|pdf|doc|docx|rtf|"
@@ -102,7 +111,55 @@ def _parse_sse_string(raw: str) -> tuple[str, dict] | None:
         return None
 
 
-async def extract_text_from_thread(thread_id: str) -> dict[str, Any]:
+def _truncate_single(text: str) -> str:
+    """Head-truncate one turn's text to ``MAX_OUTPUT_CHARS`` (keeps the start)."""
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    return text[:MAX_OUTPUT_CHARS] + (
+        "\n\n[truncated — full output available in workspace]"
+    )
+
+
+def _join_recent_turns(turn_texts: list[str]) -> str:
+    """Join turn texts oldest -> newest, capped at ``MAX_OUTPUT_CHARS``.
+
+    Turn boundaries are known from the list (not rediscovered by scanning the
+    joined text), so a turn whose own markdown contains ``---`` is never
+    mistaken for a separator. When the cap is exceeded, whole older turns are
+    dropped from the front so the most-recent turns survive; the newest turn is
+    head-truncated if it alone overflows. A banner notes any dropped turns.
+    """
+    turn_texts = [t for t in turn_texts if t]
+    if not turn_texts:
+        return ""
+
+    joined = _TURN_SEPARATOR.join(turn_texts)
+    if len(joined) <= MAX_OUTPUT_CHARS:
+        return joined
+
+    # Keep the newest turns that fit, always retaining at least the newest one.
+    kept: list[str] = []
+    total = 0
+    for text in reversed(turn_texts):
+        extra = len(text) + (len(_TURN_SEPARATOR) if kept else 0)
+        if kept and total + extra > MAX_OUTPUT_CHARS:
+            break
+        kept.append(text)
+        total += extra
+    kept.reverse()
+
+    body = _truncate_single(_TURN_SEPARATOR.join(kept))
+    if len(kept) < len(turn_texts):
+        body = (
+            "[earlier turns truncated — full output available in workspace]\n\n"
+            + body
+        )
+    return body
+
+
+async def extract_text_from_thread(
+    thread_id: str, turns: int = 1
+) -> dict[str, Any]:
     """Extract text content from a thread's SSE events.
 
     Reads from Redis if the thread is actively running, otherwise reads
@@ -110,6 +167,10 @@ async def extract_text_from_thread(thread_id: str) -> dict[str, Any]:
 
     Args:
         thread_id: The conversation thread ID
+        turns: How many of the most-recent turns to include. 1 (default) =
+            only the latest turn; N > 1 = the last N turns; <= 0 = the full
+            thread history. The window applies to the persisted record; while
+            a turn is actively streaming, only that live turn is returned.
 
     Returns:
         Dict with keys: text, status, thread_id, workspace_id
@@ -140,22 +201,18 @@ async def extract_text_from_thread(thread_id: str) -> dict[str, Any]:
     else:
         status = thread.get("current_status", "unknown")
 
-    # Determine if running (read from Redis) or completed (read from DB)
+    # Determine if running (read from Redis) or completed (read from DB).
+    # Qualify relative file paths with workspace context so the flash agent
+    # (and its frontend) can resolve them across workspaces, then cap length.
     active_statuses = {"running", "active", "streaming", "pending"}
     if status in active_statuses:
+        # The active stream is always a single live turn.
         text = await _extract_from_redis(thread_id)
+        text = _truncate_single(_qualify_file_paths(text, workspace_id))
     else:
-        text = await _extract_from_db(thread_id)
-
-    # Qualify relative file paths with workspace context so the flash
-    # agent (and its frontend) can resolve them across workspaces.
-    text = _qualify_file_paths(text, workspace_id)
-
-    # Truncate if needed
-    if len(text) > MAX_OUTPUT_CHARS:
-        text = text[:MAX_OUTPUT_CHARS] + (
-            "\n\n[truncated — full output available in workspace]"
-        )
+        turn_texts = await _extract_from_db(thread_id, turns)
+        turn_texts = [_qualify_file_paths(t, workspace_id) for t in turn_texts]
+        text = _join_recent_turns(turn_texts)
 
     return {
         "text": text,
@@ -255,39 +312,40 @@ async def _extract_from_redis(thread_id: str) -> str:
     return "".join(chunks)
 
 
-async def _extract_from_db(thread_id: str) -> str:
-    """Extract text content from DB-persisted SSE events.
-
-    Args:
-        thread_id: The conversation thread ID
-
-    Returns:
-        Concatenated text content from message_chunk events
-    """
-    from src.server.database.conversation import get_responses_for_thread
-
-    try:
-        responses, _ = await get_responses_for_thread(thread_id, limit=10)
-    except Exception as e:
-        logger.error(f"Failed to read DB responses for thread {thread_id}: {e}")
-        return ""
-
+def _text_from_response(response: dict[str, Any]) -> str:
+    """Concatenate the text of one turn's ``message_chunk`` SSE events."""
     chunks: list[str] = []
-    for response in responses:
-        sse_events = response.get("sse_events")
-        if not sse_events:
+    for event in response.get("sse_events") or []:
+        if not isinstance(event, dict):
             continue
-        for event in sse_events:
-            if not isinstance(event, dict):
-                continue
-            if event.get("event") != "message_chunk":
-                continue
-            data = event.get("data", {})
-            if not isinstance(data, dict):
-                continue
-            if data.get("content_type") == "text":
-                content = data.get("content", "")
-                if content:
-                    chunks.append(content)
-
+        if event.get("event") != "message_chunk":
+            continue
+        data = event.get("data", {})
+        if not isinstance(data, dict):
+            continue
+        if data.get("content_type") == "text":
+            content = data.get("content", "")
+            if content:
+                chunks.append(content)
     return "".join(chunks)
+
+
+async def _extract_from_db(thread_id: str, turns: int = 1) -> list[str]:
+    """Return per-turn text (oldest -> newest) for the most-recent ``turns`` turns.
+
+    ``turns``: 1 = latest only, N = last N, <= 0 = recent history; capped at
+    ``_MAX_HISTORY_TURNS`` rows since output is truncated anyway. Returns one
+    entry per non-empty turn, and lets read failures propagate so the caller
+    surfaces an error instead of an empty, success-looking result.
+    """
+    from src.server.database.conversation import get_recent_responses_for_thread
+
+    if turns == 1:
+        limit = 1
+    elif turns <= 0:
+        limit = _MAX_HISTORY_TURNS
+    else:
+        limit = min(turns, _MAX_HISTORY_TURNS)
+
+    responses = await get_recent_responses_for_thread(thread_id, limit=limit)
+    return [text for text in map(_text_from_response, responses) if text]

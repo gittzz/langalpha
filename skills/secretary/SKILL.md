@@ -45,6 +45,8 @@ Return: `{ text, status, thread_id, workspace_id }`
 - `status: "completed"` — full output available
 - `status: "error"` — something went wrong
 
+**`turns` window** (also on `manage_threads(action="get_output")`): by default you get only the **latest turn's** output. For a thread continued several times, pass `turns=N` for the last N turns or `turns=0` for the full history — turns come back oldest→newest, separated by `---`. A still-streaming turn always returns just that live turn, regardless of `turns`.
+
 ---
 
 ## Workflow Patterns
@@ -67,6 +69,7 @@ When the user asks for a status overview, combine workspace and thread informati
 When the user wants to follow up on a prior dispatch:
 1. Call `ptc_agent(question="...", thread_id="...")` with the original thread_id
 2. The PTC agent continues in the same thread with full prior context
+3. To review the whole conversation (not just the newest answer), read it back with `agent_output(thread_id="...", turns=0)`
 
 ### Workspace cleanup
 

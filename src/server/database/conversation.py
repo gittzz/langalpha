@@ -1542,6 +1542,42 @@ async def get_responses_for_thread(
         raise
 
 
+async def get_recent_responses_for_thread(
+    conversation_thread_id: str, limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """Return the most-recent turns in chronological order (oldest -> newest).
+
+    Selects the newest ``limit`` rows via ``turn_index DESC`` (so a window
+    keeps the latest turns, not the oldest) and reverses them to chronological
+    order. ``limit=None`` returns every turn.
+    """
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                base = """
+                    SELECT
+                        conversation_response_id, conversation_thread_id, turn_index, status,
+                        interrupt_reason, metadata,
+                        warnings, errors, execution_time, created_at,
+                        sse_events
+                    FROM conversation_responses
+                    WHERE conversation_thread_id = %s
+                    ORDER BY turn_index DESC
+                """
+                if limit:
+                    await cur.execute(base + " LIMIT %s", (conversation_thread_id, limit))
+                else:
+                    await cur.execute(base, (conversation_thread_id,))
+
+                rows = await cur.fetchall()
+                # SQL yields newest-first; reverse to chronological order.
+                return [dict(row) for row in reversed(rows)]
+
+    except Exception as e:
+        logger.error(f"Error getting recent responses for thread: {e}")
+        raise
+
+
 # ==================== Query-Response Pair Operations ====================
 
 

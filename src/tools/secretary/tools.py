@@ -251,11 +251,12 @@ async def _verify_thread_owner(
 
 
 async def _get_thread_output(
-    user_id: str, thread_id: str, tool_call_id: str
+    user_id: str, thread_id: str, tool_call_id: str, turns: int = 1
 ) -> Command:
     """Verify ownership and extract thread output.
 
     Shared by agent_output tool and manage_threads(action="get_output").
+    ``turns`` bounds how many recent turns are returned (1 = latest only).
     """
     from src.tools.secretary.utils import extract_text_from_thread
 
@@ -263,7 +264,7 @@ async def _get_thread_output(
         return err
 
     try:
-        result = await extract_text_from_thread(thread_id)
+        result = await extract_text_from_thread(thread_id, turns)
     except Exception as e:
         logger.error(f"Failed to extract text from thread {thread_id}: {e}")
         return _error_command("failed to retrieve thread output", tool_call_id)
@@ -720,6 +721,7 @@ async def ptc_agent(
 async def agent_output(
     thread_id: str,
     config: RunnableConfig,
+    turns: int = 1,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """Retrieve the text output of a running or completed PTC agent thread.
@@ -728,13 +730,17 @@ async def agent_output(
 
     Args:
         thread_id: The thread ID to retrieve output from
+        turns: How many of the most-recent turns to return. Default 1 (only the
+            latest turn's output). Pass a larger N for the last N turns, or 0
+            for the full thread history; multiple turns are separated by '---'.
+            A turn still streaming returns only that live turn.
     """
     configurable = config.get("configurable", {})
     user_id = configurable.get("user_id")
     if not user_id:
         return _error_command("user_id not found in config", tool_call_id)
 
-    return await _get_thread_output(user_id, thread_id, tool_call_id)
+    return await _get_thread_output(user_id, thread_id, tool_call_id, turns)
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +754,7 @@ async def manage_threads(
     config: RunnableConfig,
     workspace_id: str | None = None,
     thread_id: str | None = None,
+    turns: int = 1,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """Manage conversation threads: list, get output, or delete.
@@ -756,6 +763,8 @@ async def manage_threads(
         action: One of "list", "get_output", "delete"
         workspace_id: Optional workspace ID to filter threads (for "list")
         thread_id: Thread ID (required for "get_output" and "delete")
+        turns: For "get_output", how many recent turns to return. Default 1
+            (latest only); N for the last N turns; 0 for the full history.
     """
     configurable = config.get("configurable", {})
     user_id = configurable.get("user_id")
@@ -765,7 +774,7 @@ async def manage_threads(
     if action == "list":
         return await _threads_list(user_id, workspace_id, tool_call_id)
     elif action == "get_output":
-        return await _threads_get_output(user_id, thread_id, tool_call_id)
+        return await _threads_get_output(user_id, thread_id, tool_call_id, turns)
     elif action == "delete":
         return await _threads_delete(user_id, thread_id, tool_call_id)
     else:
@@ -814,7 +823,7 @@ async def _threads_list(
 
 
 async def _threads_get_output(
-    user_id: str, thread_id: str | None, tool_call_id: str
+    user_id: str, thread_id: str | None, tool_call_id: str, turns: int = 1
 ) -> Command:
     """Get output from a specific thread."""
     if not thread_id:
@@ -822,7 +831,7 @@ async def _threads_get_output(
             "thread_id is required for get_output action", tool_call_id
         )
 
-    return await _get_thread_output(user_id, thread_id, tool_call_id)
+    return await _get_thread_output(user_id, thread_id, tool_call_id, turns)
 
 
 async def _threads_delete(
