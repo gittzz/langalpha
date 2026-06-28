@@ -622,6 +622,14 @@ export function useChatMessages(
   // a stream type that doesn't consume it (e.g. steering) can't leak a stale
   // flag into a later abort and mis-fire a reconnect onto the wrong turn.
   const backgroundReconnectRef = useRef(false);
+  // True once the tab was GENUINELY suspended (Page Lifecycle `pagehide`/`freeze`)
+  // since it last became visible — the only state in which the SSE socket was
+  // actually torn down. A plain desktop tab-switch fires `visibilitychange` but
+  // NOT these, and keeps the socket alive; gating the foreground reconnect on
+  // this flag means alt-tabbing never aborts a healthy stream (no regression for
+  // non-suspended users). Set on suspend, consumed+cleared by the first resume
+  // handler so one suspend→resume cycle triggers at most one reconnect.
+  const tabSuspendedRef = useRef(false);
 
   // Refs for history loading state
   const historyLoadingRef = useRef(false);
@@ -769,9 +777,22 @@ export function useChatMessages(
   // On foreground, if a main stream is genuinely active and reconnectable,
   // abort the (likely dead) reader and flag it so the stream's result handler
   // runs the existing reconnect rather than treating the abort as a user stop.
+  //
+  // CRITICAL: only act when the tab was ACTUALLY suspended (`pagehide`/`freeze`),
+  // not on a bare `visibilitychange`. A desktop alt-tab fires visibility events
+  // but keeps the socket alive — aborting there would needlessly tear down a
+  // healthy stream and flash "Reconnecting…" on every refocus. The lifecycle
+  // suspend events fire only when the OS froze the tab (the case the socket
+  // dies), so gating on tabSuspendedRef keeps non-suspended users unaffected.
   useEffect(() => {
+    const onSuspend = () => { tabSuspendedRef.current = true; };
     const onForeground = () => {
       if (typeof document === 'undefined' || document.visibilityState !== 'visible') return;
+      // No genuine suspend since we were last visible → socket is still alive,
+      // nothing to recover. Consume the flag so each suspend→resume cycle
+      // triggers at most one reconnect (pageshow + visibilitychange both fire).
+      if (!tabSuspendedRef.current) return;
+      tabSuspendedRef.current = false;
       if (!isLoading || !mainStreamAbortRef.current) return;        // nothing streaming
       // Use the latched thread ref, not the threadId prop: a brand-new chat
       // keeps the prop at '__default__' until the first SSE event updates the
@@ -785,9 +806,16 @@ export function useChatMessages(
       backgroundReconnectRef.current = true;
       mainStreamAbortRef.current.abort();
     };
+    // Suspend signals: pagehide (iOS app-background / bfcache) + freeze (Chromium
+    // background-tab freeze). Both fire only on a real suspend, never on a tab-switch.
+    window.addEventListener('pagehide', onSuspend);
+    document.addEventListener('freeze', onSuspend);
+    // Resume triggers: pageshow (bfcache restore) + visibilitychange (return to visible).
     document.addEventListener('visibilitychange', onForeground);
     window.addEventListener('pageshow', onForeground);
     return () => {
+      window.removeEventListener('pagehide', onSuspend);
+      document.removeEventListener('freeze', onSuspend);
       document.removeEventListener('visibilitychange', onForeground);
       window.removeEventListener('pageshow', onForeground);
     };

@@ -75,6 +75,11 @@ function deferredStreamMock(runId = 'run-1', threadId = 'th-1') {
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
+// Simulate a GENUINE tab suspend — iOS app-background / bfcache fires `pagehide`,
+// Chromium background-tab freeze fires `freeze`. The foreground reconnect only
+// arms after one of these; a bare `visibilitychange` (desktop alt-tab) must not.
+const suspendTab = () => window.dispatchEvent(new Event('pagehide'));
+
 // Start an in-flight main stream and wait until it is live (isLoading true,
 // run_id latched). Returns the rendered hook result.
 async function startActiveStream(visibility: { value: string }) {
@@ -120,6 +125,7 @@ describe('useChatMessages — foreground (visibility) reconnect', () => {
     await startActiveStream(visibility);
 
     await act(async () => {
+      suspendTab();
       document.dispatchEvent(new Event('visibilitychange'));
       await flush();
     });
@@ -135,6 +141,7 @@ describe('useChatMessages — foreground (visibility) reconnect', () => {
     await startActiveStream(visibility);
 
     await act(async () => {
+      suspendTab();
       window.dispatchEvent(new Event('pageshow'));
       await flush();
     });
@@ -171,6 +178,27 @@ describe('useChatMessages — foreground (visibility) reconnect', () => {
     expect(mockReconnect).not.toHaveBeenCalled();
   });
 
+  // Regression guard for the rest of users: a desktop tab-switch fires
+  // `visibilitychange` (and sometimes `pageshow`) but NOT `pagehide`/`freeze`,
+  // and the SSE socket stays alive. Without a genuine suspend the handler must
+  // NOT abort the live stream — else every alt-tab during a turn would needlessly
+  // tear it down and flash "Reconnecting…".
+  it('does NOT reconnect on a bare visibilitychange with no genuine suspend (desktop alt-tab)', async () => {
+    const result = await startActiveStream(visibility);
+
+    // No pagehide/freeze — just the visibility flip a desktop tab-switch produces.
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.dispatchEvent(new Event('pageshow'));
+      await flush();
+    });
+
+    expect(mockReconnect).not.toHaveBeenCalled();
+    expect(mockStatus).not.toHaveBeenCalled();
+    // The live stream was left intact (still loading), not aborted.
+    expect(result.current.isLoading).toBe(true);
+  });
+
   // Regression: a brand-new chat sends its FIRST message while the route prop is
   // still '__default__' (it only flips to the real id on the first SSE event,
   // which for a PTC turn can be 5–30s out during sandbox spin-up). The real
@@ -205,6 +233,7 @@ describe('useChatMessages — foreground (visibility) reconnect', () => {
     mockReconnect.mockClear();
 
     await act(async () => {
+      suspendTab();
       document.dispatchEvent(new Event('visibilitychange'));
       await flush();
     });
@@ -284,6 +313,7 @@ describe('useChatMessages — foreground (visibility) reconnect', () => {
 
     // Tab returns → foreground handler aborts the demoted stream → re-kick.
     await act(async () => {
+      suspendTab();
       document.dispatchEvent(new Event('visibilitychange'));
       await flush();
     });
