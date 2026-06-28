@@ -11,6 +11,7 @@ describe('isNearBottom', () => {
   it('respects the threshold boundary (default 120)', () => {
     // distance = scrollHeight - scrollTop - clientHeight
     expect(isNearBottom({ scrollTop: 781, scrollHeight: 1000, clientHeight: 100 })).toBe(true); // 119
+    expect(isNearBottom({ scrollTop: 780, scrollHeight: 1000, clientHeight: 100 })).toBe(true); // 120 (inclusive)
     expect(isNearBottom({ scrollTop: 779, scrollHeight: 1000, clientHeight: 100 })).toBe(false); // 121
   });
   it('honors a custom threshold', () => {

@@ -1,6 +1,6 @@
 import React, { type ReactElement } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 // Enable platform auth code path (AuthProvider checks VITE_HOST_MODE)
@@ -175,7 +175,11 @@ describe('AuthContext', () => {
         event: string,
         session: unknown,
       ) => void;
-      handler('SIGNED_OUT', null);
+      // Wrap in act(): the handler drives AuthProvider state updates, which
+      // React 19 warns about if flushed outside an act() boundary.
+      await act(async () => {
+        handler('SIGNED_OUT', null);
+      });
 
       expect(mockResetNavPanelExpansion).toHaveBeenCalledTimes(1);
       expect(mockResetStableNavOrder).toHaveBeenCalledTimes(1);
