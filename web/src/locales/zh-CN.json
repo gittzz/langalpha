@@ -1124,6 +1124,7 @@
     "errorHintProviderStatus": "请查看提供商状态页，了解是否存在服务中断。",
     "errorHintTryAnotherModel": "请尝试在模型选择器中切换到其他模型。",
     "backgroundTasksRunning": "后台任务仍在运行",
+    "reportBackPending": "等待 PTC Agent 汇报结果",
     "missingWorkspaceOrThread": "缺少工作区或对话信息",
     "accessDeniedTitle": "你没有权限查看此对话",
     "accessDeniedDesc": "请联系对话所有者分享此对话。",

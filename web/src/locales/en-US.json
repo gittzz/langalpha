@@ -1124,6 +1124,7 @@
     "errorHintProviderStatus": "Check the provider's status page for ongoing incidents.",
     "errorHintTryAnotherModel": "Try switching to a different model in the model picker.",
     "backgroundTasksRunning": "Background tasks are still running",
+    "reportBackPending": "Waiting for PTC Agent to report back",
     "missingWorkspaceOrThread": "Missing workspace or thread information",
     "accessDeniedTitle": "You don't have access to this conversation",
     "accessDeniedDesc": "Ask the owner to share the conversation to view it.",

@@ -695,6 +695,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     messages,
     isLoading,
     hasActiveSubagents,
+    awaitingReportBack,
     workspaceStarting,
     isCompacting,
     setIsCompacting,
@@ -2889,6 +2890,17 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                           <span className="relative inline-flex rounded-full h-2 w-2 bg-primary/80" />
                         </span>
                         {t('chat.backgroundTasksRunning')}
+                      </div>
+                    )}
+                    {/* Report-back enabled: the dispatch turn ended and the agent
+                        is waiting to summarize the dispatched PTC thread(s) here. */}
+                    {awaitingReportBack && !isLoading && (
+                      <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground">
+                        <span className="relative flex h-2 w-2">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary/60 opacity-75" />
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-primary/80" />
+                        </span>
+                        {t('chat.reportBackPending')}
                       </div>
                     )}
                     {displayWorkspaceStarting && (
