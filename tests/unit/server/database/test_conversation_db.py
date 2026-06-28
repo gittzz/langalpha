@@ -7,7 +7,6 @@ thread sharing, and pagination logic.
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -293,6 +292,42 @@ async def test_get_responses_for_thread(mock_db_connection, mock_cursor):
 
     assert total == 1
     assert len(responses) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_recent_responses_for_thread_limit(mock_db_connection, mock_cursor):
+    """Selects newest-first via DESC + LIMIT, returns chronological order."""
+    from src.server.database.conversation import get_recent_responses_for_thread
+
+    # DB returns newest-first (turn_index DESC).
+    mock_cursor.fetchall.return_value = [
+        _response_row(turn_index=5),
+        _response_row(turn_index=4),
+    ]
+
+    result = await get_recent_responses_for_thread("t-1", limit=2)
+
+    # Reversed to chronological (oldest -> newest).
+    assert [r["turn_index"] for r in result] == [4, 5]
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "ORDER BY turn_index DESC" in sql
+    assert "LIMIT" in sql
+    # limit binds as a parameter
+    assert 2 in mock_cursor.execute.call_args[0][1]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_responses_for_thread_no_limit(mock_db_connection, mock_cursor):
+    """limit=None omits LIMIT (full history)."""
+    from src.server.database.conversation import get_recent_responses_for_thread
+
+    mock_cursor.fetchall.return_value = [_response_row(turn_index=0)]
+
+    result = await get_recent_responses_for_thread("t-1")
+
+    assert len(result) == 1
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "LIMIT" not in sql
 
 
 # ===========================================================================
