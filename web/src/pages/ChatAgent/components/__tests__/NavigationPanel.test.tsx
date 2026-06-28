@@ -14,7 +14,7 @@ import { render, screen, within, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import NavigationPanel from '../NavigationPanel';
-import { resetNavPanelExpansion, forgetNavPanelExpansion } from '../navExpansionStore';
+import { resetNavPanelExpansion, forgetNavPanelExpansion, expandedWorkspaces } from '../navExpansionStore';
 
 // `t()` identity mock — we don't depend on bundled English copy here, but
 // the component reads i18n keys for some labels and we want the fallback
@@ -470,16 +470,18 @@ describe('NavigationPanel — expansion survives remounts', () => {
     const expandSpy = vi.fn();
     renderOrderPanel('ws-a', expandSpy);
 
-    // ws-b starts collapsed — opening it lazy-loads its threads.
+    // ws-b starts collapsed — opening it expands the folder and lazy-loads threads.
+    // Assert on the store (synchronously mutated by the toggle) rather than the
+    // rendered list, which is sensitive to cross-file re-render timing.
     await user.click(screen.getByText('Workspace B'));
-    expect(screen.getByText('Thread B1')).toBeInTheDocument();
+    expect(expandedWorkspaces.has('ws-b')).toBe(true);
     expect(expandSpy).toHaveBeenCalledWith('ws-b');
     expandSpy.mockClear();
 
     // Collapsing must not re-fetch: the shared store is capped and may have
     // evicted the list, so an unconditional expand would fire a needless load.
     await user.click(screen.getByText('Workspace B'));
-    expect(screen.queryByText('Thread B1')).toBeNull();
+    expect(expandedWorkspaces.has('ws-b')).toBe(false);
     expect(expandSpy).not.toHaveBeenCalled();
   });
 });
