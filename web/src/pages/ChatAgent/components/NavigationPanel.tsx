@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
 import { DndContext, DragOverlay, closestCenter, PointerSensor, MeasuringStrategy, useSensor, useSensors } from '@dnd-kit/core';
@@ -12,6 +12,14 @@ import {
 import { ScrollArea } from '../../../components/ui/scroll-area';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../../../components/ui/dropdown-menu';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import {
+  expandedWorkspaces,
+  expandedThreads,
+  notifyNavExpansion,
+  subscribeNavExpansion,
+  getNavExpansionVersion,
+  toggleWorkspaceExpansion,
+} from './navExpansionStore';
 import './NavigationPanel.css';
 
 interface WorkspaceEntry {
@@ -108,30 +116,24 @@ function SortableWorkspace({ wsId, disabled, children }: {
   );
 }
 
+// Cap on how many extra thread pages the active-thread auto-reveal will fetch
+// before giving up: covers a genuinely deep thread while bounding a stale or
+// deleted id that would otherwise page through the whole workspace.
+const MAX_REVEAL_PAGES = 20;
+
 /**
  * NavigationPanel -- hover-triggered overlay sidebar showing
  * Workspace -> Thread -> Agent hierarchy.
  *
  * Follows the collapsible tree pattern from FilePanel's DirectoryNode:
  * ChevronRight/Down toggles, indented rows, Lucide icons throughout.
+ *
+ * Expansion state lives in ./navExpansionStore (a globalThis-anchored module)
+ * so it's shared across every cached panel instance and survives HMR. Keeping
+ * it out of this file lets NavigationPanel export only its component, so Fast
+ * Refresh hot-swaps cleanly instead of forcing full reloads that could split
+ * the module state and make folders appear to auto-collapse on thread switch.
  */
-// Expansion state shared across panel instances (one mounts per cached
-// ChatView), so user-opened folders survive thread switches within a session.
-const _expandedWorkspaces = new Set<string>();
-const _expandedThreads = new Set<string>();
-
-export function resetNavPanelExpansion() {
-  _expandedWorkspaces.clear();
-  _expandedThreads.clear();
-}
-
-// Forget a deleted workspace so the mount-effect doesn't re-expand it (and fire
-// a spurious threads 404) on the next panel remount. Only deletion is a safe
-// prune signal — `workspaces` is a paged/limited slice, so absence there can
-// mean "scrolled out", not "gone".
-export function forgetNavPanelExpansion(workspaceId: string) {
-  _expandedWorkspaces.delete(workspaceId);
-}
 
 function NavigationPanel({
   workspaces,
@@ -160,73 +162,81 @@ function NavigationPanel({
   const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
   // Id of the workspace currently being dragged — drives the DragOverlay chip.
   const [activeDragId, setActiveDragId] = useState<string | null>(null);
-  // Expanded workspaces/threads. Backed by module-level sets because one
-  // NavigationPanel mounts per cached ChatView instance — without them, every
-  // thread switch would remount the panel and collapse the folders the user
-  // opened. Current workspace/thread are expanded by default. Resets on reload.
-  const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(() => {
-    if (currentWorkspaceId) _expandedWorkspaces.add(currentWorkspaceId);
-    return new Set(_expandedWorkspaces);
-  });
-  const [expandedThreads, setExpandedThreads] = useState<Set<string>>(() => {
-    if (currentThreadId && currentThreadId !== '__default__') _expandedThreads.add(currentThreadId);
-    return new Set(_expandedThreads);
-  });
+  // Subscribe to the shared expansion store (navExpansionStore). One panel mounts
+  // per cached ChatView instance; subscribing re-renders this panel whenever any
+  // instance toggles a folder, so cached ChatViews never show stale folder state.
+  // The render reads the sets directly (below), so only the subscription is
+  // needed, not the returned version value.
+  useSyncExternalStore(subscribeNavExpansion, getNavExpansionVersion);
 
-  // Repopulate thread lists for folders that were already open — the thread
-  // data lives in per-instance hook state, so a fresh mount must re-request it
-  // (served from the React Query cache when warm).
-  React.useEffect(() => {
-    _expandedWorkspaces.forEach((wsId) => expandWorkspace(wsId));
-    // Mount-only: expandWorkspace is stable and re-running on its identity churn would be redundant.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Seed the current workspace/thread as expanded on first mount so they render
+  // open on first paint (no flicker); the effects below broadcast to other panels.
+  const seededRef = useRef(false);
+  if (!seededRef.current) {
+    seededRef.current = true;
+    if (currentWorkspaceId) expandedWorkspaces.add(currentWorkspaceId);
+    if (currentThreadId && currentThreadId !== '__default__') expandedThreads.add(currentThreadId);
+  }
 
   // Keep current workspace and thread expanded when they change
   React.useEffect(() => {
     if (currentWorkspaceId) {
-      _expandedWorkspaces.add(currentWorkspaceId);
-      setExpandedWorkspaces((prev) => {
-        if (prev.has(currentWorkspaceId)) return prev;
-        const next = new Set(prev);
-        next.add(currentWorkspaceId);
-        return next;
-      });
+      if (!expandedWorkspaces.has(currentWorkspaceId)) {
+        expandedWorkspaces.add(currentWorkspaceId);
+        notifyNavExpansion();
+      }
       expandWorkspace(currentWorkspaceId);
     }
   }, [currentWorkspaceId, expandWorkspace]);
 
   React.useEffect(() => {
-    if (currentThreadId && currentThreadId !== '__default__') {
-      _expandedThreads.add(currentThreadId);
-      setExpandedThreads((prev) => {
-        if (prev.has(currentThreadId)) return prev;
-        const next = new Set(prev);
-        next.add(currentThreadId);
-        return next;
-      });
+    if (currentThreadId && currentThreadId !== '__default__' && !expandedThreads.has(currentThreadId)) {
+      expandedThreads.add(currentThreadId);
+      notifyNavExpansion();
     }
   }, [currentThreadId]);
 
+  // Auto-reveal the active thread when it lives beyond the first page. A thread
+  // you open can sit inside the collapsed "Show more" tail (it's older than the
+  // first page of recents), which would leave it highlighted-but-hidden. Page in
+  // successive batches until it surfaces so the open folder always holds the
+  // current thread — re-runs as each page lands, walking the tail. Skipped for
+  // flash (capped at 3, no "Show more") and bounded by MAX_REVEAL_PAGES.
+  const revealAttemptRef = useRef<{ key: string; pages: number }>({ key: '', pages: 0 });
+  React.useEffect(() => {
+    if (!onLoadMoreThreads || !currentWorkspaceId) return;
+    if (!currentThreadId || currentThreadId === '__default__') return;
+    if (!expandedWorkspaces.has(currentWorkspaceId)) return;
+    const currentWs = workspaces.find((ws) => ws.workspace_id === currentWorkspaceId);
+    if (!currentWs || currentWs.status === 'flash') return;
+    const data = workspaceThreads[currentWorkspaceId];
+    if (!data || data.loading) return;
+    const loaded = data.threads || [];
+    if (loaded.some((thr) => thr.thread_id === currentThreadId)) return; // already visible
+    if (typeof data.total !== 'number' || loaded.length >= data.total) return; // nothing more to page
+
+    const key = `${currentWorkspaceId}:${currentThreadId}`;
+    if (revealAttemptRef.current.key !== key) revealAttemptRef.current = { key, pages: 0 };
+    if (revealAttemptRef.current.pages >= MAX_REVEAL_PAGES) return; // give up — leave "Show more" for manual paging
+    revealAttemptRef.current.pages += 1;
+    onLoadMoreThreads(currentWorkspaceId);
+  }, [currentWorkspaceId, currentThreadId, workspaces, workspaceThreads, onLoadMoreThreads]);
+
   const toggleWorkspace = useCallback((wsId: string) => {
-    if (_expandedWorkspaces.has(wsId)) {
-      _expandedWorkspaces.delete(wsId);
-    } else {
-      _expandedWorkspaces.add(wsId);
-    }
-    setExpandedWorkspaces(new Set(_expandedWorkspaces));
-    // Lazy-load threads when expanding -- called outside updater to avoid setState-during-render warning.
-    // expandWorkspace is a no-op when data is already cached, so calling unconditionally is safe.
+    // Routed through the store so every collapse is traceable in one place.
+    toggleWorkspaceExpansion(wsId);
+    // Lazy-load threads when expanding -- expandWorkspace is a no-op when data is
+    // already cached, so calling unconditionally is safe.
     expandWorkspace(wsId);
   }, [expandWorkspace]);
 
   const toggleThread = useCallback((threadId: string) => {
-    if (_expandedThreads.has(threadId)) {
-      _expandedThreads.delete(threadId);
+    if (expandedThreads.has(threadId)) {
+      expandedThreads.delete(threadId);
     } else {
-      _expandedThreads.add(threadId);
+      expandedThreads.add(threadId);
     }
-    setExpandedThreads(new Set(_expandedThreads));
+    notifyNavExpansion();
   }, []);
 
   // Inline workspace rename — the name span becomes a text input while editing.

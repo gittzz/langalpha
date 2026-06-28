@@ -59,6 +59,50 @@ export function resetStableNavOrder() {
   _lastWorkspaceArrangement.clear();
 }
 
+// Loaded thread lists per workspace, shared across every cached ChatView's nav
+// panel — the SAME lifetime and sharing as the expansion set in navExpansionStore.
+// Hook-local state would let a panel that mounted before a folder was opened
+// render it open-but-empty (a flash that reads as an auto-collapse) until its own
+// fetch landed; a shared store means the instant any panel loads a folder, every
+// panel renders it on first paint. Page-session scoped: a reload starts fresh.
+let _sharedWorkspaceThreads: Record<string, ThreadsData> = {};
+const _navThreadsListeners = new Set<() => void>();
+
+function subscribeNavThreads(fn: () => void): () => void {
+  _navThreadsListeners.add(fn);
+  return () => _navThreadsListeners.delete(fn);
+}
+
+// Stable snapshot: the same ref until a write replaces it, so useSyncExternalStore
+// only re-renders on a real change.
+function getNavThreadsSnapshot(): Record<string, ThreadsData> {
+  return _sharedWorkspaceThreads;
+}
+
+function setSharedWorkspaceThreads(
+  updater: (prev: Record<string, ThreadsData>) => Record<string, ThreadsData>,
+): void {
+  _sharedWorkspaceThreads = updater(_sharedWorkspaceThreads);
+  _navThreadsListeners.forEach((fn) => fn());
+}
+
+// Drop all loaded thread lists. Mirrors resetStableNavOrder's session-reset role
+// (page-session scoped); used by tests to isolate the module-level store.
+export function resetSharedWorkspaceThreads(): void {
+  _sharedWorkspaceThreads = {};
+  _navThreadsListeners.forEach((fn) => fn());
+}
+
+// Forget one workspace's threads so a deleted workspace doesn't linger in the
+// shared store. Called from the workspace delete path (alongside forgetStableNavOrder).
+export function forgetSharedWorkspaceThreads(workspaceId: string): void {
+  if (!(workspaceId in _sharedWorkspaceThreads)) return;
+  const next = { ..._sharedWorkspaceThreads };
+  delete next[workspaceId];
+  _sharedWorkspaceThreads = next;
+  _navThreadsListeners.forEach((fn) => fn());
+}
+
 // Drop a deleted workspace from the frozen-order stores so they don't retain
 // ghost ids for the rest of the session. Deleted ids are already filtered out
 // of the rendered list (applyStableOrderBy drops map-misses), so this is
@@ -159,7 +203,10 @@ export function useNavigationData(currentWorkspaceId: string) {
   const allFetched: WorkspaceRecord[] = (wsData as WorkspacesResponse | undefined)?.workspaces || [];
   const totalCount = (wsData as WorkspacesResponse | undefined)?.total || 0;
 
-  const [workspaceThreads, setWorkspaceThreads] = useState<Record<string, ThreadsData>>({});
+  // Loaded thread lists, read from the session-global shared store so every
+  // cached panel sees the same data (see _sharedWorkspaceThreads above). Writes
+  // go through setSharedWorkspaceThreads, which notifies all subscribed panels.
+  const workspaceThreads = useSyncExternalStore(subscribeNavThreads, getNavThreadsSnapshot);
   // "Load all" clicked this session — overrides a numeric workspaceLimit pref.
   const [showAllWorkspaces, setShowAllWorkspaces] = useState(false);
   const showAll = workspaceLimit === 'all' || showAllWorkspaces;
@@ -352,37 +399,33 @@ export function useNavigationData(currentWorkspaceId: string) {
   });
 
   const mergedThreads = useMemo(() => {
-    if (!currentWorkspaceId) return workspaceThreads;
-    const stored = workspaceThreads[currentWorkspaceId];
-    if (currentWsThreadData === undefined) {
-      return {
-        ...workspaceThreads,
-        [currentWorkspaceId]: {
-          threads: stored?.threads || [],
-          loading: true,
-          total: stored?.total,
-        },
-      };
+    const result: Record<string, ThreadsData> = { ...workspaceThreads };
+
+    // Current workspace: union the React Query first page with any "Show more"
+    // pages held in the shared store (query page wins on overlap, so paging
+    // survives the query refetching its first page).
+    if (currentWorkspaceId) {
+      const stored = workspaceThreads[currentWorkspaceId];
+      if (currentWsThreadData === undefined) {
+        result[currentWorkspaceId] = { threads: stored?.threads || [], loading: true, total: stored?.total };
+      } else {
+        const page = (currentWsThreadData as ThreadsResponse)?.threads || [];
+        const pageIds = new Set(page.map((t) => t.thread_id));
+        const extras = (stored?.threads || []).filter((t) => !pageIds.has(t.thread_id));
+        result[currentWorkspaceId] = {
+          threads: orderThreads(currentWorkspaceId, [...page, ...extras]),
+          loading: currentWsThreadsLoading || stored?.loading || false,
+          total: (currentWsThreadData as ThreadsResponse)?.total ?? stored?.total,
+        };
+      }
     }
-    // The query holds the first page; "Show more" pages land in workspaceThreads.
-    // Union them (query page wins on overlap) so paging the current workspace
-    // survives the query refetching its first page.
-    const page = (currentWsThreadData as ThreadsResponse)?.threads || [];
-    const pageIds = new Set(page.map((t) => t.thread_id));
-    const extras = (stored?.threads || []).filter((t) => !pageIds.has(t.thread_id));
-    return {
-      ...workspaceThreads,
-      [currentWorkspaceId]: {
-        threads: orderThreads(currentWorkspaceId, [...page, ...extras]),
-        loading: currentWsThreadsLoading || stored?.loading || false,
-        total: (currentWsThreadData as ThreadsResponse)?.total ?? stored?.total,
-      },
-    };
+
+    return result;
   }, [workspaceThreads, currentWorkspaceId, currentWsThreadData, currentWsThreadsLoading, orderThreads]);
 
   const expandWorkspace = useCallback((wsId: string) => {
     const mergeFetched = (data: ThreadsResponse) => {
-      setWorkspaceThreads(prev => {
+      setSharedWorkspaceThreads(prev => {
         const have = prev[wsId]?.threads || [];
         // Keep already-paged-in threads; the fetched first page wins on overlap.
         const pageIds = new Set((data.threads || []).map((t) => t.thread_id));
@@ -404,7 +447,7 @@ export function useNavigationData(currentWorkspaceId: string) {
       return;
     }
 
-    setWorkspaceThreads(prev => ({
+    setSharedWorkspaceThreads(prev => ({
       ...prev,
       [wsId]: { threads: prev[wsId]?.threads || [], loading: true, total: prev[wsId]?.total },
     }));
@@ -416,7 +459,7 @@ export function useNavigationData(currentWorkspaceId: string) {
     }).then((data: unknown) => {
       mergeFetched(data as ThreadsResponse);
     }).catch(() => {
-      setWorkspaceThreads(prev => ({
+      setSharedWorkspaceThreads(prev => ({
         ...prev,
         [wsId]: { threads: prev[wsId]?.threads || [], loading: false, total: prev[wsId]?.total },
       }));
@@ -429,7 +472,7 @@ export function useNavigationData(currentWorkspaceId: string) {
     if (loadMoreInflightRef.current.has(wsId)) return;
     loadMoreInflightRef.current.add(wsId);
     const shown = mergedThreads[wsId]?.threads || [];
-    setWorkspaceThreads(prev => ({
+    setSharedWorkspaceThreads(prev => ({
       ...prev,
       [wsId]: {
         threads: prev[wsId]?.threads || shown,
@@ -439,7 +482,7 @@ export function useNavigationData(currentWorkspaceId: string) {
     }));
     try {
       const data = await getWorkspaceThreads(wsId, threadPageSize, shown.length) as ThreadsResponse;
-      setWorkspaceThreads(prev => {
+      setSharedWorkspaceThreads(prev => {
         const have = prev[wsId]?.threads?.length ? prev[wsId].threads : shown;
         const haveIds = new Set(have.map((t) => t.thread_id));
         const fresh = (data.threads || []).filter((t) => !haveIds.has(t.thread_id));
@@ -454,7 +497,7 @@ export function useNavigationData(currentWorkspaceId: string) {
       });
     } catch (e) {
       console.warn('[useNavigationData] Failed to load more threads:', e);
-      setWorkspaceThreads(prev => ({
+      setSharedWorkspaceThreads(prev => ({
         ...prev,
         [wsId]: {
           threads: prev[wsId]?.threads || shown,
