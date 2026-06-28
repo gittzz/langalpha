@@ -693,6 +693,14 @@ export function useChatMessages(
 
   // Report-back watch: after PTC dispatch, watch for the flash report-back workflow via SSE
   const awaitingReportBackRef = useRef(false);
+  // React-state mirror of awaitingReportBackRef so the chat input can surface a
+  // "I'll report back when the research finishes" tip while the watch is armed.
+  // The ref stays the synchronous source of truth; this keeps render in sync.
+  const [awaitingReportBack, setAwaitingReportBackState] = useState(false);
+  const setAwaitingReportBack = (v: boolean) => {
+    awaitingReportBackRef.current = v;
+    setAwaitingReportBackState(v);
+  };
   const reportBackWatchAbortRef = useRef<AbortController | null>(null);
   const reportBackPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // The flash thread the active report-back watch belongs to. The watch is keyed
@@ -2580,8 +2588,9 @@ export function useChatMessages(
       // dispatch N concurrent PTC analyses, and the backend drains their
       // report-backs one ordered turn at a time. Clear the captured id so the
       // next reconcile falls through to /status and discovers the NEXT head run
-      // (the render gate + isStreamingRef keep us from double-attaching while
-      // this one streams). The watch tears down only once /status reports
+      // (isStreamingRef + the currentRunIdRef dedup at the top of attach keep us
+      // from double-attaching while this one streams). The watch tears down only
+      // once /status reports
       // pending_report_back=false (flash_watch drained) or the stuck-poll cap.
       reportBackRunIdRef.current = null;
       polls = 0; // progress made — reset the stuck-poll budget for the next gap
@@ -2600,9 +2609,17 @@ export function useChatMessages(
       // capture the id so the report-back streams on return.
       if (wakeRunId) reportBackRunIdRef.current = wakeRunId;
 
-      // Render gate: only attach when this flash thread is the visible thread and
-      // no other stream owns the slot. Off-thread (e.g. the user jumped into the
-      // PTC thread) we just hold the run id and leave the PTC stream untouched.
+      // Identity + ownership guard. In production each ChatView is its own hook
+      // instance bound to a stable threadId (useChatViewCache keys by
+      // workspace+thread), so this watch runs in the flash thread's OWN instance
+      // and threadIdRef.current === tid always holds: the `threadIdRef !== tid`
+      // clause is a belt-and-suspenders identity check, not cross-thread
+      // deferral. Real isolation is per-instance hook state + the currentRunIdRef
+      // dedup in attach() — the PTC thread is a separate instance this watch
+      // cannot reach. (The clause only ever fires in the single-instance test
+      // harness, where one instance's threadId is rerendered flash→PTC.)
+      // isStreamingRef/inFlight prevent double-attaching while a stream or
+      // /status call is in flight.
       if (threadIdRef.current !== tid || isStreamingRef.current || inFlight) return;
 
       // On the flash thread and idle. Attach a known run id immediately (no
@@ -2621,8 +2638,11 @@ export function useChatMessages(
         return;
       }
       inFlight = false;
-      // Re-check generation/visibility after the await: the watch may have been
-      // torn down, or the user may have navigated away, while /status was in flight.
+      // Re-check generation/ownership after the await: the watch may have been
+      // torn down (epoch bump) or a stream may have claimed the slot while
+      // /status was in flight. The `threadIdRef !== tid` clause is the same
+      // per-instance identity check as above — inert in production (stable
+      // per-instance threadId), active only in the single-instance test harness.
       if (consumed || reportBackWatchEpochRef.current !== epoch) return;
       if (threadIdRef.current !== tid || isStreamingRef.current) return;
 
@@ -2633,7 +2653,7 @@ export function useChatMessages(
       // (including the case where the only one was just consumed). Tear down.
       if (status.pending_report_back === false) {
         consumed = true;
-        awaitingReportBackRef.current = false;
+        setAwaitingReportBack(false);
         stopReportBackWatch();
         return;
       }
@@ -2645,7 +2665,7 @@ export function useChatMessages(
       // long chain of report-backs isn't capped as long as each makes progress.
       if (source === 'poll' && ++polls >= REPORT_BACK_MAX_POLLS) {
         consumed = true;
-        awaitingReportBackRef.current = false;
+        setAwaitingReportBack(false);
         stopReportBackWatch();
       }
     };
@@ -2697,8 +2717,11 @@ export function useChatMessages(
     if (historyLoadedKeyRef.current === null || isStreamingRef.current || historyLoadingRef.current) return;
     const status = (await getWorkflowStatus(threadId).catch(() => null)) as WorkflowStatusResponse | null;
     if (!status) return;
-    // Re-check after the await: a stream may have started or the thread changed.
-    if (isStreamingRef.current || threadIdRef.current !== threadId) return;
+    // Re-check after the await: a stream may have started, a history reload may
+    // have begun (reloadTrigger), or the thread changed. Mirror the pre-await
+    // guard exactly — adding historyLoadingRef so a load that starts DURING the
+    // /status fetch can't race this reconnect for the message state.
+    if (isStreamingRef.current || historyLoadingRef.current || threadIdRef.current !== threadId) return;
     if (status.can_reconnect && status.run_id && status.run_id !== currentRunIdRef.current) {
       console.log('[Reconnect] Re-activated view has a newer live run, attaching:', status.run_id);
       await reconnectToStream({ activeTasks: status.active_tasks || [], runId: status.run_id, resetCursor: true });
@@ -2719,8 +2742,11 @@ export function useChatMessages(
     // We do NOT stop the report-back watch here. Superseding the visible flash
     // reader (so the PTC thread can take the slot) must not erase the independent
     // pending report-back: the keyed watch persists, holds its run id, and renders
-    // again when the user returns to the flash thread. Its render gate
-    // (threadIdRef === its flash thread) keeps it off the PTC thread meanwhile.
+    // again when the user returns to the flash thread. The keyed watch lives in
+    // the flash thread's own ChatView instance (stable threadId), so it never
+    // targets the separate PTC-thread instance; its identity guard
+    // (threadIdRef === its flash thread) is belt-and-suspenders, with the real
+    // isolation coming from per-instance state + currentRunIdRef dedup.
     const supersedeOtherThreadStream =
       isStreamingRef.current &&
       streamingThreadIdRef.current !== null &&
@@ -2801,7 +2827,7 @@ export function useChatMessages(
       // and attach() skips the run already on screen — so this never double-streams.
       if (status.pending_report_back) {
         if (import.meta.env.DEV) console.log('[ReportBack] Pending report-back detected on load, opening watch');
-        awaitingReportBackRef.current = true;
+        setAwaitingReportBack(true);
         // Key the watch to THIS thread (the flash thread — pending_report_back is
         // a flash-thread property). Idempotent if a watch for it already persists.
         startReportBackWatch(threadId);
@@ -3282,7 +3308,7 @@ export function useChatMessages(
     // background work lingers on the client after the stop.
     closeAllSubagentStreams();
     stopReportBackWatch();
-    awaitingReportBackRef.current = false;
+    setAwaitingReportBack(false);
 
     // (d) Tell the backend to hard-cancel: one retry, then a visible error
     // toast so a failed cancel doesn't silently diverge UI from backend.
@@ -5217,7 +5243,7 @@ export function useChatMessages(
 
     // Enable report-back polling if report_back is not explicitly disabled
     if (overrides?.report_back !== false) {
-      awaitingReportBackRef.current = true;
+      setAwaitingReportBack(true);
     }
 
     resolveProposal('ptcAgentProposals', proposalId, 'approved');
@@ -5606,6 +5632,7 @@ export function useChatMessages(
     lastThreadModel,
     isLoading,
     hasActiveSubagents,
+    awaitingReportBack,
     workspaceStarting,
     isCompacting,
     setIsCompacting,

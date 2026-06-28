@@ -109,61 +109,86 @@ def _error_command(error: str, tool_call_id: str) -> Command:
 
 async def _reserve_dispatch_slot(
     flash_thread_id: str, ptc_thread_id: str, user_id: str, tool_call_id: str
-) -> Command | None:
+) -> tuple[Command | None, dict]:
     """Atomically reserve a report-back slot under the per-flash + per-user caps.
 
-    Returns an error Command if a cap is hit, else None — and on success the PTC
-    is now a pending member of both the flash watch SET and the user's pending
-    SET. The reservation precedes the dispatch POST (rolled back on failure) so
-    concurrent calls can't both pass the check then overshoot. Best-effort: a
-    Redis hiccup allows the dispatch rather than blocking it.
+    Returns ``(cap_error_or_None, added)`` where ``added`` reports which
+    memberships THIS call newly created: ``{"watch": bool, "user": bool}``. On
+    success the PTC is a pending member of both the flash watch SET and the
+    user's pending SET; ``added`` lets the caller roll back ONLY the memberships
+    it actually added (an idempotent re-dispatch adds nothing). The reservation
+    precedes the dispatch POST so concurrent calls can't both pass the check then
+    overshoot. Best-effort: a Redis hiccup allows the dispatch (added all-False).
     """
     from src.utils.cache.redis_cache import get_cache_client
 
+    no_add = {"watch": False, "user": False}
     try:
         cache = get_cache_client()
         if not (cache.enabled and cache.client):
-            return None
+            return None, dict(no_add)
         watch_key = f"flash_watch:{flash_thread_id}"
         user_key = f"flash_user_pending:{user_id}"
         async with _dispatch_reserve_lock:
+            in_watch_before = await cache.client.sismember(watch_key, ptc_thread_id)
+            in_user_before = await cache.client.sismember(user_key, ptc_thread_id)
+            added = {"watch": not in_watch_before, "user": not in_user_before}
             # An existing member (idempotent re-dispatch) doesn't add load, so it
             # never counts against the cap.
-            if not await cache.client.sismember(watch_key, ptc_thread_id):
+            if not in_watch_before:
                 if await cache.client.scard(watch_key) >= MAX_DISPATCH_PER_FLASH:
-                    return _error_command(
-                        f"too many concurrent analyses on this thread "
-                        f"(max {MAX_DISPATCH_PER_FLASH}); wait for one to finish",
-                        tool_call_id,
+                    return (
+                        _error_command(
+                            f"too many concurrent analyses on this thread "
+                            f"(max {MAX_DISPATCH_PER_FLASH}); wait for one to finish",
+                            tool_call_id,
+                        ),
+                        dict(no_add),
                     )
-            if not await cache.client.sismember(user_key, ptc_thread_id):
+            if not in_user_before:
                 if await cache.client.scard(user_key) >= MAX_DISPATCH_PER_USER:
-                    return _error_command(
-                        f"too many concurrent analyses running "
-                        f"(max {MAX_DISPATCH_PER_USER}); wait for one to finish",
-                        tool_call_id,
+                    return (
+                        _error_command(
+                            f"too many concurrent analyses running "
+                            f"(max {MAX_DISPATCH_PER_USER}); wait for one to finish",
+                            tool_call_id,
+                        ),
+                        dict(no_add),
                     )
-            await cache.client.sadd(watch_key, ptc_thread_id)
-            await cache.client.expire(watch_key, PTC_ORIGIN_TTL)
-            await cache.client.sadd(user_key, ptc_thread_id)
-            await cache.client.expire(user_key, PTC_ORIGIN_TTL)
-        return None
+            # Add only the memberships not already present (so ``added`` stays
+            # truthful); refresh both TTLs either way. One transaction keeps the
+            # two SET mutations atomic.
+            pipe = cache.client.pipeline(transaction=True)
+            if added["watch"]:
+                pipe.sadd(watch_key, ptc_thread_id)
+            pipe.expire(watch_key, PTC_ORIGIN_TTL)
+            if added["user"]:
+                pipe.sadd(user_key, ptc_thread_id)
+            pipe.expire(user_key, PTC_ORIGIN_TTL)
+            await pipe.execute()
+        return None, added
     except Exception as e:
         logger.warning(f"Failed to reserve PTC dispatch slot: {e}")
-        return None
+        return None, dict(no_add)
 
 
 async def _release_dispatch_slot(
-    flash_thread_id: str, ptc_thread_id: str, user_id: str
+    flash_thread_id: str, ptc_thread_id: str, user_id: str, added: dict
 ) -> None:
-    """Roll back a reservation when the dispatch POST fails."""
+    """Roll back a reservation, removing only the memberships this call added."""
     try:
         from src.utils.cache.redis_cache import get_cache_client
 
         cache = get_cache_client()
         if cache.client:
-            await cache.client.srem(f"flash_watch:{flash_thread_id}", ptc_thread_id)
-            await cache.client.srem(f"flash_user_pending:{user_id}", ptc_thread_id)
+            if added.get("watch"):
+                await cache.client.srem(
+                    f"flash_watch:{flash_thread_id}", ptc_thread_id
+                )
+            if added.get("user"):
+                await cache.client.srem(
+                    f"flash_user_pending:{user_id}", ptc_thread_id
+                )
     except Exception:
         pass
 
@@ -183,6 +208,28 @@ async def _verify_workspace_owner(
     if not ws or str(ws.get("user_id")) != user_id:
         return _error_command("workspace not found", tool_call_id)
     return None
+
+
+async def _resolve_workspace_name(
+    workspace_id: str | None, user_id: str
+) -> str | None:
+    """Display name for a workspace OWNED by ``user_id`` (else None).
+
+    Ownership-scoped so the new-thread dispatch HITL card can't surface another
+    user's workspace name before the ownership check runs.
+    """
+    if not workspace_id:
+        return None
+    from src.server.database.workspace import get_workspace
+
+    try:
+        ws = await get_workspace(workspace_id)
+        if not ws or str(ws.get("user_id")) != user_id:
+            return None
+        return ws.get("name")
+    except Exception as e:
+        logger.warning(f"Failed to resolve workspace name for {workspace_id}: {e}")
+        return None
 
 
 async def _verify_thread_owner(
@@ -472,9 +519,14 @@ async def ptc_agent(
             return err
         thread = await get_thread_by_id(thread_id)
         workspace_id = str(thread["workspace_id"])
-        workspace_name = None
+        workspace_name = await _resolve_workspace_name(workspace_id, user_id)
     else:
-        workspace_name = question[:50].strip() if not workspace_id else None
+        # New thread: surface the existing workspace's real name; when
+        # auto-creating (no workspace_id) use the planned name (question snippet).
+        if workspace_id:
+            workspace_name = await _resolve_workspace_name(workspace_id, user_id)
+        else:
+            workspace_name = question[:50].strip()
 
     approved, response = _hitl_confirm(
         "ptc_agent",
@@ -530,18 +582,19 @@ async def ptc_agent(
     flash_thread_id = configurable.get("thread_id") if report_back else None
     flash_workspace_id = configurable.get("workspace_id")
     reserved = False
+    added: dict = {"watch": False, "user": False}
     if report_back and flash_thread_id:
-        cap_error = await _reserve_dispatch_slot(
+        cap_error, added = await _reserve_dispatch_slot(
             flash_thread_id, thread_id, user_id, tool_call_id
         )
         if cap_error is not None:
             return cap_error
         reserved = True
-
-    async def _dispatch_failed(error: str) -> Command:
-        if reserved:
-            await _release_dispatch_slot(flash_thread_id, thread_id, user_id)
-        return _error_command(error, tool_call_id)
+    # The dispatch that newly added the watch membership OWNS the ptc_origin
+    # record: it writes it fail-closed and deletes it on rollback. An idempotent
+    # re-dispatch (already a member) or a Redis-down fail-open path never owns
+    # it — another live dispatch does.
+    origin_owned = added.get("watch", False)
 
     # Dispatch via internal HTTP call.
     # X-Dispatch: background tells the endpoint to run the PTC workflow in a
@@ -550,7 +603,60 @@ async def ptc_agent(
     self_base_url = os.environ.get("GINLIXFLOW_BASE_URL", "http://localhost:8000")
     service_token = os.environ.get("INTERNAL_SERVICE_TOKEN", "")
 
+    cache = None
+    dispatched_ok = False
     try:
+        # Record origin BEFORE the POST so a watch member's origin is guaranteed
+        # to exist by the time its PTC completion can enqueue a report-back (the
+        # POST below hasn't fired yet, so no completion can race the write).
+        if report_back and flash_thread_id:
+            from src.utils.cache.redis_cache import get_cache_client
+
+            cache = get_cache_client()
+            origin_payload = {
+                "origin": "flash",
+                "flash_thread_id": flash_thread_id,
+                "flash_workspace_id": flash_workspace_id,
+                "ptc_thread_id": thread_id,
+                "ptc_workspace_id": workspace_id,
+                "report_back": True,
+                "user_id": user_id,
+            }
+            existing = (
+                await cache.get(f"ptc_origin:{thread_id}") if origin_owned else None
+            )
+            cross_flash = (
+                isinstance(existing, dict)
+                and existing.get("flash_thread_id") not in (None, flash_thread_id)
+            )
+            if cross_flash:
+                # A different flash thread already owns this PTC thread's
+                # report-back origin (cross-flash reuse of the same thread).
+                # Don't clobber or later delete it — that would strand the other
+                # flash's pending report-back; proceed without our own wiring.
+                origin_owned = False
+            elif origin_owned:
+                # Fail-closed: a missing origin would strand the report-back, so
+                # a write failure is a dispatch failure (finally rolls back).
+                try:
+                    origin_written = await cache.set(
+                        f"ptc_origin:{thread_id}", origin_payload, ttl=PTC_ORIGIN_TTL
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to store PTC origin metadata: {e}")
+                    origin_written = False
+                if not origin_written:
+                    return _error_command("dispatch_failed", tool_call_id)
+            else:
+                # Re-dispatch / fail-open: another live dispatch owns the origin
+                # — best-effort refresh, never rolled back.
+                try:
+                    await cache.set(
+                        f"ptc_origin:{thread_id}", origin_payload, ttl=PTC_ORIGIN_TTL
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to refresh PTC origin metadata: {e}")
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{self_base_url}/api/v1/threads/{thread_id}/messages",
@@ -567,51 +673,42 @@ async def ptc_agent(
                 timeout=aiohttp.ClientTimeout(connect=10, sock_read=30),
             ) as resp:
                 if resp.status >= 400:
-                    return await _dispatch_failed("dispatch_failed")
+                    return _error_command("dispatch_failed", tool_call_id)
                 body = await resp.json()
                 if not body.get("status") == "dispatched":
-                    return await _dispatch_failed("dispatch_failed")
+                    return _error_command("dispatch_failed", tool_call_id)
+
+        dispatched_ok = True
+        return _success_command(
+            {
+                "success": True,
+                "workspace_id": workspace_id,
+                "thread_id": thread_id,
+                "status": "dispatched",
+                "report_back": report_back,
+            },
+            tool_call_id,
+        )
     except (aiohttp.ClientError, ValueError) as e:
         logger.error(f"PTC dispatch HTTP error: {e}")
-        return await _dispatch_failed("dispatch_failed")
+        return _error_command("dispatch_failed", tool_call_id)
     except TimeoutError:
         logger.error("PTC dispatch timed out")
-        return await _dispatch_failed("dispatch_timeout")
-
-    # Store origin metadata so the PTC completion hook can enqueue a report-back
-    # to the flash thread. The watch membership was already added by the
-    # reservation above; here we only record origin (read by the consumer).
-    if report_back and flash_thread_id:
-        try:
-            from src.utils.cache.redis_cache import get_cache_client
-
-            cache = get_cache_client()
-            await cache.set(
-                f"ptc_origin:{thread_id}",
-                {
-                    "origin": "flash",
-                    "flash_thread_id": flash_thread_id,
-                    "flash_workspace_id": flash_workspace_id,
-                    "ptc_thread_id": thread_id,
-                    "ptc_workspace_id": workspace_id,
-                    "report_back": True,
-                    "user_id": user_id,
-                },
-                ttl=PTC_ORIGIN_TTL,
+        return _error_command("dispatch_timeout", tool_call_id)
+    finally:
+        # Single rollback path: HTTP error / bad body / network exception /
+        # cancellation / fail-closed origin write all leave dispatched_ok=False.
+        if reserved and not dispatched_ok:
+            await _release_dispatch_slot(
+                flash_thread_id, thread_id, user_id, added
             )
-        except Exception as e:
-            logger.warning(f"Failed to store PTC origin metadata: {e}")
-
-    return _success_command(
-        {
-            "success": True,
-            "workspace_id": workspace_id,
-            "thread_id": thread_id,
-            "status": "dispatched",
-            "report_back": report_back,
-        },
-        tool_call_id,
-    )
+            # Only the owning dispatch deletes the origin it wrote; never strand
+            # a concurrent owning dispatch's record.
+            if origin_owned and cache is not None:
+                try:
+                    await cache.delete(f"ptc_origin:{thread_id}")
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------

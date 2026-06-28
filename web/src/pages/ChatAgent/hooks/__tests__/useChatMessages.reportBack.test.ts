@@ -573,4 +573,41 @@ describe('useChatMessages — report-back watch (PTC → flash report-back)', ()
     expect(mockWatch).not.toHaveBeenCalled();
     expect(mockReconnect).not.toHaveBeenCalled();
   });
+
+  it('exposes awaitingReportBack: true while a report-back is pending, false once drained', async () => {
+    // This flag drives the chat-input "I'll report back when the research
+    // finishes" tip. It must mirror the watch: on while pending, off when drained.
+    mockStatus.mockResolvedValue({
+      can_reconnect: false,
+      status: 'completed',
+      pending_report_back: true,
+      active_tasks: [],
+    });
+    mockReconnect.mockResolvedValue({ disconnected: false, aborted: false });
+
+    const watchCalls: Array<{ cb: (p?: { run_id?: string | null }) => void | Promise<void> }> = [];
+    mockWatch.mockImplementation((_tid: string, cb: (p?: { run_id?: string | null }) => void | Promise<void>) => {
+      watchCalls.push({ cb });
+      return { abort: new AbortController() };
+    });
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-rb', 'th-rb'));
+
+    // Pending on load → the tip flag is on.
+    await waitFor(() => expect(result.current.awaitingReportBack).toBe(true));
+
+    // Drain: /status reports nothing pending → the next reconcile clears it.
+    mockStatus.mockResolvedValue({
+      can_reconnect: false,
+      status: 'completed',
+      pending_report_back: false,
+      report_back_run_id: null,
+      active_tasks: [],
+    });
+    await act(async () => {
+      await watchCalls[0].cb();
+    });
+
+    await waitFor(() => expect(result.current.awaitingReportBack).toBe(false));
+  });
 });

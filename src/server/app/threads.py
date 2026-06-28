@@ -43,6 +43,7 @@ from src.server.database.conversation import (
     delete_thread,
     update_thread_title,
     get_thread_by_id,
+    get_thread_owner_id,
     update_thread_sharing,
     lookup_thread_by_external_id,
     get_next_turn_index,
@@ -479,6 +480,13 @@ async def _handle_send_message(
                     "link": {"url": "/setup/method", "label": "Set up provider"},
                 },
             )
+
+        # IDOR guard: an existing thread must belong to the caller. A brand-new
+        # thread_id has no owner yet -> creation proceeds. The internal report-back
+        # dispatch sets X-User-Id to the owner, so it passes.
+        owner_id = await get_thread_owner_id(thread_id) if thread_id else None
+        if owner_id is not None and owner_id != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
 
         # Resolve workspace_id from thread if not provided
         if not workspace_id and thread_id:

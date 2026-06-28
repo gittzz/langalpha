@@ -32,10 +32,52 @@ from src.server.handlers.chat import flash_workflow, ptc_workflow
 # ---------------------------------------------------------------------------
 
 
+class _FakePipeline:
+    """Queues client ops and replays them against the same fake client on execute.
+
+    Mirrors redis-py's async pipeline shape: command methods are synchronous
+    (queue + return self), ``execute`` is awaited and runs them in order.
+    """
+
+    def __init__(self, client: "_FakeClient") -> None:
+        self._client = client
+        self._ops: list = []
+
+    def delete(self, key) -> "_FakePipeline":
+        self._ops.append(("delete", key))
+        return self
+
+    def srem(self, key, member) -> "_FakePipeline":
+        self._ops.append(("srem", key, member))
+        return self
+
+    def sadd(self, key, member) -> "_FakePipeline":
+        self._ops.append(("sadd", key, member))
+        return self
+
+    def lrem(self, key, count, value) -> "_FakePipeline":
+        self._ops.append(("lrem", key, count, value))
+        return self
+
+    def expire(self, key, ttl) -> "_FakePipeline":
+        self._ops.append(("expire", key, ttl))
+        return self
+
+    async def execute(self) -> list:
+        results = []
+        for name, *args in self._ops:
+            results.append(await getattr(self._client, name)(*args))
+        self._ops.clear()
+        return results
+
+
 class _FakeClient:
     def __init__(self) -> None:
         self.sets: dict[str, set] = {}
         self.lists: dict[str, list] = {}
+        # Shared with _FakeCache.kv so raw-client DELETE (pipeline) and the
+        # wrapper's get/set/delete address one keyspace, as real Redis does.
+        self.kv: dict[str, object] = {}
         self.published: list[tuple[str, str]] = []
 
     async def sismember(self, key, member) -> bool:
@@ -87,16 +129,22 @@ class _FakeClient:
     async def delete(self, key) -> None:
         self.sets.pop(key, None)
         self.lists.pop(key, None)
+        self.kv.pop(key, None)
 
     async def publish(self, channel, message) -> None:
         self.published.append((channel, message))
+
+    def pipeline(self, transaction: bool = True) -> _FakePipeline:
+        return _FakePipeline(self)
 
 
 class _FakeCache:
     def __init__(self) -> None:
         self.enabled = True
         self.client = _FakeClient()
-        self.kv: dict[str, object] = {}
+        # One keyspace: the wrapper's string KV is the client's kv dict, so a
+        # pipeline DELETE on the raw client removes wrapper-set keys too.
+        self.kv: dict[str, object] = self.client.kv
 
     async def get(self, key):
         return self.kv.get(key)
@@ -187,6 +235,46 @@ async def test_clear_without_flash_thread_id_only_deletes_origin():
     await ptc_workflow.clear_flash_report_back(cache, "ptc-1", None)
 
     assert "ptc_origin:ptc-1" not in cache.kv
+
+
+@pytest.mark.asyncio
+async def test_clear_runs_all_six_mutations_in_one_pipeline():
+    """The teardown must be all-or-nothing (single transaction) so a partial
+    failure can't leak the per-user cap."""
+    cache = _FakeCache()
+    flash, ptc = "flash-1", "ptc-1"
+    _seed_dispatched(cache, flash, [ptc])
+    await cache.client.rpush(ptc_workflow.flash_rb_queue_key(flash), ptc)
+    await cache.client.sadd(ptc_workflow.flash_rb_queued_key(flash), ptc)
+    cache.kv[ptc_workflow.flash_rb_run_key(flash, ptc)] = {"run_id": "rb-1"}
+
+    executes = 0
+    orig_pipeline = cache.client.pipeline
+
+    def _counting_pipeline(transaction: bool = True):
+        pipe = orig_pipeline(transaction=transaction)
+        orig_execute = pipe.execute
+
+        async def _execute():
+            nonlocal executes
+            executes += 1
+            return await orig_execute()
+
+        pipe.execute = _execute
+        return pipe
+
+    cache.client.pipeline = _counting_pipeline
+
+    await ptc_workflow.clear_flash_report_back(cache, ptc, flash)
+
+    assert executes == 1  # all six mutations issued in one transaction
+    # All six keys are gone.
+    assert f"ptc_origin:{ptc}" not in cache.kv
+    assert ptc_workflow.flash_rb_run_key(flash, ptc) not in cache.kv
+    assert ptc not in cache.client.sets.get(ptc_workflow.flash_watch_key(flash), set())
+    assert ptc not in cache.client.sets.get("flash_user_pending:u-1", set())
+    assert ptc not in cache.client.lists.get(ptc_workflow.flash_rb_queue_key(flash), [])
+    assert ptc not in cache.client.sets.get(ptc_workflow.flash_rb_queued_key(flash), set())
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +434,36 @@ async def test_consumer_drops_member_on_permanent_rejection_and_advances():
     assert order == ["ptc-1", "ptc-2"]  # dropped ptc-1 still advanced to ptc-2
     assert not cache.client.sets.get(ptc_workflow.flash_watch_key(flash))
     assert not cache.client.lists.get(ptc_workflow.flash_rb_queue_key(flash))
+
+
+@pytest.mark.asyncio
+async def test_consumer_bounds_terminal_wait_and_force_clears_stuck_member(monkeypatch):
+    """A report-back that POSTs but never reaches terminal (e.g. its run crashed)
+    must not wedge the queue: a hard deadline force-clears it so the consumer
+    advances."""
+    monkeypatch.setattr(ptc_workflow, "_RB_TERMINAL_WAIT_CAP", 0.0)
+    cache = _FakeCache()
+    flash = "flash-1"
+    _seed_dispatched(cache, flash, ["ptc-1", "ptc-2"])
+    order: list[str] = []
+
+    async def fake_post(c, f, ptc, origin):
+        order.append(ptc)
+        return "dispatched", f"run-{ptc}"  # NO terminal ever fires
+
+    with patch("src.utils.cache.redis_cache.get_cache_client", return_value=cache), patch.object(
+        ptc_workflow, "_post_report_back", side_effect=fake_post
+    ):
+        await ptc_workflow._flash_report_back("ptc-1", "ws-1")
+        await ptc_workflow._flash_report_back("ptc-2", "ws-1")
+        await _drain(flash)
+
+    # Deadline force-cleared each stuck member, so the consumer drained the whole
+    # queue instead of hanging on ptc-1 forever.
+    assert order == ["ptc-1", "ptc-2"]
+    assert not cache.client.sets.get(ptc_workflow.flash_watch_key(flash))
+    assert not cache.client.lists.get(ptc_workflow.flash_rb_queue_key(flash))
+    assert not cache.client.sets.get(ptc_workflow.flash_rb_queued_key(flash))
 
 
 @pytest.mark.asyncio

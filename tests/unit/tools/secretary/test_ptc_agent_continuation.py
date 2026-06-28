@@ -168,6 +168,128 @@ async def test_continuation_normalizes_noncanonical_thread_id():
     by_id.assert_awaited_once_with(PTC_THREAD_ID)
 
 
+class _FakeOriginCache:
+    """Minimal cache stub exercising only the origin get/set/delete path."""
+
+    enabled = True
+    client = object()  # truthy so the report_back branch runs
+
+    def __init__(self, store: dict) -> None:
+        self._store = store
+
+    async def get(self, key):
+        return self._store.get(key)
+
+    async def set(self, key, value, ttl=None):
+        self._store[key] = value
+        return True
+
+    async def delete(self, key):
+        return bool(self._store.pop(key, None))
+
+
+def _f1_origin() -> dict:
+    return {
+        "origin": "flash",
+        "flash_thread_id": "flash-F1",
+        "flash_workspace_id": "ws-F1",
+        "ptc_thread_id": PTC_THREAD_ID,
+        "ptc_workspace_id": WORKSPACE_ID,
+        "report_back": True,
+        "user_id": USER_ID,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cross_flash_reuse_does_not_strand_other_flashs_origin():
+    """A second flash reusing the same PTC thread must NOT clobber or delete the
+    first flash's report-back origin — even when its own dispatch fails and rolls
+    back. Origin is keyed by ptc_thread_id only, so seizing+deleting it would
+    strand the first flash's pending report-back."""
+    store = {f"ptc_origin:{PTC_THREAD_ID}": _f1_origin()}
+    fake_cache = _FakeOriginCache(store)
+    owner = AsyncMock(return_value=USER_ID)
+    by_id = AsyncMock(return_value={
+        "conversation_thread_id": PTC_THREAD_ID,
+        "workspace_id": WORKSPACE_ID,
+    })
+
+    with patch(
+        "src.server.database.conversation.get_thread_owner_id", owner
+    ), patch(
+        "src.server.database.conversation.get_thread_by_id", by_id
+    ), patch(
+        "src.tools.secretary.tools._hitl_confirm", return_value=(True, {})
+    ), patch(
+        "src.tools.secretary.tools._reserve_dispatch_slot",
+        AsyncMock(return_value=(None, {"watch": True, "user": True})),
+    ), patch(
+        "src.tools.secretary.tools._release_dispatch_slot", AsyncMock()
+    ), patch(
+        "src.utils.cache.redis_cache.get_cache_client", return_value=fake_cache
+    ), patch(
+        "aiohttp.ClientSession", return_value=_FakeSession(_FakeResp(status=500))
+    ):
+        result = await ptc_agent.ainvoke(
+            _tool_call({"question": "follow up", "thread_id": PTC_THREAD_ID}),
+            # report_back is on and the dispatching flash (F2) differs from the
+            # owner of the existing origin (F1).
+            config={"configurable": {
+                "user_id": USER_ID,
+                "thread_id": "flash-F2",
+                "workspace_id": "flash-ws-F2",
+            }},
+        )
+
+    payload = _payload(result)
+    assert payload.get("success") is False, payload  # dispatch failed -> rollback
+    # F1's origin survives untouched: not overwritten to F2, not deleted.
+    assert store.get(f"ptc_origin:{PTC_THREAD_ID}") == _f1_origin()
+
+
+@pytest.mark.asyncio
+async def test_same_flash_reuse_keeps_origin_ownership():
+    """The same flash continuing its own PTC thread still owns + refreshes the
+    origin (the cross-flash guard must not downgrade a same-flash record)."""
+    same = _f1_origin()
+    same["flash_thread_id"] = "flash-F2"  # owned by the dispatching flash
+    store = {f"ptc_origin:{PTC_THREAD_ID}": dict(same)}
+    fake_cache = _FakeOriginCache(store)
+    owner = AsyncMock(return_value=USER_ID)
+    by_id = AsyncMock(return_value={
+        "conversation_thread_id": PTC_THREAD_ID,
+        "workspace_id": WORKSPACE_ID,
+    })
+
+    with patch(
+        "src.server.database.conversation.get_thread_owner_id", owner
+    ), patch(
+        "src.server.database.conversation.get_thread_by_id", by_id
+    ), patch(
+        "src.tools.secretary.tools._hitl_confirm", return_value=(True, {})
+    ), patch(
+        "src.tools.secretary.tools._reserve_dispatch_slot",
+        AsyncMock(return_value=(None, {"watch": True, "user": True})),
+    ), patch(
+        "src.utils.cache.redis_cache.get_cache_client", return_value=fake_cache
+    ), patch(
+        "aiohttp.ClientSession", return_value=_FakeSession(_FakeResp())
+    ):
+        result = await ptc_agent.ainvoke(
+            _tool_call({"question": "follow up", "thread_id": PTC_THREAD_ID}),
+            config={"configurable": {
+                "user_id": USER_ID,
+                "thread_id": "flash-F2",
+                "workspace_id": "flash-ws-F2",
+            }},
+        )
+
+    payload = _payload(result)
+    assert payload.get("success") is True, payload
+    # Origin still present and pointed at the owning (same) flash.
+    assert store[f"ptc_origin:{PTC_THREAD_ID}"]["flash_thread_id"] == "flash-F2"
+
+
 @pytest.mark.asyncio
 async def test_continuation_non_uuid_thread_id_short_circuits():
     """A non-UUID id (e.g. an agent file/dir name) is rejected before any DB

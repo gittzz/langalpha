@@ -134,6 +134,12 @@ _rb_terminal_events: dict[tuple[str, str], asyncio.Event] = {}
 # it. Matches the workflow timeout so a long user turn ahead is waited out.
 _RB_BUSY_WAIT_CAP = 3200.0
 
+# Upper bound (seconds) on how long the consumer waits for a POSTed report-back
+# to reach terminal before force-clearing it. A report-back that POSTs but never
+# terminates (e.g. its run crashed) would otherwise wedge the whole flash queue;
+# matches the workflow timeout.
+_RB_TERMINAL_WAIT_CAP = _RB_BUSY_WAIT_CAP
+
 
 def flash_watch_key(flash_thread_id: str) -> str:
     """Redis SET of PTC thread ids dispatched from this flash thread, pending report-back."""
@@ -170,19 +176,26 @@ async def clear_flash_report_back(
     to the next queued report-back. Reads ``ptc_origin`` first (for the user id)
     before deleting it. Does not swallow Redis errors — callers wrap it.
     """
+    # Read origin first (outside the pipeline) for the user id, then do every
+    # Redis mutation in ONE transaction so a partial failure can't leak the
+    # per-user cap (orphaned flash_user_pending / flash_watch membership).
     origin = await cache.get(f"ptc_origin:{ptc_thread_id}")
     user_id = origin.get("user_id") if isinstance(origin, dict) else None
 
-    await cache.delete(f"ptc_origin:{ptc_thread_id}")
-    if flash_thread_id:
-        await cache.delete(flash_rb_run_key(flash_thread_id, ptc_thread_id))
-    if user_id and cache.client:
-        await cache.client.srem(f"flash_user_pending:{user_id}", ptc_thread_id)
+    if cache.client:
+        pipe = cache.client.pipeline(transaction=True)
+        pipe.delete(f"ptc_origin:{ptc_thread_id}")
+        if flash_thread_id:
+            pipe.delete(flash_rb_run_key(flash_thread_id, ptc_thread_id))
+        if user_id:
+            pipe.srem(f"flash_user_pending:{user_id}", ptc_thread_id)
+        if flash_thread_id:
+            pipe.srem(flash_watch_key(flash_thread_id), ptc_thread_id)
+            pipe.lrem(flash_rb_queue_key(flash_thread_id), 0, ptc_thread_id)
+            pipe.srem(flash_rb_queued_key(flash_thread_id), ptc_thread_id)
+        await pipe.execute()
 
     if flash_thread_id and cache.client:
-        await cache.client.srem(flash_watch_key(flash_thread_id), ptc_thread_id)
-        await cache.client.lrem(flash_rb_queue_key(flash_thread_id), 0, ptc_thread_id)
-        await cache.client.srem(flash_rb_queued_key(flash_thread_id), ptc_thread_id)
         # Wake the consumer waiting on this exact pair. Per-(flash, ptc) so an
         # unrelated PTC's terminal never wakes (or skips) the wrong wait.
         event = _rb_terminal_events.get((flash_thread_id, ptc_thread_id))
@@ -336,8 +349,18 @@ async def _drain_one_report_back(cache, flash_thread_id: str, ptc_thread_id: str
         # Membership-first sticky wait: a terminal handler removes the member and
         # sets our Event. Bounded re-checks guard against a missed in-process
         # signal (e.g. the terminal fired in a path that didn't go through our
-        # Event) so the consumer can never hang permanently.
+        # Event) so the consumer can never hang permanently. A hard deadline
+        # force-clears a report-back that POSTs but never reaches terminal (e.g.
+        # its run crashed) so it can't wedge the whole flash queue.
+        deadline = asyncio.get_running_loop().time() + _RB_TERMINAL_WAIT_CAP
         while await cache.client.sismember(flash_watch_key(flash_thread_id), ptc_thread_id):
+            if asyncio.get_running_loop().time() >= deadline:
+                logger.warning(
+                    f"[FLASH_REPORT_BACK] Terminal wait cap hit for {ptc_thread_id} "
+                    f"on flash thread {flash_thread_id}; clearing stuck member"
+                )
+                await clear_flash_report_back(cache, ptc_thread_id, flash_thread_id)
+                break
             try:
                 await asyncio.wait_for(event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
