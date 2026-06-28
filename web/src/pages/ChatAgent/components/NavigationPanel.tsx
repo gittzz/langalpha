@@ -61,6 +61,9 @@ interface AgentEntry {
 }
 
 interface NavigationPanelProps {
+  /** Whether this panel's host ChatView is the visible one. Up to 5 ChatViews
+   *  stay mounted (display:none); only the active one should auto-page threads. */
+  isActive?: boolean;
   workspaces: WorkspaceEntry[];
   workspaceThreads: Record<string, ThreadsData>;
   currentWorkspaceId?: string | null;
@@ -136,6 +139,7 @@ const MAX_REVEAL_PAGES = 20;
  */
 
 function NavigationPanel({
+  isActive = true,
   workspaces,
   workspaceThreads,
   currentWorkspaceId,
@@ -169,17 +173,12 @@ function NavigationPanel({
   // needed, not the returned version value.
   useSyncExternalStore(subscribeNavExpansion, getNavExpansionVersion);
 
-  // Seed the current workspace/thread as expanded on first mount so they render
-  // open on first paint (no flicker); the effects below broadcast to other panels.
-  const seededRef = useRef(false);
-  if (!seededRef.current) {
-    seededRef.current = true;
-    if (currentWorkspaceId) expandedWorkspaces.add(currentWorkspaceId);
-    if (currentThreadId && currentThreadId !== '__default__') expandedThreads.add(currentThreadId);
-  }
-
-  // Keep current workspace and thread expanded when they change
-  React.useEffect(() => {
+  // Seed the current workspace/thread as expanded, then keep them expanded when
+  // they change. A layout effect (not a render-phase mutation) runs before paint,
+  // so the folder still renders open on first paint with no flicker — but it goes
+  // through notifyNavExpansion, so the useSyncExternalStore version always tracks
+  // the Set contents (no torn snapshot across cached panels under React 19).
+  React.useLayoutEffect(() => {
     if (currentWorkspaceId) {
       if (!expandedWorkspaces.has(currentWorkspaceId)) {
         expandedWorkspaces.add(currentWorkspaceId);
@@ -189,7 +188,7 @@ function NavigationPanel({
     }
   }, [currentWorkspaceId, expandWorkspace]);
 
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
     if (currentThreadId && currentThreadId !== '__default__' && !expandedThreads.has(currentThreadId)) {
       expandedThreads.add(currentThreadId);
       notifyNavExpansion();
@@ -204,6 +203,10 @@ function NavigationPanel({
   // flash (capped at 3, no "Show more") and bounded by MAX_REVEAL_PAGES.
   const revealAttemptRef = useRef<{ key: string; pages: number }>({ key: '', pages: 0 });
   React.useEffect(() => {
+    // Only the visible ChatView's panel pages threads. Up to 5 panels stay
+    // mounted under display:none; without this each could fire MAX_REVEAL_PAGES
+    // fetches for its own (hidden) current thread.
+    if (!isActive) return;
     if (!onLoadMoreThreads || !currentWorkspaceId) return;
     if (!currentThreadId || currentThreadId === '__default__') return;
     if (!expandedWorkspaces.has(currentWorkspaceId)) return;
@@ -220,7 +223,7 @@ function NavigationPanel({
     if (revealAttemptRef.current.pages >= MAX_REVEAL_PAGES) return; // give up — leave "Show more" for manual paging
     revealAttemptRef.current.pages += 1;
     onLoadMoreThreads(currentWorkspaceId);
-  }, [currentWorkspaceId, currentThreadId, workspaces, workspaceThreads, onLoadMoreThreads]);
+  }, [isActive, currentWorkspaceId, currentThreadId, workspaces, workspaceThreads, onLoadMoreThreads]);
 
   const toggleWorkspace = useCallback((wsId: string) => {
     // Routed through the store so every collapse is traceable in one place.

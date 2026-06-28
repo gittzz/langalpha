@@ -68,6 +68,11 @@ export function resetStableNavOrder() {
 let _sharedWorkspaceThreads: Record<string, ThreadsData> = {};
 const _navThreadsListeners = new Set<() => void>();
 
+// Cap on how many workspaces' thread lists the shared store retains. A long
+// session paging through many workspaces would otherwise grow this unbounded;
+// far above any realistic count of workspaces a user navigates in one session.
+const MAX_WORKSPACE_THREAD_LISTS = 50;
+
 function subscribeNavThreads(fn: () => void): () => void {
   _navThreadsListeners.add(fn);
   return () => _navThreadsListeners.delete(fn);
@@ -82,7 +87,15 @@ function getNavThreadsSnapshot(): Record<string, ThreadsData> {
 function setSharedWorkspaceThreads(
   updater: (prev: Record<string, ThreadsData>) => Record<string, ThreadsData>,
 ): void {
-  _sharedWorkspaceThreads = updater(_sharedWorkspaceThreads);
+  let next = updater(_sharedWorkspaceThreads);
+  const keys = Object.keys(next);
+  if (keys.length > MAX_WORKSPACE_THREAD_LISTS) {
+    // Evict oldest (insertion-order) entries to bound a long multi-workspace
+    // session; evicted lists are re-fetched on demand when revisited.
+    next = { ...next };
+    for (const k of keys.slice(0, keys.length - MAX_WORKSPACE_THREAD_LISTS)) delete next[k];
+  }
+  _sharedWorkspaceThreads = next;
   _navThreadsListeners.forEach((fn) => fn());
 }
 
