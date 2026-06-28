@@ -828,10 +828,12 @@ async def reconnect_to_stream(
 async def watch_thread(thread_id: str, x_user_id: CurrentUserId):
     """Watch for new workflow activity on a thread via SSE + Redis pub/sub.
 
-    Opens a lightweight SSE connection that emits a single ``workflow_started``
-    event when a new workflow begins on this thread (e.g., flash report-back
-    after PTC completion).  The client should then close the connection and
-    reconnect via ``/messages/stream``.
+    Opens a lightweight SSE connection that emits a ``workflow_started`` event
+    each time a new workflow begins on this thread (e.g. a flash report-back
+    after a PTC completes). The connection stays open across the whole chain so
+    N concurrent PTCs' report-backs are all delivered on one subscription; the
+    client reconnects via ``/messages/stream`` per event and closes the watch
+    when ``/status`` reports no more pending report-backs.
 
     Sends keepalive pings every 45 seconds.  Auto-closes after 30 minutes
     to prevent leaked connections from abandoned browser tabs.
@@ -868,8 +870,13 @@ async def watch_thread(thread_id: str, x_user_id: CurrentUserId):
                     data = msg["data"]
                     if isinstance(data, bytes):
                         data = data.decode("utf-8")
+                    # Forward EVERY wake, not just the first. A flash thread can
+                    # dispatch N PTCs whose report-backs arrive as separate runs;
+                    # staying subscribed lets the one connection deliver each in
+                    # turn. Breaking here dropped wake #2+ — the client's
+                    # re-subscribe raced the next wake and fell back to the poll,
+                    # which misses a report-back that finishes within its window.
                     yield f'event: workflow_started\ndata: {data}\n\n'
-                    break
                 else:
                     yield ': ping\n\n'
         finally:
