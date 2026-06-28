@@ -463,6 +463,25 @@ describe('NavigationPanel — expansion survives remounts', () => {
     expect(screen.queryByText('Thread B1')).toBeNull();
     expect(expandSpy).not.toHaveBeenCalledWith('ws-b');
   });
+
+  it('lazy-loads threads only when opening a folder, not when collapsing it', async () => {
+    resetNavPanelExpansion();
+    const user = userEvent.setup();
+    const expandSpy = vi.fn();
+    renderOrderPanel('ws-a', expandSpy);
+
+    // ws-b starts collapsed — opening it lazy-loads its threads.
+    await user.click(screen.getByText('Workspace B'));
+    expect(screen.getByText('Thread B1')).toBeInTheDocument();
+    expect(expandSpy).toHaveBeenCalledWith('ws-b');
+    expandSpy.mockClear();
+
+    // Collapsing must not re-fetch: the shared store is capped and may have
+    // evicted the list, so an unconditional expand would fire a needless load.
+    await user.click(screen.getByText('Workspace B'));
+    expect(screen.queryByText('Thread B1')).toBeNull();
+    expect(expandSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('NavigationPanel — shared expansion across instances', () => {
