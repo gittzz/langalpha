@@ -18,8 +18,8 @@ import { queryKeys } from '../../../lib/queryKeys';
 import { createWorkspace, deleteWorkspace, getFlashWorkspace, updateWorkspace, reorderWorkspaces } from '../utils/api';
 import { removeStoredThreadId } from '../hooks/useChatMessages';
 import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
-import { forgetNavPanelExpansion } from './NavigationPanel';
-import { forgetStableNavOrder } from '../hooks/useNavigationData';
+import { forgetNavPanelExpansion } from './navExpansionStore';
+import { forgetStableNavOrder, forgetSharedWorkspaceThreads } from '../hooks/useNavigationData';
 import { clearChatSession } from '../hooks/utils/chatSessionRestore';
 
 const DEFAULT_PAGE_SIZE = 8;
@@ -572,6 +572,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
       // and clear its frozen-order entries so they don't linger all session.
       forgetNavPanelExpansion(workspaceId);
       forgetStableNavOrder(workspaceId);
+      forgetSharedWorkspaceThreads(workspaceId);
 
       // Invalidate workspace list cache
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });

@@ -1,6 +1,6 @@
 import React, { type ReactElement } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 // Enable platform auth code path (AuthProvider checks VITE_HOST_MODE)
@@ -29,6 +29,19 @@ vi.mock('../../lib/supabase', () => ({
 
 vi.mock('../../api/client', () => ({
   setTokenGetter: vi.fn(),
+}));
+
+// Spy on the module-level nav stores so we can assert sign-out resets them.
+const mockResetNavPanelExpansion = vi.fn();
+const mockResetStableNavOrder = vi.fn();
+const mockResetSharedWorkspaceThreads = vi.fn();
+
+vi.mock('@/pages/ChatAgent/components/navExpansionStore', () => ({
+  resetNavPanelExpansion: () => mockResetNavPanelExpansion(),
+}));
+vi.mock('@/pages/ChatAgent/hooks/useNavigationData', () => ({
+  resetStableNavOrder: () => mockResetStableNavOrder(),
+  resetSharedWorkspaceThreads: () => mockResetSharedWorkspaceThreads(),
 }));
 
 // Dynamic import so mocks and env stubs are applied first
@@ -144,6 +157,33 @@ describe('AuthContext', () => {
         expect(screen.getByTestId('isInitialized').textContent).toBe('true')
       );
       expect(mockOnAuthStateChange).toHaveBeenCalled();
+    });
+
+    // Regression: the module-level nav stores live on globalThis and survive
+    // logout (no page reload), so they must be reset on sign-out or one user's
+    // folders/thread lists leak into the next user's session on a shared tab.
+    it('resets the module-level nav stores on sign-out', async () => {
+      renderWithQueryClient(
+        <AuthProvider>
+          <TestConsumer />
+        </AuthProvider>
+      );
+
+      await waitFor(() => expect(mockOnAuthStateChange).toHaveBeenCalled());
+
+      const handler = mockOnAuthStateChange.mock.calls[0][0] as (
+        event: string,
+        session: unknown,
+      ) => void;
+      // Wrap in act(): the handler drives AuthProvider state updates, which
+      // React 19 warns about if flushed outside an act() boundary.
+      await act(async () => {
+        handler('SIGNED_OUT', null);
+      });
+
+      expect(mockResetNavPanelExpansion).toHaveBeenCalledTimes(1);
+      expect(mockResetStableNavOrder).toHaveBeenCalledTimes(1);
+      expect(mockResetSharedWorkspaceThreads).toHaveBeenCalledTimes(1);
     });
   });
 });

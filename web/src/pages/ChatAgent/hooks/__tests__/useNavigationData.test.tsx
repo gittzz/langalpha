@@ -19,6 +19,7 @@ import {
   applyStableOrder,
   applyStableOrderBy,
   resetStableNavOrder,
+  resetSharedWorkspaceThreads,
   bumpThreadNavOrder,
 } from '../useNavigationData';
 import { resetNavPrefs, setNavPrefs } from '../../utils/navPrefs';
@@ -105,6 +106,7 @@ describe('useNavigationData — stable thread ordering', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStableNavOrder();
+    resetSharedWorkspaceThreads();
     resetNavPrefs();
     threadsByWs = {
       'ws-1': threads('t-3', 't-1', 't-2'),
@@ -253,12 +255,34 @@ describe('useNavigationData — stable thread ordering', () => {
     await waitFor(() => expect(second.idsFor('ws-1').length).toBeGreaterThan(0));
     expect(second.idsFor('ws-1')).toEqual(['t-3', 't-1', 't-2']);
   });
+
+  it('shares loaded thread lists across concurrent hook instances (cached panels)', async () => {
+    // Two cached ChatView panels are alive at once, each its own hook instance.
+    // Thread lists live in a session-global shared store, so a folder loaded by
+    // one panel is visible to the other immediately. Before the shared store,
+    // the second panel rendered the folder open-but-empty (the flash that read
+    // as an auto-collapse) until its own fetch landed.
+    const a = setup('ws-1');
+    const b = setup('ws-1');
+    await waitFor(() => expect(a.idsFor('ws-1')).toEqual(['t-3', 't-1', 't-2']));
+
+    // Panel A opens ws-2 (neither panel's current workspace).
+    expect(b.idsFor('ws-2')).toEqual([]);
+    await act(async () => {
+      a.result.current.expandWorkspace('ws-2');
+    });
+
+    // Panel B sees A's load through the shared store — no empty flash.
+    await waitFor(() => expect(b.idsFor('ws-2')).toEqual(['u-2', 'u-1']));
+    expect(a.idsFor('ws-2')).toEqual(['u-2', 'u-1']);
+  });
 });
 
 describe('useNavigationData — stable workspace ordering', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStableNavOrder();
+    resetSharedWorkspaceThreads();
     resetNavPrefs();
     mockGetWorkspaceThreads.mockResolvedValue({ threads: [] });
   });
@@ -436,6 +460,7 @@ describe('useNavigationData — drag-reorder workspaces', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStableNavOrder();
+    resetSharedWorkspaceThreads();
     resetNavPrefs();
     mockGetWorkspaceThreads.mockResolvedValue({ threads: [] });
     mockReorderWorkspaces.mockResolvedValue(undefined);
@@ -525,6 +550,7 @@ describe('useNavigationData — pin & rename workspace', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStableNavOrder();
+    resetSharedWorkspaceThreads();
     resetNavPrefs();
     mockGetWorkspaceThreads.mockResolvedValue({ threads: [] });
     server = [
@@ -603,6 +629,7 @@ describe('useNavigationData — thread paging', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStableNavOrder();
+    resetSharedWorkspaceThreads();
     resetNavPrefs();
     mockGetWorkspaces.mockResolvedValue({
       workspaces: [{ workspace_id: 'ws-1' }],
