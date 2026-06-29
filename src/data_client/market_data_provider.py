@@ -221,10 +221,13 @@ class MarketDataProvider:
     ) -> list[dict[str, Any]]:
         """Fetch batch snapshots with per-symbol market routing and fallback."""
         def normalize_symbol(value: Any) -> str:
-            # lstrip("^") so a provider returning the Yahoo caret form ("^GSPC")
-            # still matches the bare requested index symbol ("GSPC"). Request
-            # symbols are caret-free, so this is a no-op for them.
-            return str(value).strip().upper().lstrip("^")
+            # removeprefix("^") so a provider returning the Yahoo caret form
+            # ("^GSPC") still matches the bare requested index symbol ("GSPC").
+            # Strips exactly one leading caret (Yahoo's index prefix) — unlike
+            # lstrip, a malformed "^^X" won't collapse onto a bare "X" request
+            # and resolve it against the wrong source. Request symbols are
+            # caret-free, so this is a no-op for them.
+            return str(value).strip().upper().removeprefix("^")
 
         pending = [s for s in symbols if str(s).strip()]
         if not pending:
