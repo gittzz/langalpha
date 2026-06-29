@@ -383,6 +383,23 @@ class TestMarketDataProvider:
         assert "market_data.snapshot.drop_unrequested" not in caplog.text
 
     @pytest.mark.asyncio
+    async def test_get_snapshots_double_caret_row_does_not_alias_bare_index(self, caplog):
+        # normalize_symbol strips exactly ONE leading caret (removeprefix, not
+        # lstrip), so a malformed "^^GSPC" row normalizes to "^GSPC" and must
+        # NOT alias the bare requested "GSPC" — it's dropped as unrequested
+        # instead of resolving the request against the wrong data.
+        src = SnapshotSource(
+            "caret",
+            extra_rows=[{"symbol": "^^GSPC", "price": 5000.0}],
+        )
+        provider = MarketDataProvider([ProviderEntry("caret", src, {"all"})])
+
+        result = await provider.get_snapshots(["GSPC"], asset_type="indices")
+
+        assert result == []
+        assert "market_data.snapshot.drop_unrequested" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_get_snapshots_falls_back_when_provider_returns_no_rows(self):
         empty_src = SnapshotSource("primary")
         fallback_src = SnapshotSource(

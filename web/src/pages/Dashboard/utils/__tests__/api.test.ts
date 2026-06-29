@@ -101,6 +101,27 @@ describe('getIndex', () => {
     // date label reflects the session the data belongs to, not "today".
     expect(result.asOfDate).toBe('2025-01-13');
   });
+
+  it('falls back to the chronologically-last bar when no regular-hours bars exist', async () => {
+    // Every bar is pre-market/overnight (before 09:30 ET) across two dates, so
+    // the regular-hours slice is empty and the selector falls back to the last
+    // bar's date rather than blanking the card.
+    apiMock.get.mockResolvedValueOnce({
+      data: {
+        data: [
+          { time: ET(2025, 0, 13, 6, 0), open: 100, close: 100 },
+          { time: ET(2025, 0, 14, 7, 0), open: 100, close: 105 },
+          { time: ET(2025, 0, 14, 8, 0), open: 100, close: 110 },
+        ],
+      },
+    });
+
+    const result = await getIndex('VIX');
+
+    expect(result.asOfDate).toBe('2025-01-14');
+    expect(result.sparklineData.map((p) => p.val)).toEqual([105, 110]);
+    expect(result.price).toBe(110);
+  });
 });
 
 describe('getIndices', () => {
@@ -138,5 +159,57 @@ describe('getIndices', () => {
     expect(vix.quoteAvailable).toBe(false);
     expect(vix.price).toBe(0);
     expect(failedCount).toBe(1);
+  });
+
+  it('treats a zero-price index snapshot as no quote (N/A, not a fake 0.00)', async () => {
+    // Index prices are never legitimately 0; a partial provider snapshot
+    // (missing lastPrice coerced to 0) must not render as a real quote.
+    apiMock.get.mockImplementation((url: string) => {
+      if (url.includes('/snapshots/indexes')) {
+        return Promise.resolve({
+          data: {
+            snapshots: [
+              { symbol: 'GSPC', price: 0, change: 0, change_percent: 0, previous_close: 0 },
+            ],
+          },
+        });
+      }
+      return Promise.resolve({ data: { data: [] } });
+    });
+
+    const { indices, failedCount } = await getIndices(['GSPC']);
+    const gspc = indices.find((i) => i.symbol === 'GSPC')!;
+
+    expect(gspc.quoteAvailable).toBe(false);
+    expect(failedCount).toBe(1);
+  });
+
+  it('threads the intraday session asOfDate onto the index when the snapshot is present', async () => {
+    apiMock.get.mockImplementation((url: string) => {
+      if (url.includes('/snapshots/indexes')) {
+        return Promise.resolve({
+          data: {
+            snapshots: [
+              { symbol: 'GSPC', price: 5000, change: 1, change_percent: 0.1, previous_close: 4999 },
+            ],
+          },
+        });
+      }
+      // intraday — a complete regular-hours session on 2025-01-13
+      return Promise.resolve({
+        data: {
+          data: [
+            { time: ET(2025, 0, 13, 9, 30), open: 100, close: 100 },
+            { time: ET(2025, 0, 13, 16, 0), open: 100, close: 101 },
+          ],
+        },
+      });
+    });
+
+    const { indices } = await getIndices(['GSPC']);
+    const gspc = indices.find((i) => i.symbol === 'GSPC')!;
+
+    expect(gspc.quoteAvailable).toBe(true);
+    expect(gspc.asOfDate).toBe('2025-01-13');
   });
 });
