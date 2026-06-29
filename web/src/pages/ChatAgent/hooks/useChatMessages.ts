@@ -819,7 +819,10 @@ export function useChatMessages(
       document.removeEventListener('visibilitychange', onForeground);
       window.removeEventListener('pageshow', onForeground);
     };
-  }, [isLoading, threadId]); // refs are stable
+    // Only isLoading is read in the handler closure; the thread identity comes
+    // from threadIdRef.current, not the prop, so threadId is intentionally NOT a
+    // dep — including it would re-register the listeners on every thread nav.
+  }, [isLoading]); // refs are stable
 
   // Reset thread ID when workspace or initialThreadId changes
   useEffect(() => {
