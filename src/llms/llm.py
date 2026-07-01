@@ -66,7 +66,8 @@ class ModelConfig:
             for vkey, overrides in variants.items():
                 merged = {**shared, **overrides}
                 if vkey != group_key:
-                    merged["parent_provider"] = group_key
+                    # setdefault: a variant may declare an explicit parent_provider
+                    merged.setdefault("parent_provider", group_key)
                 flat[vkey] = merged
 
             if not has_self_variant:
@@ -211,6 +212,24 @@ _UNSET = object()  # Sentinel to distinguish "no override" from "override to Non
 # Name regex for custom models: alphanumeric start, then alphanumeric/./_/-/:
 # Colon allowed for Ollama-style name:tag format (e.g. gemma4:31b)
 CUSTOM_MODEL_NAME_RE = r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,62}$"
+
+
+def _profile_overrides_from_config(model_info: dict) -> dict[str, Any]:
+    """Map a models.json entry onto ``ModelProfile`` keys (manifest is the SoT)."""
+    overrides: dict[str, Any] = {}
+    context = model_info.get("context")
+    if isinstance(context, int):
+        overrides["max_input_tokens"] = context
+    max_tokens = (model_info.get("parameters") or {}).get("max_tokens")
+    if isinstance(max_tokens, int):
+        overrides["max_output_tokens"] = max_tokens
+    modalities = model_info.get("input_modalities")
+    if isinstance(modalities, list):
+        overrides["text_inputs"] = "text" in modalities
+        overrides["image_inputs"] = "image" in modalities
+        overrides["audio_inputs"] = "audio" in modalities
+        overrides["video_inputs"] = "video" in modalities
+    return overrides
 
 
 class LLM:
@@ -414,6 +433,8 @@ class LLM:
             client = self._get_codex_llm(cache_key=effective_cache_key)
         elif self.sdk == "deepseek":
             client = self._get_deepseek_llm()
+        elif self.sdk == "glm":
+            client = self._get_glm_llm()
         elif self.sdk == "qwq":
             client = self._get_qwq_llm()
         elif self.sdk == "anthropic":
@@ -542,6 +563,37 @@ class LLM:
             params["extra_body"] = self.extra_body
 
         return ChatDeepSeek(**params)
+
+    def _get_glm_llm(self):
+        """Get GLM/bigmodel LLM via vendored langchain-zai ``ChatZai`` (reasoning round-trip)."""
+        from src.llms.vendor.langchain_zai import ChatZai
+
+        params = {
+            "model": self.model,
+            "api_key": self._resolve_api_key(),
+            "stream_usage": True,
+            "max_retries": 5,
+            "timeout": 600.0,
+        }
+        params.update(self._resolve_base_url("base_url"))
+
+        # Add all parameters from llm_config
+        params.update(self.parameters)
+
+        if self.extra_body:
+            params["extra_body"] = self.extra_body
+
+        client = ChatZai(**params)
+
+        # Override the package profile with manifest values so the two can't drift
+        # (compaction reads profile["max_input_tokens"]); capability flags preserved.
+        model_info = self.model_config.get_model_config(self.custom_model_name) or {}
+        overrides = _profile_overrides_from_config(model_info)
+        if overrides:
+            base = client.profile if isinstance(client.profile, dict) else {}
+            client.profile = {**base, **overrides}
+
+        return client
 
     def _get_qwq_llm(self):
         """Get QwQ or QwQ-compatible LLM (for Qwen models with reasoning support)."""
