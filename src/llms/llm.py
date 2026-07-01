@@ -1,3 +1,4 @@
+import copy
 import os
 import json
 from pathlib import Path
@@ -279,8 +280,11 @@ class LLM:
         if not api_key and model_info.get("system_provider"):
             self.provider = model_info["system_provider"]
 
-        self.parameters = model_info.get("parameters", {}).copy()
-        self.extra_body = model_info.get("extra_body", {}).copy()
+        # Deep copy: reasoning-effort overrides mutate nested dicts (e.g.
+        # extra_body.thinking); a shallow copy would contaminate the
+        # process-wide manifest for every subsequent request.
+        self.parameters = copy.deepcopy(model_info.get("parameters", {}))
+        self.extra_body = copy.deepcopy(model_info.get("extra_body", {}))
 
         # Override with any provided parameters
         self.parameters.update(override_params)
@@ -358,8 +362,8 @@ class LLM:
         instance.custom_model_name = config.get("name", config["model_id"])
         instance.model = config["model_id"]
         instance.provider = config["provider"]
-        instance.parameters = (config.get("parameters") or {}).copy()
-        instance.extra_body = (config.get("extra_body") or {}).copy()
+        instance.parameters = copy.deepcopy(config.get("parameters") or {})
+        instance.extra_body = copy.deepcopy(config.get("extra_body") or {})
         instance.parameters.update(override_params)
         instance.api_key_override = api_key
 
