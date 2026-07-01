@@ -544,6 +544,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       const detail = ((resp?.data ?? undefined) as { detail?: unknown } | undefined)?.detail;
       if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
         const obj = detail as { code?: string; message?: string };
+        // A user Stop cancels the backend call; the shared cancellation wrapper
+        // returns 409 {code: "request_cancelled"} — report a clean stop, not an error.
+        if (obj.code === 'request_cancelled') { insertNotification(t('chat.compactionStopped'), 'info'); return; }
         if (obj.code === 'workflow_active') { insertNotification(t(busyKey), 'warning'); return; }
         if (typeof obj.message === 'string' && obj.message.length > 0) { insertNotification(obj.message, 'warning'); return; }
         insertNotification(t(fallbackKey), 'warning');

@@ -590,7 +590,7 @@ const MessageBubble = memo(function MessageBubble({ message, isLoading, hideAvat
   const avatarUrl = user?.avatar_url as string | undefined;
   const isUser = (message.role as string) === 'user';
   const isAssistant = (message.role as string) === 'assistant';
-  const isPendingDelivery = isUser && ((message.isPending as boolean) || (message.steering as boolean));
+  const isPendingDelivery = isUser && ((message.isPending as boolean) || (message.steering as boolean) || (message.queued as boolean));
   const attachments = message.attachments as AttachmentData[] | undefined;
   const hasAttachments = isUser && attachments && attachments.length > 0;
   const widgetSnapshots = message.widgetSnapshots as WidgetChipShape[] | undefined;

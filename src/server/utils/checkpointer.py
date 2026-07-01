@@ -19,6 +19,12 @@ from src.config.settings import get_checkpointer_pool_max
 
 logger = logging.getLogger(__name__)
 
+# Message ids under DeltaChannel are stamped upstream by langgraph's
+# ``ensure_message_ids`` (>=1.2.2) at ``put_writes`` time, before the checkpointer
+# persists the raw delta write; the vendored reducer in ``ptc_agent.agent.state``
+# never mints. So id-less ``messages`` writes already carry stable ids by the time
+# they reach the savers below — no id-stamping shim is needed here.
+
 # Module-level connection pool cache to reuse connections across graph compilations
 _postgres_pool_cache: dict[str, AsyncConnectionPool] = {}
 

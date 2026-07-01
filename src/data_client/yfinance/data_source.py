@@ -161,7 +161,18 @@ class YFinanceDataSource:
         results = await asyncio.gather(
             *(asyncio.to_thread(_fetch_single_snapshot, s) for s in prepared)
         )
-        return [r for r in results if r is not None]
+        # gather preserves order, so results[i] maps back to symbols[i]. Restore
+        # the originally-requested (bare) symbol — the caret was only for the
+        # Yahoo query — so the provider chain matches on the requested ticker
+        # instead of dropping "^GSPC" as unrequested. Keeps yfinance consistent
+        # with FMP/ginlix-data, which already return bare index symbols.
+        out: list[dict[str, Any]] = []
+        for original, snap in zip(symbols, results):
+            if snap is None:
+                continue
+            snap["symbol"] = original
+            out.append(snap)
+        return out
 
     async def get_market_status(
         self,

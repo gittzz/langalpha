@@ -252,6 +252,53 @@ class TestCancelStaleWorkflowTimeout:
 
 
 # ---------------------------------------------------------------------------
+# cancel_stale_workflow — excludes the caller's own pre-registered placeholder
+# ---------------------------------------------------------------------------
+
+class TestCancelStaleWorkflowExcludesOwnRun:
+    """Regression: a dispatched cold-start must not cancel its own placeholder.
+
+    On the dispatched path threads.py pre-registers (thread_id, run_id) as a
+    QUEUED placeholder before astream_ptc_workflow runs. When the sandbox is
+    cold, astream calls cancel_stale_workflow to clear a stale prior run — and
+    without exclude_run_id it found and cancelled its OWN placeholder, so
+    start_workflow later settled it "cancelled before start" and the run
+    silently never executed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_excluded_own_placeholder_not_cancelled(self):
+        """With exclude_run_id naming the only (placeholder) run, nothing is cancelled."""
+        btm = _make_btm()
+        placeholder = _make_task_info(
+            status=TaskStatus.QUEUED, run_id="run-self", task=None, inner_task=None
+        )
+        btm.tasks[("thread-1", "run-self")] = placeholder
+
+        result = await btm.cancel_stale_workflow("thread-1", exclude_run_id="run-self")
+
+        assert result is False
+        assert not placeholder.cancel_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_other_stale_run_still_cancelled_when_excluding_own(self):
+        """A genuinely stale OTHER run is still cancelled despite the exclusion."""
+        btm = _make_btm()
+        stale = _make_task_info(status=TaskStatus.RUNNING, run_id="run-stale")
+        own = _make_task_info(
+            status=TaskStatus.QUEUED, run_id="run-self", task=None, inner_task=None
+        )
+        btm.tasks[("thread-1", "run-stale")] = stale
+        btm.tasks[("thread-1", "run-self")] = own
+
+        result = await btm.cancel_stale_workflow("thread-1", exclude_run_id="run-self")
+
+        assert result is True
+        assert stale.cancel_event.is_set()
+        assert not own.cancel_event.is_set()
+
+
+# ---------------------------------------------------------------------------
 # consume_workflow uses closure-captured events
 # ---------------------------------------------------------------------------
 
@@ -1057,3 +1104,234 @@ class TestStartWorkflowCancelledPlaceholder:
                 ti.task.cancel()
                 with suppress(asyncio.CancelledError):
                     await ti.task
+
+
+# ---------------------------------------------------------------------------
+# Compaction admission guard
+# ---------------------------------------------------------------------------
+
+
+class TestCompactionAdmissionGuard:
+    """begin/end_compaction hold a new turn at admission until an in-progress
+    compaction (auto Tier-2 summarize or manual /compact|/offload) finishes,
+    so a concurrent POST is never steered mid-summarize and never races the
+    manual checkpoint read-modify-write."""
+
+    def test_begin_compaction_is_atomic_check_and_set(self):
+        btm = _make_btm()
+        assert btm.compaction_event("t1") is None
+        # First begin starts a window and reports it.
+        assert btm.begin_compaction("t1") is True
+        ev = btm.compaction_event("t1")
+        assert ev is not None and not ev.is_set()
+        # Second begin while in progress is a no-op (manual-vs-manual guard).
+        assert btm.begin_compaction("t1") is False
+        assert btm.compaction_event("t1") is ev
+
+    def test_end_compaction_releases_and_is_idempotent(self):
+        btm = _make_btm()
+        btm.begin_compaction("t1")
+        ev = btm.compaction_event("t1")
+        btm.end_compaction("t1")
+        assert ev.is_set()
+        assert btm.compaction_event("t1") is None
+        # Idempotent: a second end (e.g. the finally safety net) must not raise.
+        btm.end_compaction("t1")
+
+    @pytest.mark.asyncio
+    async def test_admission_waits_then_returns_running(self):
+        """A running turn that is compacting → a concurrent admission blocks
+        until end_compaction, then returns 'running' so the caller steers."""
+        btm = _make_btm()
+        btm.tasks[("thread-1", "run-1")] = _make_task_info(status=TaskStatus.RUNNING)
+        btm.begin_compaction("thread-1")
+
+        admission = asyncio.create_task(btm.wait_for_admission("thread-1"))
+        await asyncio.sleep(0.05)
+        assert not admission.done()  # held by the compaction guard
+
+        btm.end_compaction("thread-1")
+        result = await asyncio.wait_for(admission, timeout=1.0)
+        assert result == "running"
+
+    @pytest.mark.asyncio
+    async def test_admission_waits_then_returns_fresh(self):
+        """Manual compaction (no active task) → after end_compaction the
+        admission returns 'fresh' so a new turn starts."""
+        btm = _make_btm()
+        btm.begin_compaction("thread-1")
+
+        admission = asyncio.create_task(btm.wait_for_admission("thread-1"))
+        await asyncio.sleep(0.05)
+        assert not admission.done()
+
+        btm.end_compaction("thread-1")
+        result = await asyncio.wait_for(admission, timeout=1.0)
+        assert result == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_admission_timeout_returns_compacting(self):
+        """No end_compaction within the wait window → 'compacting' (→ 409)."""
+        btm = _make_btm()
+        # Zero the floor margin and compaction budget so the patched admission
+        # timeout (not the compaction_timeout floor) governs this case.
+        btm._COMPACTION_ADMISSION_MARGIN_S = 0.0
+        btm.begin_compaction("thread-1")
+        with patch(
+            "src.server.services.background_task_manager."
+            "get_admission_compaction_wait_timeout",
+            return_value=0.05,
+        ), patch(
+            "src.server.services.background_task_manager.get_compaction_timeout",
+            return_value=0.0,
+        ):
+            result = await btm.wait_for_admission("thread-1")
+        assert result == "compacting"
+
+    @pytest.mark.asyncio
+    async def test_admission_floored_at_compaction_timeout(self):
+        """Admission must not 409 a healthy compaction before its call budget
+        self-terminates: the wait is floored at compaction_timeout + margin even
+        when the configured admission timeout is shorter."""
+        btm = _make_btm()
+        btm._COMPACTION_ADMISSION_MARGIN_S = 0.0
+        btm.begin_compaction("thread-1")
+
+        with patch(
+            "src.server.services.background_task_manager."
+            "get_admission_compaction_wait_timeout",
+            return_value=0.05,  # would 409 almost immediately WITHOUT the floor
+        ), patch(
+            "src.server.services.background_task_manager.get_compaction_timeout",
+            return_value=0.5,  # floor: admission holds at least this long
+        ):
+            admission = asyncio.create_task(btm.wait_for_admission("thread-1"))
+            # Past the configured 0.05 but inside the 0.5 floor: still waiting.
+            await asyncio.sleep(0.2)
+            assert not admission.done()
+
+            # Compaction releases before the floor expires → admit, don't 409.
+            btm.end_compaction("thread-1")
+            result = await asyncio.wait_for(admission, timeout=1.0)
+        assert result == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_no_compaction_admits_normally(self):
+        """No compaction in progress → admission falls straight through to the
+        normal task scan."""
+        btm = _make_btm()
+        result = await btm.wait_for_admission("thread-1")
+        assert result == "fresh"
+
+
+class TestCancelCompaction:
+    """A user Stop during a MANUAL compaction must interrupt the in-flight call.
+    The compaction's request task is registered so /cancel can cancel it; the
+    cancelled task's finally releases the admission guard (end_compaction)."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_compaction_cancels_registered_task(self):
+        btm = _make_btm()
+        started = asyncio.Event()
+
+        async def _hang():
+            started.set()
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(_hang())
+        await started.wait()
+        btm.set_compaction_task("thread-1", task)
+
+        assert btm.cancel_compaction("thread-1") is True
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_cancel_compaction_no_task_returns_false(self):
+        btm = _make_btm()
+        assert btm.cancel_compaction("absent-thread") is False
+
+    @pytest.mark.asyncio
+    async def test_clear_compaction_task_unregisters(self):
+        btm = _make_btm()
+        started = asyncio.Event()
+
+        async def _hang():
+            started.set()
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(_hang())
+        await started.wait()
+        btm.set_compaction_task("thread-1", task)
+        btm.clear_compaction_task("thread-1")
+        # Once cleared, a Stop can no longer reach the (now finished) task.
+        assert btm.cancel_compaction("thread-1") is False
+        # Idempotent — clearing again must not raise.
+        btm.clear_compaction_task("thread-1")
+
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+# ---------------------------------------------------------------------------
+# _clear_report_back_watch — terminal runs clear the flash report-back watch
+# ---------------------------------------------------------------------------
+
+class TestClearReportBackWatch:
+    """A report-back flash run that fails/cancels must clear the watch, since the
+    success-only completion hook never runs on a terminal failure (else /status
+    reports the report-back pending until its 24h TTL)."""
+
+    @pytest.mark.asyncio
+    async def test_clears_when_metadata_has_ptc_thread_id(self):
+        btm = _make_btm()
+        cache = MagicMock()
+        cache.enabled = True
+        cache.client = MagicMock()
+        mock_clear = AsyncMock()
+
+        with patch(
+            "src.utils.cache.redis_cache.get_cache_client", return_value=cache
+        ), patch(
+            "src.server.handlers.chat.ptc_workflow.clear_flash_report_back", mock_clear
+        ):
+            await btm._clear_report_back_watch(
+                "flash-1", {"report_back_ptc_thread_id": "ptc-1"}
+            )
+
+        mock_clear.assert_awaited_once_with(cache, "ptc-1", "flash-1")
+
+    @pytest.mark.asyncio
+    async def test_noop_without_ptc_thread_id(self):
+        btm = _make_btm()
+        mock_clear = AsyncMock()
+
+        with patch(
+            "src.utils.cache.redis_cache.get_cache_client"
+        ) as mock_get_cache, patch(
+            "src.server.handlers.chat.ptc_workflow.clear_flash_report_back", mock_clear
+        ):
+            await btm._clear_report_back_watch("flash-1", {"user_id": "u-1"})
+
+        mock_clear.assert_not_called()
+        mock_get_cache.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_swallows_clear_errors(self):
+        btm = _make_btm()
+        cache = MagicMock()
+        cache.enabled = True
+        cache.client = MagicMock()
+
+        with patch(
+            "src.utils.cache.redis_cache.get_cache_client", return_value=cache
+        ), patch(
+            "src.server.handlers.chat.ptc_workflow.clear_flash_report_back",
+            AsyncMock(side_effect=RuntimeError("redis down")),
+        ):
+            # Must not raise — terminal handlers call this best-effort.
+            await btm._clear_report_back_watch(
+                "flash-1", {"report_back_ptc_thread_id": "ptc-1"}
+            )

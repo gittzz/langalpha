@@ -58,16 +58,17 @@ from ._common import (
     _append_to_last_user_message,
     _resolve_timezone,
     _setup_fork_and_persistence,
+    admission_conflict_detail,
     apply_fetch_override,
     build_graph_config,
     ensure_thread,
     handle_workflow_error,
     init_tracking,
     inject_inline_reminders,
-    inject_skills,
     logger,
     normalize_request_messages,
     persist_or_skip_replay,
+    prepare_skill_contexts,
     process_hitl_response,
     serialize_context_metadata,
     setup_steering_tracking,
@@ -82,6 +83,33 @@ from .steering import (
     steer_thread,
 )
 from .stream_from_log import stream_from_log
+
+
+# ---------------------------------------------------------------------------
+# Report-back watch cleanup
+# ---------------------------------------------------------------------------
+
+
+async def _maybe_clear_report_back(request: ChatRequest, flash_thread_id: str) -> None:
+    """Clear the durable flash report-back watch if this run consumed one.
+
+    A flash run dispatched as a PTC report-back carries
+    ``report_back_ptc_thread_id``. This is invoked from the success-only
+    completion hook, so by now the summary is persisted — clearing the watch is
+    safe (any reload surfaces the summary via history). A failed/crashed
+    report-back run never reaches the hook, so its keys survive for recovery.
+    """
+    ptc_thread_id = getattr(request, "report_back_ptc_thread_id", None)
+    if not ptc_thread_id:
+        return
+
+    from src.utils.cache.redis_cache import get_cache_client
+    from src.server.handlers.chat.ptc_workflow import clear_flash_report_back
+
+    cache = get_cache_client()
+    if not (cache.enabled and cache.client):
+        return
+    await clear_flash_report_back(cache, ptc_thread_id, flash_thread_id)
 
 
 # ---------------------------------------------------------------------------
@@ -159,13 +187,10 @@ async def astream_flash_workflow(
                 thread_id, exclude_run_id=run_id
             )
             if state != "fresh":
-                detail = (
-                    f"Workflow {thread_id} is stopping; retry shortly."
-                    if state == "stopping"
-                    else f"Workflow {thread_id} is still running; dispatched "
-                    "follow-up could not be admitted."
+                raise HTTPException(
+                    status_code=409,
+                    detail=admission_conflict_detail(thread_id, state),
                 )
-                raise HTTPException(status_code=409, detail=detail)
             ready, steering_event = True, None
         else:
             ready, steering_event = await wait_or_steer(
@@ -341,8 +366,18 @@ async def astream_flash_workflow(
                     f"noted for {effective_model}"
                 )
 
-        # Skill Context Injection (Flash mode)
-        loaded_skill_names = inject_skills(messages, request, config, mode="flash")
+        # Skill Context Resolution (Flash) — body injection happens in
+        # SkillsMiddleware, which dedups bodies already live in the thread. Only
+        # set on normal turns; HITL/replay carry no new user message to attach to.
+        if not request.hitl_response and not is_checkpoint_replay:
+            skill_contexts = prepare_skill_contexts(messages, request, mode="flash")
+        else:
+            skill_contexts = None
+        skill_dirs = (
+            [local_dir for local_dir, _ in config.skills.local_skill_dirs_with_sandbox()]
+            if skill_contexts
+            else None
+        )
 
         # Inline context injection (directive + widget + chart selection) --
         # Flash-specific. Skip on HITL resumes and checkpoint replay because
@@ -376,8 +411,7 @@ async def astream_flash_workflow(
             )
         else:
             input_state = {"messages": messages}
-            if loaded_skill_names:
-                input_state["loaded_skills"] = loaded_skill_names
+            # Skill tools auto-load via SkillsMiddleware (sets loaded_skills in state).
 
         graph_config = build_graph_config(
             thread_id=thread_id,
@@ -390,6 +424,8 @@ async def astream_flash_workflow(
             effective_model=effective_model,
             is_byok=is_byok,
             recursion_limit=get_flash_recursion_limit(),
+            skill_contexts=skill_contexts,
+            skill_dirs=skill_dirs,
         )
         graph_config["run_id"] = run_id
 
@@ -467,6 +503,18 @@ async def astream_flash_workflow(
                         thread_id, handler.injected_steerings
                     )
 
+                # If this flash run consumed a PTC report-back, the summary is
+                # now persisted — clear the durable watch so a client reload no
+                # longer surfaces it as pending. This success-only hook is the
+                # consumption point; a failed run leaves the keys for recovery.
+                try:
+                    await _maybe_clear_report_back(request, thread_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[FLASH_COMPLETE] report-back watch cleanup failed for "
+                        f"{thread_id}: {e}"
+                    )
+
                 logger.info(
                     f"[FLASH_COMPLETE] Background completion persisted: "
                     f"thread_id={thread_id} duration={execution_time:.2f}s"
@@ -498,6 +546,12 @@ async def astream_flash_workflow(
                     "handler": handler,
                     "token_callback": token_callback,
                     "persistence_service": persistence_service,
+                    # Lets the BTM terminal handlers clear the report-back watch
+                    # if this run fails or is cancelled (the success path clears
+                    # it from the completion hook above).
+                    "report_back_ptc_thread_id": getattr(
+                        request, "report_back_ptc_thread_id", None
+                    ),
                 },
                 completion_callback=on_flash_workflow_complete,
                 graph=flash_graph,
@@ -524,11 +578,13 @@ async def astream_flash_workflow(
 
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    f"Workflow {thread_id} is still running. "
-                    "Wait a moment, or use /reconnect to continue streaming, "
-                    "or /cancel to stop it."
-                ),
+                detail={
+                    "code": "running",
+                    "message": (
+                        "The workflow is still running. Wait a moment, then "
+                        "retry — or use /reconnect to continue, /cancel to stop."
+                    ),
+                },
             )
         else:
             slot_owned = False  # Manager owns burst slot release from here

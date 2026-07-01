@@ -33,6 +33,8 @@ import {
   deleteThread,
   sendHitlResponse,
   streamWorkspaceEvents,
+  watchThread,
+  reconnectToWorkflowStream,
 } from '../api';
 
 const mockGet = api.get as Mock;
@@ -384,6 +386,143 @@ describe('ChatAgent API utilities', () => {
       ]);
       await streamWorkspaceEvents('ws-1', vi.fn(), ctrl());
       expect(reader.cancel).toHaveBeenCalled();
+    });
+  });
+
+  describe('watchThread', () => {
+    let originalFetch: typeof global.fetch;
+
+    beforeEach(() => {
+      originalFetch = global.fetch;
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
+    /** Build a fetch mock whose /watch body streams the given SSE text chunks. */
+    function mockWatchResponse(chunks: string[], { ok = true } = {}) {
+      const encoder = new TextEncoder();
+      const queue = [...chunks];
+      const reader = {
+        read: vi.fn(async () => {
+          if (queue.length === 0) return { done: true, value: undefined };
+          return { done: false, value: encoder.encode(queue.shift()!) };
+        }),
+        cancel: vi.fn(async () => {}),
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok,
+        status: ok ? 200 : 503,
+        body: ok ? { getReader: () => reader } : null,
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+      return { fetchMock, reader };
+    }
+
+    /** Run watchThread and resolve with the payload it reports (one-shot). */
+    function runWatch(): Promise<{ run_id?: string | null } | undefined> {
+      return new Promise((resolve) => {
+        watchThread('flash-1', resolve);
+      });
+    }
+
+    it('parses the run_id from a wake delivered as a single frame', async () => {
+      mockWatchResponse([
+        'event: workflow_started\ndata: {"thread_id":"flash-1","run_id":"rb-1"}\n\n',
+      ]);
+      expect(await runWatch()).toEqual({ run_id: 'rb-1' });
+    });
+
+    it('parses the run_id when the data line arrives in a later read() chunk', async () => {
+      // Regression: the wake frame is split mid-`data:` across reads. Reacting on
+      // first sight of the event name parsed partial JSON and lost the run_id,
+      // forcing a /status fallback that a fast report-back has already torn down.
+      mockWatchResponse([
+        'event: workflow_started\ndata: {"thread_id":"flash-1","ru',
+        'n_id":"rb-1"}\n\n',
+      ]);
+      expect(await runWatch()).toEqual({ run_id: 'rb-1' });
+    });
+
+    it('skips keepalive pings before reporting the wake run_id', async () => {
+      mockWatchResponse([
+        ': ping\n\n',
+        ': ping\n\n',
+        'event: workflow_started\ndata: {"run_id":"rb-9"}\n\n',
+      ]);
+      expect(await runWatch()).toEqual({ run_id: 'rb-9' });
+    });
+
+    it('reports a null run_id for a malformed wake (caller falls back to /status)', async () => {
+      mockWatchResponse(['event: workflow_started\ndata: {not json}\n\n']);
+      expect(await runWatch()).toEqual({ run_id: null });
+    });
+
+    it('joins multiple data: lines per the SSE spec before parsing', async () => {
+      // A wake whose JSON spans multiple data: lines must concatenate with a
+      // newline (SSE spec). The old single-line regex captured only the first
+      // line, truncating the JSON and forcing a /status fallback.
+      mockWatchResponse([
+        'event: workflow_started\ndata: {"thread_id":"flash-1",\ndata: "run_id":"rb-7"}\n\n',
+      ]);
+      expect(await runWatch()).toEqual({ run_id: 'rb-7' });
+    });
+
+    it('cancels the reader once the wake is consumed', async () => {
+      const { reader } = mockWatchResponse([
+        'event: workflow_started\ndata: {"run_id":"rb-1"}\n\n',
+      ]);
+      await runWatch();
+      expect(reader.cancel).toHaveBeenCalled();
+    });
+  });
+
+  describe('reconnectToWorkflowStream transport-error classification (Prong A)', () => {
+    let originalFetch: typeof global.fetch;
+
+    beforeEach(() => {
+      originalFetch = global.fetch;
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
+    /** Build a fetch mock whose reader.read() rejects with the given error. */
+    function mockRejectingReader(error: Error) {
+      const reader = {
+        read: vi.fn().mockRejectedValue(error),
+        cancel: vi.fn(async () => {}),
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: { getReader: () => reader },
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+      return { fetchMock, reader };
+    }
+
+    it('classifies a TypeError("Load failed") read rejection as a disconnect (iOS Safari background-kill)', async () => {
+      // The fail-first proof: "Load failed" contains no "network" substring, so
+      // the old classifier re-threw it (error banner, no reconnect). After Prong
+      // A, any TypeError out of the read loop resolves as a disconnect.
+      mockRejectingReader(new TypeError('Load failed'));
+      const result = await reconnectToWorkflowStream('t-1');
+      expect(result.disconnected).toBe(true);
+      expect(result.aborted).toBe(false);
+    });
+
+    it('classifies a TypeError("The network connection was lost.") read rejection as a disconnect', async () => {
+      // Forward-looking guard for the other iOS Safari string. (This literal
+      // already contains "network", so the old classifier handled it too; this
+      // test pins it down regardless of the substring.)
+      mockRejectingReader(new TypeError('The network connection was lost.'));
+      const result = await reconnectToWorkflowStream('t-1');
+      expect(result.disconnected).toBe(true);
+      expect(result.aborted).toBe(false);
     });
   });
 });

@@ -89,12 +89,24 @@ def _make_sandbox(mock_runtime):
     return sandbox
 
 
+def _exec_side_effect(command, *args, **kwargs):
+    """Default exec mock: ``wc -c`` sizes the trace before the read.
+
+    A populated trace reports a real non-zero byte count in production (an
+    absent/empty file reports 0, which short-circuits the read). Other exec
+    calls (rm, mkdir) return empty.
+    """
+    if str(command).lstrip().startswith("wc -c"):
+        return ExecResult("4096", "", 0)
+    return ExecResult("", "", 0)
+
+
 @pytest.fixture
 def mock_runtime():
     runtime = AsyncMock(spec=SandboxRuntime)
     runtime.working_dir = WORK_DIR
     runtime.fetch_working_dir = AsyncMock(return_value=WORK_DIR)
-    runtime.exec = AsyncMock(return_value=ExecResult("", "", 0))
+    runtime.exec = AsyncMock(side_effect=_exec_side_effect)
     runtime.upload_file = AsyncMock()
     runtime.code_run = AsyncMock(return_value=CodeRunResult("out", "", 0, []))
     return runtime
@@ -188,3 +200,42 @@ async def test_mcp_trace_empty_when_no_file(
 
     assert result.success is True
     assert result.mcp_trace == []
+
+
+@patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
+@pytest.mark.asyncio
+async def test_mcp_trace_skipped_when_file_over_read_cap(
+    mock_create_provider, mock_provider, mock_runtime
+):
+    # MCP_TRACE_FILE is writable by agent-authored sandbox code, so the host
+    # sizes it (wc -c) before reading. A file past the 16 MiB read cap is skipped
+    # entirely — never pulled into host memory — and yields no trace.
+    mock_create_provider.return_value = mock_provider
+    sandbox = _make_sandbox(mock_runtime)
+    over_cap = 16 * 1024 * 1024 + 1
+    mock_runtime.exec = AsyncMock(return_value=ExecResult(str(over_cap), "", 0))
+
+    trace = await sandbox._collect_mcp_trace(f"{WORK_DIR}/.system/trace/t.jsonl")
+
+    assert trace == []
+    sandbox.aread_file_text.assert_not_awaited()
+
+
+@patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
+@pytest.mark.asyncio
+async def test_mcp_trace_skips_read_when_file_absent(
+    mock_create_provider, mock_provider, mock_runtime
+):
+    # A bash/exec run that imported no MCP wrappers never creates the trace file,
+    # so `wc -c` reports 0 bytes and the read (and the rm) are skipped entirely —
+    # no wasted round-trip on the common non-MCP path.
+    mock_create_provider.return_value = mock_provider
+    sandbox = _make_sandbox(mock_runtime)
+    mock_runtime.exec = AsyncMock(return_value=ExecResult("", "", 0))
+
+    trace = await sandbox._collect_mcp_trace(f"{WORK_DIR}/.system/trace/t.jsonl")
+
+    assert trace == []
+    sandbox.aread_file_text.assert_not_awaited()
+    # Only the `wc -c` sizing ran — no read, no rm (both skipped).
+    assert mock_runtime.exec.await_count == 1

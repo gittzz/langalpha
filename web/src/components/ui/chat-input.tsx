@@ -97,6 +97,13 @@ export interface ChatInputProps {
   onSend: (message: string, planMode: boolean, attachments: ReadyAttachment[], slashCommands: SlashCommand[], modelOptions: ModelOptions) => void;
   disabled?: boolean;
   isLoading?: boolean;
+  /**
+   * A compaction is in progress with no streaming turn (manual /compact|/offload
+   * runs with isLoading=false). Surfaces the Stop button so the user can
+   * interrupt it, just like a running turn. The Enter-key send path stays open
+   * so a message typed now is queued (mirrors steering during a running turn).
+   */
+  isCompacting?: boolean;
   onStop?: () => void;
   placeholder?: string;
   files?: string[];
@@ -203,6 +210,20 @@ const BUILTIN_SLASH_COMMANDS = [
   { type: 'action', name: 'compact', aliases: ['compaction', 'summarize'] },
   { type: 'action', name: 'offload', aliases: ['truncate'] },
 ];
+
+/**
+ * Slash-menu sort key (lower sorts first). Prefix matches (name/alias starts
+ * with the query, char-by-char) rank above substring-only matches; within a
+ * tier, system/service commands rank above skills. Combined: prefix+system 0,
+ * prefix+skill 1, substring+system 2, substring+skill 3.
+ */
+function slashRank(item: SlashCommand, query: string): number {
+  const isPrefix =
+    item.name.toLowerCase().startsWith(query) ||
+    !!item.aliases?.some((a) => a.toLowerCase().startsWith(query));
+  const isSkill = item.type === 'skill';
+  return (isPrefix ? 0 : 2) + (isSkill ? 1 : 0);
+}
 
 /** Derive a short display name from a model key string. */
 function getModelDisplayName(key: string | null): string {
@@ -322,6 +343,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   onSend,
   disabled = false,
   isLoading = false,
+  isCompacting = false,
   onStop,
   placeholder = 'Type / for skills, @ for files',
   files: workspaceFiles = [],
@@ -344,7 +366,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   hasExternalContext = false,
   // Token usage (context window progress)
   tokenUsage = null,
-  // Action commands (e.g. /compact) — fired immediately on selection
+  // Action commands (e.g. /compact) — dispatched on send, not on selection
   onAction = null,
   // Model selector
   initialModel = null,
@@ -668,10 +690,10 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     else localStorage.removeItem(`fast_mode:${selectedModel}`);
   }, [fastMode, selectedModel]);
 
-  // Reset isStopping when loading finishes
+  // Reset isStopping once both a running turn and a compaction have finished.
   useEffect(() => {
-    if (!isLoading) setIsStopping(false);
-  }, [isLoading]);
+    if (!isLoading && !isCompacting) setIsStopping(false);
+  }, [isLoading, isCompacting]);
 
   const handleStop = useCallback(() => {
     if (isStopping) return;
@@ -823,13 +845,25 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     ];
     return items
       .filter((item) => !slashCommands.some((c) => c.name === item.name))
+      // Fuzzy-match on command name + aliases only — never the description.
+      // Matching the description surfaces irrelevant commands (e.g. /subagent
+      // for "comp" because its blurb says "...complete this task"); skills and
+      // builtins follow the same name-based rule.
       .filter((item) => {
         if (!query) return true;
         if (item.name.toLowerCase().includes(query)) return true;
-        if (item.description?.toLowerCase().includes(query)) return true;
         if (item.aliases?.some((a: string) => a.toLowerCase().includes(query))) return true;
         return false;
       })
+      // Rank: prefix (char-by-char from the start) matches before substring-only
+      // matches; within a tier, system/service commands (/compact, /offload,
+      // /subagent) outrank skills. So `/d` puts /dcf-model (prefix) above
+      // /offload (a system command matching "d" only mid-word), while `/comp`
+      // puts /compact above /comps-analysis (both prefix → system wins). Combined
+      // score (lower = earlier): prefix+system 0, prefix+skill 1, substr+system
+      // 2, substr+skill 3. Array.sort is stable, preserving within-tier order;
+      // sort before slice so a high-rank match never falls off the top-10.
+      .sort((a, b) => slashRank(a, query) - slashRank(b, query))
       .slice(0, 10);
   }, [skills, showSlashMenu, slashQuery, slashCommands, t]);
 
@@ -944,40 +978,27 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     const before = message.slice(0, slashStart);
     const after = message.slice(cursorPos);
 
-    // Action commands fire immediately — no pill, no send required
-    if (cmd.type === 'action') {
-      setMessage(before + after);
-      setShowSlashMenu(false);
-      setSlashStart(-1);
-      setSlashQuery('');
-      onAction?.(cmd);
-      setTimeout(() => {
-        if (textareaRef.current) {
-          textareaRef.current.focus();
-          textareaRef.current.setSelectionRange(before.length, before.length);
-        }
-      }, 0);
-    } else {
-      // Retain /{command} in textarea and add pill
-      const inserted = `/${cmd.name} `;
-      const newMsg = before + inserted + after;
-      setMessage(newMsg);
-      setShowSlashMenu(false);
-      setSlashStart(-1);
-      setSlashQuery('');
-      setSlashCommands((prev) => {
-        if (prev.some((c) => c.name === cmd.name)) return prev;
-        return [...prev, cmd];
-      });
-      const newCursor = before.length + inserted.length;
-      setTimeout(() => {
-        if (textareaRef.current) {
-          textareaRef.current.focus();
-          textareaRef.current.setSelectionRange(newCursor, newCursor);
-        }
-      }, 0);
-    }
-  }, [slashStart, message, onAction]);
+    // All commands — including system actions like /compact — insert a pill and
+    // defer execution to send. Nothing fires on mere selection; handleSend
+    // dispatches action pills via onAction when the user actually sends.
+    const inserted = `/${cmd.name} `;
+    const newMsg = before + inserted + after;
+    setMessage(newMsg);
+    setShowSlashMenu(false);
+    setSlashStart(-1);
+    setSlashQuery('');
+    setSlashCommands((prev) => {
+      if (prev.some((c) => c.name === cmd.name)) return prev;
+      return [...prev, cmd];
+    });
+    const newCursor = before.length + inserted.length;
+    setTimeout(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.setSelectionRange(newCursor, newCursor);
+      }
+    }, 0);
+  }, [slashStart, message]);
 
   const removeSlashCommand = useCallback((name: string) => {
     setSlashCommands((prev) => prev.filter((c) => c.name !== name));
@@ -1016,6 +1037,32 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
 
   const handleSend = useCallback(() => {
     if (!hasContent || disabled) return;
+
+    // System action commands (/compact, /offload) are standalone: they run on
+    // send rather than starting a chat turn. If any are present, fire them and
+    // clear the input — don't dispatch a message.
+    const actionCommands = slashCommands.filter((c) => c.type === 'action');
+    if (actionCommands.length > 0) {
+      actionCommands.forEach((c) => onAction?.(c));
+      // Fully reset the draft, same as a normal send — an action must not leave
+      // staged attachments / mentions / widget context behind for the next turn.
+      setMessage('');
+      setSlashCommands([]);
+      attachedFiles.forEach((f) => { if (f.preview) URL.revokeObjectURL(f.preview); });
+      setAttachedFiles([]);
+      setMentionedFiles([]);
+      if (widgetSnapshots.length > 0) {
+        ContextBus.clear();
+      }
+      setDeckFanned(false);
+      setShowAutocomplete(false);
+      setShowSlashMenu(false);
+      if (textareaRef.current) {
+        textareaRef.current.style.height = 'auto';
+      }
+      return;
+    }
+
     const readyAttachments = attachedFiles
       .filter((f) => f.dataUrl)
       .map((f) => ({
@@ -1062,7 +1109,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
-  }, [hasContent, disabled, message, planMode, attachedFiles, onSend, mentionedFiles, slashCommands, selectedModel, reasoningEffort, fastMode, widgetSnapshots, t]);
+  }, [hasContent, disabled, message, planMode, attachedFiles, onSend, onAction, mentionedFiles, slashCommands, selectedModel, reasoningEffort, fastMode, widgetSnapshots, t]);
 
   // --- Keyboard & Language Detection ---
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1759,14 +1806,17 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
                   </button>
                 </div>
               )}
-              {/* Send / Stop Button */}
-              {isLoading && onStop ? (
+              {/* Send / Stop Button. Stop also shows during a compaction with no
+                  streaming turn (manual /compact|/offload) so the user can
+                  interrupt it; the Enter-key send path stays open for queuing. */}
+              {(isLoading || isCompacting) && onStop ? (
                 <button
                   className="w-8 h-8 rounded-xl flex items-center justify-center transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
                   style={{ backgroundColor: isStopping ? 'var(--color-btn-danger-pressed)' : 'var(--color-btn-danger)', color: 'var(--color-text-on-accent)' }}
                   onClick={(e) => { e.stopPropagation(); handleStop(); }}
                   disabled={isStopping}
-                  title={isStopping ? 'Stopping...' : 'Stop'}
+                  title={isStopping ? t('chat.stopping') : t('chat.stop')}
+                  aria-label={isStopping ? t('chat.stopping') : t('chat.stop')}
                   type="button"
                 >
                   {isStopping ? (

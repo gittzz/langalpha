@@ -4,6 +4,7 @@
  */
 import { api } from '@/api/client';
 import { utcMsToETDate, utcMsToETTime } from '@/lib/utils';
+import type { IndexData, SparklinePoint } from '@/types/market';
 import * as portfolioApi from './portfolio';
 import * as watchlistApi from './watchlist';
 import * as watchlistItemsApi from './watchlistItems';
@@ -19,28 +20,13 @@ interface IntradayPoint {
   volume?: number;
 }
 
-interface SparklinePoint {
-  time: string;
-  val: number;
-}
-
-interface IndexData {
-  symbol: string;
-  name: string;
-  price: number;
-  change: number;
-  changePercent: number;
-  isPositive: boolean;
-  sparklineData: SparklinePoint[];
-  previousClose?: number | null;
-}
-
 interface StockPrice {
   symbol: string;
   price: number;
   change: number;
   changePercent: number;
   isPositive: boolean;
+  quoteAvailable?: boolean;
   previousClose?: number | null;
   earlyTradingChangePercent?: number | null;
   lateTradingChangePercent?: number | null;
@@ -110,6 +96,7 @@ function fallbackIndex(norm: string): IndexData {
     changePercent: 0,
     isPositive: true,
     sparklineData: [],
+    quoteAvailable: false,
   };
 }
 
@@ -132,13 +119,21 @@ export async function getIndex(symbol: string, _opts: Record<string, unknown> = 
     // Sort ascending by time (Unix ms)
     const sorted = [...pts].sort((a: IntradayPoint, b: IntradayPoint) => a.time - b.time);
 
-    // Isolate the most recent trading day, regular hours only (9:30–16:00)
-    const latestDate = utcMsToETDate(sorted[sorted.length - 1].time);
-    const todayPoints = sorted.filter((p: IntradayPoint) => {
-      if (utcMsToETDate(p.time) !== latestDate) return false;
+    // Isolate regular-hours points (9:30–16:00 ET) first, then take the most
+    // recent date that actually has them. Some indices (e.g. VIX) carry
+    // overnight/pre-market bars, so the chronologically-last bar's date can have
+    // zero regular-hours points on a pre-open day — which would blank the
+    // sparkline. `sorted` is ascending, so the regular-hours slice is too.
+    const regularHours = sorted.filter((p: IntradayPoint) => {
       const t = utcMsToETTime(p.time);
       return t >= '09:30' && t <= '16:00';
     });
+    const latestDate = regularHours.length
+      ? utcMsToETDate(regularHours[regularHours.length - 1].time)
+      : utcMsToETDate(sorted[sorted.length - 1].time);
+    const todayPoints = regularHours.length
+      ? regularHours.filter((p: IntradayPoint) => utcMsToETDate(p.time) === latestDate)
+      : sorted.filter((p: IntradayPoint) => utcMsToETDate(p.time) === latestDate);
 
     const oldest = todayPoints[0];
     const mostRecent = todayPoints[todayPoints.length - 1];
@@ -155,6 +150,10 @@ export async function getIndex(symbol: string, _opts: Record<string, unknown> = 
       change: Math.round(change * 100) / 100,
       changePercent: Math.round(changePercent * 100) / 100,
       isPositive: change >= 0,
+      // Direct getIndex consumers get the same zero/invalid-close masking the
+      // dashboard applies via the snapshot: a non-positive close isn't a quote.
+      quoteAvailable: close > 0,
+      asOfDate: latestDate,
       sparklineData: todayPoints
         .filter((p: IntradayPoint) => Number(p.close) > 0)
         .map((p: IntradayPoint) => ({ time: utcMsToETTime(p.time), val: Number(p.close) })),
@@ -182,14 +181,15 @@ export async function getIndices(symbols: string[] = INDEX_SYMBOLS, _opts: Recor
     Promise.all(list.map(async (norm: string) => {
       try {
         const result = await getIndex(norm);
-        return { symbol: norm, sparklineData: result.sparklineData };
+        return { symbol: norm, sparklineData: result.sparklineData, asOfDate: result.asOfDate };
       } catch {
-        return { symbol: norm, sparklineData: [] as SparklinePoint[] };
+        return { symbol: norm, sparklineData: [] as SparklinePoint[], asOfDate: undefined };
       }
     })),
   ]);
 
   const sparklineMap: Record<string, SparklinePoint[]> = Object.fromEntries(sparklineResults.map((r) => [r.symbol, r.sparklineData]));
+  const asOfMap: Record<string, string | undefined> = Object.fromEntries(sparklineResults.map((r) => [r.symbol, r.asOfDate]));
   const snapshotList: SnapshotEntry[] = snapshots?.snapshots || snapshots?.results || snapshots?.data || [];
   const snapshotMap: Record<string, SnapshotEntry> = Array.isArray(snapshotList)
     ? Object.fromEntries(snapshotList.map((s: SnapshotEntry) => [normalizeIndexSymbol(s.symbol), s]))
@@ -198,7 +198,11 @@ export async function getIndices(symbols: string[] = INDEX_SYMBOLS, _opts: Recor
   let failedCount = 0;
   const indices: IndexData[] = list.map((norm: string) => {
     const snap = snapshotMap[norm];
-    if (snap && snap.price != null) {
+    // Index prices are never legitimately 0; a zero/negative price means a
+    // partial provider snapshot (e.g. yfinance coercing a missing lastPrice to
+    // 0). Treat it as no quote so the card renders N/A instead of a fake
+    // "0.00 / +0.00%" — the same symptom #287 set out to kill.
+    if (snap && snap.price != null && snap.price > 0) {
       const change = snap.change ?? 0;
       const changePct = snap.change_percent ?? (snap.previous_close ? ((change / snap.previous_close) * 100) : 0);
       return {
@@ -210,10 +214,12 @@ export async function getIndices(symbols: string[] = INDEX_SYMBOLS, _opts: Recor
         isPositive: change >= 0,
         previousClose: snap.previous_close ?? null,
         sparklineData: sparklineMap[norm] || [],
+        quoteAvailable: true,
+        asOfDate: asOfMap[norm],
       };
     }
     failedCount++;
-    return { ...fallbackIndex(norm), sparklineData: sparklineMap[norm] || [] };
+    return { ...fallbackIndex(norm), sparklineData: sparklineMap[norm] || [], asOfDate: asOfMap[norm] };
   });
 
   return { indices, failedCount };
@@ -409,15 +415,17 @@ export async function getStockPrices(symbols: string[]): Promise<StockPrice[]> {
           change: Math.round(change * 100) / 100,
           changePercent: Math.round(changePct * 100) / 100,
           isPositive: change >= 0,
+          quoteAvailable: true,
           previousClose: snap.previous_close ?? null,
           earlyTradingChangePercent: snap.early_trading_change_percent ?? null,
           lateTradingChangePercent: snap.late_trading_change_percent ?? null,
         };
       }
-      return { symbol: sym, price: 0, change: 0, changePercent: 0, isPositive: true };
+      return { symbol: sym, price: 0, change: 0, changePercent: 0, isPositive: true, quoteAvailable: false };
     });
-  } catch {
-    return list.map((sym: string) => ({ symbol: sym, price: 0, change: 0, changePercent: 0, isPositive: true }));
+  } catch (e: unknown) {
+    console.error('[API] getStockPrices failed:', e instanceof Error ? e.message : String(e));
+    return list.map((sym: string) => ({ symbol: sym, price: 0, change: 0, changePercent: 0, isPositive: true, quoteAvailable: false }));
   }
 }
 

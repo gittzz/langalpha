@@ -7,6 +7,7 @@ from ptc_agent.agent.provenance.types import (
     ProvenanceSource,
     build_provenance_event,
     fingerprint_result,
+    fingerprint_result_with_body,
     hash_args,
     redact_args,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "ProvenanceSource",
     "build_provenance_event",
     "fingerprint_result",
+    "fingerprint_result_with_body",
     "hash_args",
     "redact_args",
 ]

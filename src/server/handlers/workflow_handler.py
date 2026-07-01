@@ -10,6 +10,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 
+from src.server.handlers.cancellation import cancellation_as_http
 from src.server.utils.checkpoint_helpers import (
     build_checkpoint_config,
     get_checkpointer,
@@ -83,27 +84,58 @@ async def cancel_workflow(thread_id: str, run_id: Optional[str] = None) -> dict:
         Confirmation of cancellation with thread_id
     """
     try:
-        from src.server.services.workflow_tracker import WorkflowTracker
-
-        tracker = WorkflowTracker.get_instance()
-
-        # Set cancellation flag (checked by exception handler)
-        success = await tracker.set_cancel_flag(thread_id)
-
-        # Mark workflow as cancelled immediately (don't wait for exception handler)
-        # This provides immediate feedback to frontend
-        await tracker.mark_cancelled(thread_id)
-
-        # Update thread status in database for consistency
-        from src.server.database import conversation as qr_db
-
-        await qr_db.update_thread_status(thread_id, "cancelled")
-
         from src.server.services.background_task_manager import (
             BackgroundTaskManager,
         )
 
         manager = BackgroundTaskManager.get_instance()
+        has_active = await manager.has_active_task_for_thread(thread_id)
+
+        # Manual compaction stop. A manual /compact|/offload registers no
+        # workflow task (it runs inside its own HTTP request handler), so when
+        # there is no active workflow, cancelling the in-flight compaction is
+        # the entire job. Take this path before the workflow-cancel tracker
+        # writes below (cancel flag / mark_cancelled / "cancelled" thread
+        # status) so a pure compaction stop doesn't mislabel the thread as a
+        # stopped turn. (An AUTO compaction runs inside the turn's task — there
+        # has_active is True, so we fall through and cancel_workflow's
+        # inner_task cancel interrupts the summarize.)
+        if not has_active and manager.cancel_compaction(thread_id):
+            logger.info(f"Manual compaction stopped by user: {thread_id}")
+            return {
+                "cancelled": True,
+                "thread_id": thread_id,
+                "message": "Compaction stopped.",
+            }
+
+        from src.server.services.workflow_tracker import WorkflowTracker
+
+        tracker = WorkflowTracker.get_instance()
+
+        # A /cancel that reaches here with no BTM task AND no in-flight
+        # compaction is almost always a Stop click racing a compaction that
+        # JUST finished (its finally already cleared the guard). Marking such an
+        # idle thread "cancelled" would mislabel a successful compaction as a
+        # stopped turn, so only write the cancel signal/status when a turn is
+        # genuinely active — a BTM task, or a tracker-reported ACTIVE/INTERRUPTED
+        # dispatched turn. The orphan-registry safety net below still runs.
+        turn_is_active = has_active or await _thread_turn_is_active(
+            tracker, thread_id
+        )
+
+        success = True
+        if turn_is_active:
+            # Set cancellation flag (checked by exception handler)
+            success = await tracker.set_cancel_flag(thread_id)
+
+            # Mark workflow as cancelled immediately for fast frontend feedback.
+            await tracker.mark_cancelled(thread_id)
+
+            # Update thread status in database for consistency
+            from src.server.database import conversation as qr_db
+
+            await qr_db.update_thread_status(thread_id, "cancelled")
+
         cancel_success = await manager.cancel_workflow(thread_id, run_id)
 
         if not cancel_success and not await manager.has_active_task_for_thread(
@@ -179,7 +211,6 @@ async def get_workflow_status(thread_id: str) -> dict:
                 checkpoint_info = {
                     "has_plan": False,  # PTC doesn't use plans
                     "has_final_report": bool(state_values.get("final_report")),
-                    "message_count": len(state_values.get("messages", [])),
                     "completed": len(pending_sends) == 0,
                     "checkpoint_id": checkpoint_tuple.config.get(
                         "configurable", {}
@@ -256,9 +287,14 @@ async def get_workflow_status(thread_id: str) -> dict:
             logger.debug(f"Could not fetch share status for {thread_id}: {e}")
 
         # Check if this flash thread has pending PTC report-backs
-        # (flash_watch is a Redis SET of dispatched ptc_thread_ids)
+        # (flash_watch is a Redis SET of dispatched ptc_thread_ids). When
+        # pending, surface the report-back run_id the backend recorded so the
+        # client attaches to the exact run instead of inferring it from run_id
+        # changes.
         pending_report_back = False
+        report_back_run_id = None
         try:
+            from src.server.handlers.chat.ptc_workflow import flash_rb_run_key
             from src.utils.cache.redis_cache import get_cache_client
 
             cache = get_cache_client()
@@ -266,6 +302,9 @@ async def get_workflow_status(thread_id: str) -> dict:
                 count = await cache.client.scard(f"flash_watch:{thread_id}")
                 if count and count > 0:
                     pending_report_back = True
+                    rb = await cache.get(flash_rb_run_key(thread_id))
+                    if isinstance(rb, dict):
+                        report_back_run_id = rb.get("run_id")
         except Exception:
             pass
 
@@ -281,6 +320,7 @@ async def get_workflow_status(thread_id: str) -> dict:
             "active_tasks": active_tasks,
             "is_shared": is_shared,
             "pending_report_back": pending_report_back,
+            "report_back_run_id": report_back_run_id,
         }
 
         logger.debug(f"Status check for {thread_id}: {status}")
@@ -381,7 +421,26 @@ async def _update_graph_state(
         )
 
 
-async def _require_no_active_workflow(thread_id: str, verb: str) -> None:
+def _gate_unverifiable(verb: str) -> HTTPException:
+    """409 raised when the workflow-active gate can't be verified under a
+    fail-closed verb (offload)."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "workflow_unverifiable",
+            "verb": verb,
+            "message": (
+                f"Cannot safely {verb} right now: the thread's activity status "
+                "is unavailable (the workflow tracker is down). Try again once "
+                "it recovers."
+            ),
+        },
+    )
+
+
+async def _require_no_active_workflow(
+    thread_id: str, verb: str, *, fail_closed: bool = False
+) -> None:
     """Reject manual compact/offload while a workflow is running on the thread.
 
     Both /compact and /offload perform read-modify-write on LangGraph state and
@@ -394,6 +453,12 @@ async def _require_no_active_workflow(thread_id: str, verb: str) -> None:
 
     Raises HTTPException(409) for ACTIVE / INTERRUPTED. Allows
     None / COMPLETED / CANCELLED.
+
+    When the gate can't be verified (tracker disabled / get_status raises) the
+    default is to fail OPEN — chat workflows are already degraded under a Redis
+    outage and admin actions should stay usable. ``fail_closed=True`` (used by
+    /offload, a non-critical optimization) instead raises 409 so the action is
+    skipped rather than run blind during a possibly-active turn.
     """
     from src.server.services.workflow_tracker import (
         WorkflowStatus,
@@ -401,27 +466,27 @@ async def _require_no_active_workflow(thread_id: str, verb: str) -> None:
     )
 
     tracker = WorkflowTracker.get_instance()
-    # When Redis is unavailable the tracker returns enabled=False and get_status
-    # yields None, which would silently bypass this gate. Log a warning so the
-    # operator knows the protection is off; fail open because chat workflows are
-    # also degraded under a Redis outage and admin actions should remain usable.
-    if not getattr(tracker, "enabled", True):
+
+    def _handle_unverifiable(reason: str) -> None:
+        # The gate can't confirm the thread is idle — Redis down, so either the
+        # tracker is disabled or get_status raised. Fail OPEN by default (log +
+        # continue) so admin actions stay usable while chat is already degraded;
+        # fail CLOSED (offload) by raising 409 so we never write blind into a
+        # possibly-active turn.
+        action = "skipped (fail-closed)" if fail_closed else "bypassed"
         logger.warning(
-            f"[{verb}] WorkflowTracker disabled (Redis unavailable); "
-            f"workflow-active gate bypassed for thread {thread_id}"
+            f"[{verb}] {reason}; workflow-active gate {action} for thread {thread_id}"
         )
+        if fail_closed:
+            raise _gate_unverifiable(verb)
+
+    if not getattr(tracker, "enabled", True):
+        _handle_unverifiable("WorkflowTracker disabled (Redis unavailable)")
         return
-    # Transient Redis errors during a healthy session would otherwise bubble up
-    # through trigger_compaction's broad except and surface as 500. Fail open
-    # (same as tracker.enabled=False) with a warning so admin actions stay
-    # usable and the operator can see that the gate was bypassed.
     try:
         status = await tracker.get_status(thread_id)
     except Exception as e:
-        logger.warning(
-            f"[{verb}] WorkflowTracker.get_status failed for thread {thread_id}: "
-            f"{e}; workflow-active gate bypassed"
-        )
+        _handle_unverifiable(f"WorkflowTracker.get_status failed: {e}")
         return
     if not status:
         return
@@ -449,6 +514,61 @@ async def _require_no_active_workflow(thread_id: str, verb: str) -> None:
         )
 
 
+async def _thread_turn_is_active(tracker, thread_id: str) -> bool:
+    """Best-effort: is a turn genuinely active on the thread?
+
+    Returns True for a tracker-reported ACTIVE/INTERRUPTED turn, and True
+    (fail-safe) when the tracker is disabled or errors — we cannot confirm the
+    thread is idle, so a real cancel is never skipped. Returns False only when
+    the tracker is reachable and reports no active turn.
+    """
+    from src.server.services.workflow_tracker import WorkflowStatus
+
+    if not getattr(tracker, "enabled", True):
+        return True
+    try:
+        status = await tracker.get_status(thread_id)
+    except Exception:
+        return True
+    if not status:
+        return False
+    return status.get("status") in {
+        WorkflowStatus.ACTIVE,
+        WorkflowStatus.INTERRUPTED,
+    }
+
+
+def _open_manual_compaction(manager, thread_id: str, verb: str) -> None:
+    """Open the per-thread compaction guard for a MANUAL /compact|/offload and
+    register this request's task so a user Stop (/cancel) can interrupt the
+    in-flight call. Raises 409 ``compaction_in_progress`` if another compaction
+    already holds the thread (reject rather than clobber it). Callers MUST pair
+    this with ``_close_manual_compaction`` in a finally.
+    """
+    if not manager.begin_compaction(thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "compaction_in_progress",
+                "verb": verb,
+                "message": (
+                    "Another compaction is already running on this thread. "
+                    "Wait for it to finish, then try again."
+                ),
+            },
+        )
+    task = asyncio.current_task()
+    if task is not None:
+        manager.set_compaction_task(thread_id, task)
+
+
+def _close_manual_compaction(manager, thread_id: str) -> None:
+    """Release the manual-compaction guard + task registration. Idempotent."""
+    manager.clear_compaction_task(thread_id)
+    manager.end_compaction(thread_id)
+
+
+@cancellation_as_http("compact")
 async def trigger_compaction(
     thread_id: str,
     keep_messages: int = 5,
@@ -460,6 +580,10 @@ async def trigger_compaction(
     When ``user_id`` is set, applies that user's compaction_model + profile
     so manual /compact matches the auto path.
     """
+    from src.server.services.background_task_manager import BackgroundTaskManager
+
+    manager = BackgroundTaskManager.get_instance()
+    started_compaction = False
     try:
         from ptc_agent.agent.middleware.compaction import compact_messages
         from src.server.app import setup
@@ -467,6 +591,15 @@ async def trigger_compaction(
         # Gate FIRST — before any graph state reads or writes. Otherwise we can
         # clobber the running workflow's sse_events or checkpoint state.
         await _require_no_active_workflow(thread_id, "compact")
+
+        # Open the admission guard so a concurrent message POST waits this
+        # manual compaction out instead of being admitted "fresh" and racing
+        # the checkpoint read-modify-write below (manual compaction registers no
+        # BackgroundTaskManager task). Also registers this request's task so a
+        # user Stop can interrupt the in-flight summarize. Rejects with 409 if
+        # another compaction already holds the thread.
+        _open_manual_compaction(manager, thread_id, "compact")
+        started_compaction = True
 
         agent_cfg = setup.agent_config
         if user_id and agent_cfg is not None:
@@ -596,12 +729,18 @@ async def trigger_compaction(
     except HTTPException:
         raise
     except Exception as e:
+        # CancelledError (user Stop / client disconnect) is handled by the
+        # @cancellation_as_http wrapper, which sees it after this finally runs.
         logger.exception(f"Error triggering compaction for thread {thread_id}: {e}")
         raise HTTPException(
             status_code=500, detail=f"Failed to trigger compaction: {str(e)}"
         )
+    finally:
+        if started_compaction:
+            _close_manual_compaction(manager, thread_id)
 
 
+@cancellation_as_http("offload")
 async def trigger_offload(thread_id: str) -> dict:
     """
     Manually trigger tool-arg offloading for a thread (Tier 1 only).
@@ -615,12 +754,26 @@ async def trigger_offload(thread_id: str) -> dict:
     Returns:
         Dict with success, thread_id, message_count, offloaded_args, offloaded_reads
     """
+    from src.server.services.background_task_manager import BackgroundTaskManager
+
+    manager = BackgroundTaskManager.get_instance()
+    started_compaction = False
     try:
         from ptc_agent.agent.middleware.compaction import offload_tool_args
 
         # Same gate as /compact — /offload also writes checkpoint state and
         # could race a running workflow's _offloaded_tool_call_ids updates.
-        await _require_no_active_workflow(thread_id, "offload")
+        # Fail CLOSED: offload is a non-critical optimization, so if the gate
+        # can't confirm the thread is idle we skip it rather than write into a
+        # possibly-active turn.
+        await _require_no_active_workflow(thread_id, "offload", fail_closed=True)
+
+        # Open the admission guard (same rationale as /compact): hold a
+        # concurrent message POST until this manual offload's checkpoint
+        # read-modify-write finishes, register the task so a Stop can interrupt
+        # it, and reject with 409 if another compaction is already active.
+        _open_manual_compaction(manager, thread_id, "offload")
+        started_compaction = True
 
         graph, lg_config, state, messages, backend = await _resolve_graph_and_state(
             thread_id, "offload"
@@ -702,10 +855,15 @@ async def trigger_offload(thread_id: str) -> dict:
     except HTTPException:
         raise
     except Exception as e:
+        # CancelledError (user Stop / client disconnect) is handled by the
+        # @cancellation_as_http wrapper, which sees it after this finally runs.
         logger.exception(f"Error triggering offload for thread {thread_id}: {e}")
         raise HTTPException(
             status_code=500, detail=f"Failed to trigger offload: {str(e)}"
         )
+    finally:
+        if started_compaction:
+            _close_manual_compaction(manager, thread_id)
 
 
 async def _persist_context_window_event(thread_id: str, data: dict) -> None:

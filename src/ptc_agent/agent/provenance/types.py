@@ -21,6 +21,12 @@ from datetime import datetime, timezone
 # required for cross-surface dedup.
 SNIPPET_MAX_CHARS = 500
 
+# Canonical per-body cap (bytes). Doubles as the in-sandbox transport cap on the
+# untrusted mcp_tool trace channel. The server-side body store re-declares the
+# same value locally (to stay out of the agent import graph); both copies MUST
+# hold this number.
+RESULT_BODY_MAX_BYTES = 64 * 1024
+
 
 @dataclass
 class ProvenanceSource:
@@ -49,6 +55,11 @@ class ProvenanceSource:
     result_sha256: str | None = None
     result_size: int | None = None
     result_snippet: str | None = None
+    # Transient: the full (redacted) per-access body whose hash is
+    # ``result_sha256``. Consumed live by ProvenanceMiddleware to write the
+    # content-addressed body store; intentionally NOT carried by
+    # ``build_provenance_event`` so it never rides the SSE event.
+    result_body: str | None = None
     agent: str | None = None
 
 
@@ -72,6 +83,15 @@ def _canonicalize(value: object) -> str:
             return ""
 
 
+def _fingerprint_canonical(canonical: str) -> tuple[str, int, str]:
+    """Fingerprint an already-canonical string as ``(sha256_hex, byte_size, snippet)``."""
+    encoded = canonical.encode("utf-8")
+    sha256_hex = hashlib.sha256(encoded).hexdigest()
+    size = len(encoded)
+    snippet = canonical[:SNIPPET_MAX_CHARS]
+    return sha256_hex, size, snippet
+
+
 def fingerprint_result(value: object) -> tuple[str, int, str]:
     """Fingerprint a tool result as ``(sha256_hex, utf8_byte_size, snippet)``.
 
@@ -80,12 +100,20 @@ def fingerprint_result(value: object) -> tuple[str, int, str]:
     characters of the canonical string, truncated on a char boundary; it may
     contain NUL — downstream Postgres sanitization strips that, not this.
     """
+    return _fingerprint_canonical(_canonicalize(value))
+
+
+def fingerprint_result_with_body(value: object) -> tuple[str, int, str, str]:
+    """Like :func:`fingerprint_result`, plus the canonical string itself.
+
+    Canonicalizes ``value`` once and returns ``(sha256_hex, size, snippet,
+    canonical)``, so a caller storing the full body reuses the exact string that
+    produced ``sha256_hex`` — byte-identity with ``result_sha256`` is structural,
+    and a large dict/list is serialized once instead of twice.
+    """
     canonical = _canonicalize(value)
-    encoded = canonical.encode("utf-8")
-    sha256_hex = hashlib.sha256(encoded).hexdigest()
-    size = len(encoded)
-    snippet = canonical[:SNIPPET_MAX_CHARS]
-    return sha256_hex, size, snippet
+    sha256_hex, size, snippet = _fingerprint_canonical(canonical)
+    return sha256_hex, size, snippet, canonical
 
 
 def hash_args(args: object) -> dict | None:

@@ -5,6 +5,8 @@ by_source_type summary shape. Mirrors the dependency-override + AsyncClient
 pattern used by the other threads route tests. Neutral placeholder data only.
 """
 
+import hashlib
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -51,6 +53,212 @@ def _row(turn_index, response_id, source_type, identifier, sha):
         "provider": "tavily",
         "created_at": datetime.now(timezone.utc),
     }
+
+
+def _body_meta(body_inline, *, byte_len=None, object_key=None):
+    return {
+        "body_inline": body_inline,
+        "object_key": object_key,
+        "byte_len": byte_len if byte_len is not None else len(body_inline.encode()),
+        "content_type": "text/plain; charset=utf-8",
+    }
+
+
+@asynccontextmanager
+async def _fake_db_conn():
+    yield AsyncMock()
+
+
+@contextmanager
+def _patch_body_store(owner, rows, bodies, *, full_body=None):
+    """Patch owner + record lookups + the body-store reads the verifier endpoints use.
+
+    Patches both the list read (``get_provenance_body_refs``, used by ``/bodies``,
+    which the endpoint filters + caps in SQL) and the targeted single-record read
+    (``get_provenance_record``, used by ``/{id}/body``); the latter matches ``rows``
+    by record id so unknown ids 404.
+    """
+
+    async def _get_record(thread_id, record_id):
+        return next(
+            (r for r in rows if str(r["provenance_record_id"]) == str(record_id)),
+            None,
+        )
+
+    async def _get_body_refs(conn, thread_id, limit):
+        # Mirror the SQL: eligible rows in order, capped at limit + 1.
+        eligible = [r for r in rows if r.get("result_sha256")]
+        return eligible[: limit + 1]
+
+    patches = [
+        patch(
+            "src.server.database.conversation.get_thread_owner_id",
+            new=AsyncMock(return_value=owner),
+        ),
+        patch(
+            "src.server.app.threads.get_provenance_body_refs",
+            new=AsyncMock(side_effect=_get_body_refs),
+        ),
+        patch(
+            "src.server.app.threads.get_provenance_record",
+            new=AsyncMock(side_effect=_get_record),
+        ),
+        patch(
+            "src.server.database.conversation.get_db_connection",
+            new=_fake_db_conn,
+        ),
+        patch(
+            "src.server.database.provenance_bodies.fetch_result_bodies",
+            new=AsyncMock(return_value=bodies),
+        ),
+        patch(
+            "src.server.database.provenance_bodies.fetch_full_body",
+            new=AsyncMock(return_value=full_body),
+        ),
+    ]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        yield
+
+
+class TestGetProvenanceBodies:
+    @pytest.mark.asyncio
+    async def test_verified_true_when_body_hashes_to_sha(self, threads_client):
+        body = "the exact bytes the agent reasoned over"
+        sha = hashlib.sha256(body.encode()).hexdigest()
+        rows = [_row(0, RESPONSE_0, "web_fetch", "https://x.test/a", sha)]
+        bodies = {sha: _body_meta(body)}
+        with _patch_body_store(OWNER_ID, rows, bodies):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/bodies"
+            )
+        assert resp.status_code == 200
+        rec = resp.json()["records"][0]
+        assert rec["result_sha256"] == sha
+        assert rec["truncated"] is False
+        assert rec["verified"] is True
+
+    @pytest.mark.asyncio
+    async def test_verified_false_when_body_redacted(self, threads_client):
+        # Stored body was redacted, so it no longer hashes to the raw-content sha:
+        # present + not truncated + verified=False is the redaction signal.
+        raw_sha = hashlib.sha256(b"raw body with a secret").hexdigest()
+        redacted = "raw body with [REDACTED]"
+        rows = [_row(0, RESPONSE_0, "web_fetch", "https://x.test/a", raw_sha)]
+        bodies = {raw_sha: _body_meta(redacted)}
+        with _patch_body_store(OWNER_ID, rows, bodies):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/bodies"
+            )
+        rec = resp.json()["records"][0]
+        assert rec["truncated"] is False
+        assert rec["verified"] is False
+
+    @pytest.mark.asyncio
+    async def test_redacted_inline_body_is_not_truncated(self, threads_client):
+        # A body that redaction shrank stays COMPLETE. `byte_len` tracks the stored
+        # (post-redaction) length, `body_inline` holds the whole redacted body, and
+        # there's no spilled object — so `truncated` is False even when the original
+        # was larger (this is the case that mislabeled when byte_len was the raw
+        # pre-redaction size: a body redacted from over the inline cap down to under
+        # it is whole, not a head). The "not the raw bytes" signal is `verified=false`.
+        raw_body = b"api_key=sk-supersecretvalue-0123456789abcdef"
+        raw_sha = hashlib.sha256(raw_body).hexdigest()
+        redacted = "api_key=[REDACTED:API_KEY]"
+        assert len(redacted.encode()) < len(raw_body)  # redaction shortened it
+        rows = [_row(0, RESPONSE_0, "web_fetch", "https://x.test/a", raw_sha)]
+        # byte_len = stored (redacted) length, as _body_item records it post-redaction.
+        bodies = {raw_sha: _body_meta(redacted)}
+        with _patch_body_store(OWNER_ID, rows, bodies):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/bodies"
+            )
+        rec = resp.json()["records"][0]
+        assert rec["body_inline"] == redacted  # complete redacted body, not a head
+        assert rec["truncated"] is False
+        assert rec["verified"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_bucket_head_is_truncated(self, threads_client):
+        # Over-cap body with no object store configured → only the inline head was
+        # kept (object_key None). The stored byte_len exceeds the inline slice, so
+        # truncated flips True without a spilled object — the head is incomplete.
+        head = "h" * 200
+        sha = "b" * 64
+        rows = [_row(0, RESPONSE_0, "web_fetch", "https://x.test/a", sha)]
+        bodies = {sha: _body_meta(head, byte_len=500_000, object_key=None)}
+        with _patch_body_store(OWNER_ID, rows, bodies):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/bodies"
+            )
+        rec = resp.json()["records"][0]
+        assert rec["truncated"] is True
+        assert rec["verified"] is False
+
+    @pytest.mark.asyncio
+    async def test_truncated_head_is_not_verified(self, threads_client):
+        head = "h" * 100
+        sha = "a" * 64
+        rows = [_row(0, RESPONSE_0, "web_fetch", "https://x.test/a", sha)]
+        # byte_len far exceeds the inline head → truncated, can't verify the head.
+        bodies = {sha: _body_meta(head, byte_len=500_000, object_key="provenance/x")}
+        with _patch_body_store(OWNER_ID, rows, bodies):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/bodies"
+            )
+        rec = resp.json()["records"][0]
+        assert rec["truncated"] is True
+        assert rec["verified"] is False
+
+    @pytest.mark.asyncio
+    async def test_capped_when_more_than_limit(self, threads_client):
+        rows = [
+            _row(0, RESPONSE_0, "web_fetch", f"https://x.test/{i}", f"{i:064d}")
+            for i in range(3)
+        ]
+        bodies = {f"{i:064d}": _body_meta(f"body {i}") for i in range(3)}
+        with _patch_body_store(OWNER_ID, rows, bodies):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/bodies?limit=1"
+            )
+        body = resp.json()
+        assert body["capped"] is True
+        assert len(body["records"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_owner_returns_403(self, threads_client):
+        with _patch_body_store("someone-else", [], {}):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/bodies"
+            )
+        assert resp.status_code == 403
+
+
+class TestGetProvenanceRecordBody:
+    @pytest.mark.asyncio
+    async def test_full_body_verified(self, threads_client):
+        body = "full body content the agent saw"
+        sha = hashlib.sha256(body.encode()).hexdigest()
+        rows = [_row(0, RESPONSE_0, "web_fetch", "doc", sha)]
+        bodies = {sha: _body_meta(body)}
+        with _patch_body_store(OWNER_ID, rows, bodies, full_body=body):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/rec-doc/body?full=true"
+            )
+        assert resp.status_code == 200
+        out = resp.json()
+        assert out["body"] == body
+        assert out["verified"] is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_record_returns_404(self, threads_client):
+        rows = [_row(0, RESPONSE_0, "web_fetch", "doc", "a" * 64)]
+        with _patch_body_store(OWNER_ID, rows, {}):
+            resp = await threads_client.get(
+                f"/api/v1/threads/{THREAD_ID}/provenance/rec-MISSING/body"
+            )
+        assert resp.status_code == 404
 
 
 class TestGetProvenanceAuth:

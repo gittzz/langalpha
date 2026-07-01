@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import psycopg
 from fastapi import HTTPException
@@ -34,7 +34,6 @@ from src.server.services.persistence.conversation import (
 )
 from src.server.services.workflow_tracker import WorkflowTracker
 from src.server.utils.skill_context import (
-    build_skill_content,
     detect_slash_commands,
     parse_skill_contexts,
 )
@@ -524,47 +523,68 @@ async def persist_or_skip_replay(
         )
 
 
-def inject_skills(
+def _slash_text_target(content: Any) -> tuple[str, dict | None]:
+    """Locate the leading-slash text for command detection in a user message.
+
+    Returns ``(text, block)`` where ``block`` is the content-list element to
+    rewrite when stripping the prefix (``None`` for plain-string content). User
+    content is a block list when a supported attachment rewrites it
+    (``inject_multimodal_context``) or the client sends a multi-part message;
+    without scanning it, slash commands on those turns would be invisible. Only a
+    block whose text starts with ``/`` is considered, so attachment-label blocks
+    never false-match.
+    """
+    if isinstance(content, str):
+        return content, None
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "") or ""
+                if text.startswith("/"):
+                    return text, block
+    return "", None
+
+
+def prepare_skill_contexts(
     messages: list[dict],
     request: ChatRequest,
-    config,
     mode: str,
-) -> list[str]:
-    """Detect and inject skill content into the last user message.
+) -> list[dict]:
+    """Resolve which skills this turn activates, for the agent to inject.
 
-    Handles slash-command detection as a fallback when ``additional_context``
-    does not contain ``skill_contexts``.
-
-    Returns the list of loaded skill names.
+    Parses ``additional_context`` skill items and, as a fallback when none are
+    present, detects a leading ``/command`` in the last user message (stripping
+    the prefix in place). Returns plain ``{"name", "instruction"}`` dicts to thread
+    through ``config["configurable"]["skill_contexts"]`` — ``SkillsMiddleware`` then
+    loads the SKILL.md body once and dedups against bodies already live in the
+    thread. No body loading or checkpoint reads happen here.
     """
-    loaded_skill_names: list[str] = []
     skill_contexts = parse_skill_contexts(request.additional_context)
 
-    # Detect slash commands from message text (fallback for missing additional_context)
+    # Detect slash commands from message text (fallback for missing additional_context).
+    # Handles both plain-string content and the content-block list a supported
+    # attachment leaves behind, so `/cmd` + an image/PDF still activates the skill.
     if not skill_contexts and not request.hitl_response and messages:
         last_msg = messages[-1]
-        msg_text = last_msg.get("content", "") if isinstance(last_msg.get("content"), str) else ""
+        msg_text, text_block = _slash_text_target(last_msg.get("content"))
         if msg_text:
             cleaned_text, detected = detect_slash_commands(msg_text, mode=mode)
             if detected:
                 skill_contexts = detected
                 if cleaned_text != msg_text:
-                    last_msg["content"] = cleaned_text
+                    if text_block is None:
+                        last_msg["content"] = cleaned_text
+                    else:
+                        text_block["text"] = cleaned_text
 
     if skill_contexts:
-        skill_dirs = [
-            local_dir
-            for local_dir, _ in config.skills.local_skill_dirs_with_sandbox()
-        ]
-        skill_result = build_skill_content(
-            skill_contexts, skill_dirs=skill_dirs, mode=mode
+        logger.info(
+            f"[{mode.upper()}_CHAT] Skills requested: {[s.name for s in skill_contexts]}"
         )
-        if skill_result:
-            _append_to_last_user_message(messages, "\n\n" + skill_result.content)
-            loaded_skill_names = skill_result.loaded_skill_names
-            logger.info(f"[{mode.upper()}_CHAT] Skills injected: {loaded_skill_names}")
 
-    return loaded_skill_names
+    return [
+        {"name": s.name, "instruction": s.instruction} for s in skill_contexts
+    ]
 
 
 def build_graph_config(
@@ -580,11 +600,15 @@ def build_graph_config(
     recursion_limit: int,
     plan_mode: bool | None = None,
     extra_configurable: dict | None = None,
+    skill_contexts: list[dict] | None = None,
+    skill_dirs: list[str] | None = None,
 ) -> dict:
     """Build the LangGraph ``config`` dict shared by flash and PTC handlers.
 
     ``mode`` should be ``"flash"`` or ``"ptc"``.
     ``extra_configurable`` is an optional dict merged into ``configurable``.
+    ``skill_contexts`` (+ ``skill_dirs``) are passed to ``SkillsMiddleware`` so it
+    injects each requested skill's SKILL.md body once; omit on HITL/replay turns.
     """
     workflow_type = "flash_agent" if mode == "flash" else "ptc_agent"
 
@@ -616,6 +640,10 @@ def build_graph_config(
     }
     if extra_configurable:
         configurable.update(extra_configurable)
+    if skill_contexts:
+        configurable["skill_contexts"] = skill_contexts
+        if skill_dirs:
+            configurable["skill_dirs"] = skill_dirs
 
     graph_config: dict = {
         "configurable": configurable,
@@ -633,6 +661,41 @@ def build_graph_config(
         graph_config["callbacks"] = [token_callback]
 
     return graph_config
+
+
+# Structured codes carried by every in-generator admission-conflict 409
+# (``admission_conflict_detail`` and ``wait_or_steer``). ``handle_workflow_error``
+# keys its skip-persist/skip-mark_failed path on these so a non-admission 409
+# can't be mistaken for one. ``request_cancelled`` (from the cancellation
+# wrapper) is included defensively though it does not currently reach this path.
+ADMISSION_CONFLICT_CODES = {"stopping", "compacting", "running", "request_cancelled"}
+
+
+def admission_conflict_detail(thread_id: str, state: str) -> dict:
+    """Map a non-fresh admission state to the dispatched-flow 409 detail.
+
+    Dispatched (X-Dispatch=background) turns can't steer, so any non-fresh peer
+    is a conflict. Returns a structured ``{"code", "message"}`` dict so
+    ``handle_workflow_error`` can tag the SSE error with the code and the client
+    can recognize the transient state; ``thread_id`` is kept out of the
+    user-facing message so it can't leak into the UI on a client-state desync.
+    Shared by the PTC and Flash handlers so the per-state wording lives in one
+    place.
+    """
+    if state == "stopping":
+        return {
+            "code": "stopping",
+            "message": "The workflow is stopping. Wait a moment, then retry.",
+        }
+    if state == "compacting":
+        return {
+            "code": "compacting",
+            "message": "The assistant is compacting its context. Wait a moment, then retry.",
+        }
+    return {
+        "code": "running",
+        "message": "The workflow is still running; the follow-up could not be admitted.",
+    }
 
 
 async def wait_or_steer(
@@ -665,10 +728,31 @@ async def wait_or_steer(
     if state == "stopping":
         raise HTTPException(
             status_code=409,
-            detail=(
-                f"Workflow {thread_id} is stopping. "
-                "Wait a moment, then retry your message."
-            ),
+            detail={
+                "code": "stopping",
+                "message": (
+                    "The workflow is stopping. "
+                    "Wait a moment, then retry your message."
+                ),
+            },
+        )
+
+    # An in-progress compaction outlasted the admission wait. Must come BEFORE
+    # the steer fallback — steering mid-summarize corrupts the context rewrite,
+    # and a manual compaction has no turn to steer into. Structured detail
+    # (code) so the client can recognize this as a transient/retryable state and
+    # re-queue rather than surfacing a hard error banner; no thread_id in the
+    # user-facing message (it would leak into the UI on a client-state desync).
+    if state == "compacting":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "compacting",
+                "message": (
+                    "The assistant is compacting its context. "
+                    "Wait a moment, then resend your message."
+                ),
+            },
         )
 
     # state == "running" → steer the running workflow immediately.
@@ -686,10 +770,13 @@ async def wait_or_steer(
     # Fallback: raise 409 if steering failed
     raise HTTPException(
         status_code=409,
-        detail=(
-            f"Workflow {thread_id} is still running. "
-            "Wait a moment, or use /reconnect to continue streaming, or /cancel to stop it."
-        ),
+        detail={
+            "code": "running",
+            "message": (
+                "The workflow is still running. Wait a moment, then retry — "
+                "or use /reconnect to continue streaming, or /cancel to stop it."
+            ),
+        },
     )
 
 
@@ -717,6 +804,41 @@ async def handle_workflow_error(
     error occurred before the workspace was resolved.
     ``timezone_str`` is the resolved timezone; falls back to ``request.timezone``.
     """
+    # An admission-conflict 409 is a deliberate protocol response (raised
+    # in-generator by ``wait_or_steer`` or the dispatched gate), not a workflow
+    # execution failure. Surface it to the client as an SSE error, but never
+    # persist it as a conversation error or call ``mark_failed``: this path runs
+    # with ``run_id=None``, the run_id guard is skipped when run_id is None, so
+    # marking failed would clobber a concurrently-running peer turn's status
+    # (defeating the guard). Keyed on the structured admission CODE, not the bare
+    # 409 status: every admission 409 now carries ``detail={"code", ...}`` (see
+    # ``admission_conflict_detail`` / ``wait_or_steer``), so any other
+    # HTTPException — a 503, or even a future non-admission 409 from middleware —
+    # falls through to the persist + mark_failed + classify path below.
+    if (
+        isinstance(e, HTTPException)
+        and e.status_code == 409
+        and isinstance(e.detail, dict)
+        and e.detail.get("code") in ADMISSION_CONFLICT_CODES
+    ):
+        await release_burst_slot(user_id)
+        # The guard above already proved e.detail is a dict whose "code" is in
+        # ADMISSION_CONFLICT_CODES (truthy), so no re-checking is needed here.
+        detail = e.detail
+        error_payload = {
+            "thread_id": thread_id,
+            "error": detail.get("message"),
+            "type": "workflow_error",
+            "error_type": "admission_conflict",
+            "error_class": type(e).__name__,
+            "code": detail["code"],
+        }
+        if handler:
+            yield handler._format_sse_event("error", error_payload)
+        else:
+            yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
+        return
+
     MAX_RETRIES = get_max_workflow_retries()
 
     # Release burst slot on error (setup errors before background task starts)

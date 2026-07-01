@@ -36,6 +36,8 @@ from src.config.settings import (
     get_redis_ttl_workflow_events,
     get_shutdown_timeout,
     get_checkpoint_flush_timeout,
+    get_admission_compaction_wait_timeout,
+    get_compaction_timeout,
     get_sse_drain_timeout,
     get_wait_for_persistence_timeout,
     get_stop_drain_timeout,
@@ -220,6 +222,13 @@ class BackgroundTaskManager:
     # second checkpoint writer.
     _ADMISSION_TEARDOWN_MARGIN_S = 2.0
 
+    # Admission floors its compaction wait at compaction_timeout + this margin so
+    # a healthy in-progress compaction is never 409'd before its own call budget
+    # self-terminates. The margin covers the compaction's post-LLM work (state
+    # write + persistence) and the except-handler cleanup that finally sets the
+    # guard's Event after the call returns or times out.
+    _COMPACTION_ADMISSION_MARGIN_S = 20.0
+
     def __init__(self):
         # Keyed by (thread_id, run_id). One slot per turn; no cross-turn
         # aliasing because run_id is fresh per POST.
@@ -247,6 +256,33 @@ class BackgroundTaskManager:
         # teardown can cancel any collector that would otherwise mutate the
         # persisted response after the user has stopped the turn.
         self._orphan_collectors: Dict[str, set[asyncio.Task]] = {}
+
+        # Per-thread compaction guard. An entry means a compaction (auto Tier-2
+        # summarize or manual /compact|/offload) is in progress on the thread;
+        # its Event stays UNSET until the compaction finishes, then is .set() so
+        # admission waiters proceed. Admission blocks on this BEFORE acquiring
+        # task_lock (the running turn buffers SSE events under task_lock, and
+        # those events are what eventually clear this flag).
+        #
+        # SINGLE-PROCESS ASSUMPTION: this guard is in-process only (like
+        # task_lock / admission_lock). For the AUTO path the in-flight turn is
+        # also tracked cross-process via WorkflowTracker (Redis), but the MANUAL
+        # /compact|/offload checkpoint race is closed SOLELY by this in-memory
+        # guard. server.py runs a single uvicorn worker today; under
+        # ``uvicorn --workers N`` (or multiple replicas) a message POST routed
+        # to another worker would not see this guard and could race the manual
+        # checkpoint write. Scaling out requires a Redis-backed guard (mirror
+        # WorkflowTracker) before bumping the worker count.
+        self._compacting: Dict[str, asyncio.Event] = {}
+
+        # Per-thread MANUAL compaction task registry. A manual /compact|/offload
+        # registers no BackgroundTaskManager task (it runs inside its own HTTP
+        # request handler), so a user Stop has nothing to cancel via the normal
+        # inner_task path. We record the request's asyncio.Task here so
+        # cancel_compaction can interrupt the in-flight LLM call; the cancelled
+        # task's finally releases the admission guard. AUTO compaction runs
+        # inside the turn's own task and is interrupted via cancel_workflow.
+        self._compaction_tasks: Dict[str, asyncio.Task] = {}
 
     @classmethod
     def get_instance(cls) -> 'BackgroundTaskManager':
@@ -760,8 +796,19 @@ class BackgroundTaskManager:
             if not values:
                 return
 
+            # Exclude `messages` from the re-write. The committed messages are
+            # already in this snapshot and carry forward on the DeltaChannel, so
+            # re-writing the full list only re-applies every message as a delta —
+            # and any still-id-less tail message appends as a duplicate (the
+            # reducer keys dedup on id). The remaining keys (private compaction /
+            # offload state) are last-write-wins, so re-writing them is idempotent.
+            flush_values = {k: v for k, v in values.items() if k != "messages"}
+            if not flush_values:
+                return
+
             await asyncio.wait_for(
-                graph_any.aupdate_state(config, values), timeout=get_checkpoint_flush_timeout()
+                graph_any.aupdate_state(config, flush_values),
+                timeout=get_checkpoint_flush_timeout(),
             )
             logger.info(f"[BackgroundTaskManager] Flushed checkpoint for {thread_id}")
         except asyncio.TimeoutError:
@@ -1563,6 +1610,30 @@ class BackgroundTaskManager:
             )
             return False
 
+    async def _clear_report_back_watch(self, thread_id: str, metadata: dict) -> None:
+        """Best-effort clear of the flash report-back watch on a terminal run.
+
+        A report-back flash run carries ``report_back_ptc_thread_id`` in its
+        metadata; when it fails or is cancelled the watch is never consumed by
+        the success-only completion hook, so clear it here to stop ``/status``
+        reporting the report-back as pending until the keys' 24h TTL.
+        """
+        ptc_thread_id = (metadata or {}).get("report_back_ptc_thread_id")
+        if not ptc_thread_id:
+            return
+        try:
+            from src.server.handlers.chat.ptc_workflow import clear_flash_report_back
+            from src.utils.cache.redis_cache import get_cache_client
+
+            cache = get_cache_client()
+            if cache.enabled and cache.client:
+                await clear_flash_report_back(cache, ptc_thread_id, thread_id)
+        except Exception as e:
+            logger.warning(
+                f"[BackgroundTaskManager] report-back watch clear failed for "
+                f"{thread_id}: {e}"
+            )
+
     async def _mark_failed(
         self,
         thread_id: str,
@@ -1647,6 +1718,8 @@ class BackgroundTaskManager:
             logger.warning(
                 f"[BackgroundTaskManager] tracker.mark_failed failed for {key}: {tracker_err}"
             )
+
+        await self._clear_report_back_watch(thread_id, metadata)
 
         task_info.persistence_complete.set()
         async with self.task_lock:
@@ -1905,6 +1978,8 @@ class BackgroundTaskManager:
                 f"[BackgroundTaskManager] tracker.mark_cancelled failed for {key}: {tracker_err}"
             )
 
+        await self._clear_report_back_watch(thread_id, metadata)
+
         task_info.persistence_complete.set()
         async with self.task_lock:
             self._release_terminal_refs(thread_id, run_id)
@@ -2047,11 +2122,21 @@ class BackgroundTaskManager:
             return True
 
     async def cancel_stale_workflow(
-        self, thread_id: str, timeout: float = 10.0
+        self,
+        thread_id: str,
+        timeout: float = 10.0,
+        exclude_run_id: Optional[str] = None,
     ) -> bool:
-        """Cancel a stale workflow on the given thread."""
+        """Cancel a stale workflow on the given thread.
+
+        ``exclude_run_id`` skips that run when locating the stale task, so a
+        dispatched flow can pass its own pre-registered placeholder's run_id and
+        not cancel the very run it is about to start.
+        """
         async with self.task_lock:
-            task_info = self._find_active_for_thread(thread_id)
+            task_info = self._find_active_for_thread(
+                thread_id, exclude_run_id=exclude_run_id
+            )
             if not task_info:
                 return False
 
@@ -2112,11 +2197,60 @@ class BackgroundTaskManager:
             "active_connections": active_connections,
         }
 
+    # ---------- compaction admission guard ----------
+
+    def begin_compaction(self, thread_id: str) -> bool:
+        """Mark ``thread_id`` as compacting. Atomic check-and-set (synchronous,
+        so no other coroutine runs between the check and the assignment).
+
+        Returns ``True`` if this call opened the window, ``False`` if one was
+        already open — manual callers treat ``False`` as "already compacting".
+        """
+        if thread_id in self._compacting:
+            return False
+        self._compacting[thread_id] = asyncio.Event()
+        return True
+
+    def end_compaction(self, thread_id: str) -> None:
+        """Close ``thread_id``'s compaction window and release any admission
+        waiters. Idempotent — safe to call from a finally safety net."""
+        ev = self._compacting.pop(thread_id, None)
+        if ev is not None:
+            ev.set()
+
+    def compaction_event(self, thread_id: str) -> Optional[asyncio.Event]:
+        """Return the in-progress compaction Event for ``thread_id``, or None."""
+        return self._compacting.get(thread_id)
+
+    def set_compaction_task(self, thread_id: str, task: asyncio.Task) -> None:
+        """Register the asyncio Task running a MANUAL compaction so a user Stop
+        (/cancel) can interrupt the in-flight LLM call."""
+        self._compaction_tasks[thread_id] = task
+
+    def clear_compaction_task(self, thread_id: str) -> None:
+        """Unregister the manual-compaction task. Idempotent — safe from a
+        finally block."""
+        self._compaction_tasks.pop(thread_id, None)
+
+    def cancel_compaction(self, thread_id: str) -> bool:
+        """Cancel an in-flight MANUAL compaction on ``thread_id``.
+
+        Returns True if a live task was registered and ``cancel()`` was issued.
+        The cancelled task's finally releases the admission guard
+        (``end_compaction``); we do not pop here so that finally stays the
+        single owner of cleanup.
+        """
+        task = self._compaction_tasks.get(thread_id)
+        if task is not None and not task.done():
+            task.cancel()
+            return True
+        return False
+
     async def wait_for_admission(
         self,
         thread_id: str,
         exclude_run_id: Optional[str] = None,
-    ) -> Literal["fresh", "running", "stopping"]:
+    ) -> Literal["fresh", "running", "stopping", "compacting"]:
         """Decide whether a new turn can start on ``thread_id``.
 
         Returns one of:
@@ -2127,10 +2261,36 @@ class BackgroundTaskManager:
         - ``"stopping"`` — a turn was explicitly cancelled and is still tearing
           down past the wait: 409 "stopping, retry" (never start a second
           writer while ``_flush_checkpoint`` may still be writing this thread).
+        - ``"compacting"`` — a compaction was in progress and did not finish
+          within the wait window: 409 "compacting, retry".
 
         ``exclude_run_id`` lets dispatched callers ignore their own
         pre-registered placeholder while checking for OTHER active runs.
         """
+        # Hold the new turn until any in-progress compaction finishes, then run
+        # the normal scan: an auto compaction leaves the turn RUNNING (caller
+        # steers); a manual compaction leaves no task (caller starts fresh).
+        # This MUST happen before acquiring task_lock — the running turn buffers
+        # the SSE events that clear this flag under task_lock.
+        ev = self.compaction_event(thread_id)
+        if ev is not None:
+            # Floor the wait at compaction_timeout + margin so a healthy
+            # compaction is never 409'd before its own call budget self-
+            # terminates and the except-handler cleanup sets this Event.
+            backstop = max(
+                get_admission_compaction_wait_timeout(),
+                get_compaction_timeout() + self._COMPACTION_ADMISSION_MARGIN_S,
+            )
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=backstop)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[BackgroundTaskManager] Compaction on thread {thread_id} "
+                    f"did not finish within admission wait; rejecting new turn "
+                    f"with 409 (compacting)"
+                )
+                return "compacting"
+
         async with self.task_lock:
             task_info = self._find_active_for_thread(
                 thread_id, exclude_run_id=exclude_run_id

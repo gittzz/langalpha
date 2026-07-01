@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import psycopg
 import pytest
 
+from src.server.models.additional_context import SkillContext
 
 COMMON = "src.server.handlers.chat._common"
 
@@ -774,6 +775,34 @@ class TestBuildGraphConfig:
         config = self._build(timezone_str="UTC")
         assert config["configurable"]["timezone"] == "UTC"
 
+    def test_skill_contexts_and_dirs_threaded_to_configurable(self):
+        """The server→middleware handoff: both skill_contexts and skill_dirs must
+        land in ``configurable`` so SkillsMiddleware can inject + locate bodies."""
+        config = self._build(
+            skill_contexts=[{"name": "chart-annotation", "instruction": "AAPL:1d"}],
+            skill_dirs=["/skills"],
+        )
+        assert config["configurable"]["skill_contexts"] == [
+            {"name": "chart-annotation", "instruction": "AAPL:1d"}
+        ]
+        assert config["configurable"]["skill_dirs"] == ["/skills"]
+
+    def test_skill_contexts_without_dirs_omits_dirs(self):
+        """skill_dirs is nested under the skill_contexts gate; contexts may be
+        present while dirs default (middleware falls back to project_root/skills)."""
+        config = self._build(
+            skill_contexts=[{"name": "research"}], skill_dirs=None
+        )
+        assert config["configurable"]["skill_contexts"] == [{"name": "research"}]
+        assert "skill_dirs" not in config["configurable"]
+
+    def test_skill_dirs_without_contexts_is_dropped(self):
+        """No skills requested → neither key is set, even if skill_dirs is passed
+        (the ``if skill_contexts`` gate guards the whole block)."""
+        config = self._build(skill_contexts=None, skill_dirs=["/skills"])
+        assert "skill_contexts" not in config["configurable"]
+        assert "skill_dirs" not in config["configurable"]
+
 
 # ---------------------------------------------------------------------------
 # wait_or_steer
@@ -840,6 +869,11 @@ class TestWaitOrSteer:
             await wait_or_steer(manager, "t-1", "hello", "u-1")
 
         assert exc_info.value.status_code == 409
+        # Structured detail so handle_workflow_error can tag the SSE error code.
+        detail = exc_info.value.detail
+        assert isinstance(detail, dict)
+        assert detail["code"] == "stopping"
+        assert "t-1" not in detail["message"]
         mock_steer.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -862,6 +896,283 @@ class TestWaitOrSteer:
             await wait_or_steer(manager, "t-1", "hello", "u-1")
 
         assert exc_info.value.status_code == 409
+        detail = exc_info.value.detail
+        assert isinstance(detail, dict)
+        assert detail["code"] == "running"
+        assert "t-1" not in detail["message"]
+
+    @pytest.mark.asyncio
+    async def test_compacting_raises_409_without_steering(self):
+        """A thread mid-compaction whose wait timed out → 409 'compacting',
+        never steered (steering mid-summarize corrupts the context rewrite)."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import wait_or_steer
+
+        manager = AsyncMock()
+        manager.wait_for_admission = AsyncMock(return_value="compacting")
+
+        with (
+            patch(
+                "src.server.handlers.chat.steering.steer_thread",
+                new_callable=AsyncMock,
+            ) as mock_steer,
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await wait_or_steer(manager, "t-1", "hello", "u-1")
+
+        assert exc_info.value.status_code == 409
+        # Structured detail so the client can recognize the transient state and
+        # re-queue; no thread_id leaked into the user-facing message.
+        detail = exc_info.value.detail
+        assert isinstance(detail, dict)
+        assert detail["code"] == "compacting"
+        assert "t-1" not in detail["message"]
+        mock_steer.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# admission_conflict_detail (dispatched-flow 409 message mapping)
+# ---------------------------------------------------------------------------
+
+
+class TestAdmissionConflictDetail:
+    """The dispatched (X-Dispatch=background) flow can't steer, so a non-fresh
+    admission state becomes a 409. This shared helper maps the admission state
+    to its retry message — same mapping for PTC and Flash."""
+
+    def test_compacting_state_names_compaction(self):
+        from src.server.handlers.chat._common import admission_conflict_detail
+
+        detail = admission_conflict_detail("t-1", "compacting")
+        # Structured detail (code + message) so handle_workflow_error can tag the
+        # SSE error with a code and the client can recognize a transient state.
+        assert isinstance(detail, dict)
+        assert detail["code"] == "compacting"
+        assert "compacting" in detail["message"].lower()
+        assert "retry" in detail["message"].lower() or "resend" in detail["message"].lower()
+
+    def test_stopping_state_names_stopping(self):
+        from src.server.handlers.chat._common import admission_conflict_detail
+
+        detail = admission_conflict_detail("t-1", "stopping")
+        assert isinstance(detail, dict)
+        assert detail["code"] == "stopping"
+        assert "stopping" in detail["message"].lower()
+
+    def test_running_state_is_the_generic_fallback(self):
+        from src.server.handlers.chat._common import admission_conflict_detail
+
+        # Any other non-fresh state (e.g. "running") falls through to the
+        # "still running" code.
+        detail = admission_conflict_detail("t-1", "running")
+        assert isinstance(detail, dict)
+        assert detail["code"] == "running"
+        assert "still running" in detail["message"].lower()
+
+    def test_unknown_state_falls_back_to_generic(self):
+        from src.server.handlers.chat._common import admission_conflict_detail
+
+        detail = admission_conflict_detail("t-1", "wedged")
+        assert detail["code"] == "running"
+        assert "still running" in detail["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# handle_workflow_error — HTTPException (admission conflict) handling
+# ---------------------------------------------------------------------------
+
+
+class TestHandleWorkflowErrorHTTPException:
+    """An HTTPException reaching the workflow error handler is a deliberate
+    protocol response (e.g. a 409 admission conflict raised in-generator by
+    wait_or_steer / the dispatched gate), not an execution failure. It must
+    surface to the client as an SSE error but never persist a conversation
+    error or call mark_failed — mark_failed runs with run_id=None here, and
+    the run_id guard is skipped when run_id is None, so it would clobber a
+    concurrently-running peer turn's status to FAILED."""
+
+    @pytest.mark.asyncio
+    async def test_http_exception_surfaces_error_but_skips_persist_and_mark_failed(
+        self,
+    ):
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import handle_workflow_error
+
+        exc = HTTPException(
+            status_code=409,
+            detail={"code": "compacting", "message": "compacting; retry shortly"},
+        )
+
+        persistence_service = AsyncMock()
+        tracker = AsyncMock()
+        handler = MagicMock()
+        handler.get_tool_usage = MagicMock(return_value=None)
+        handler.get_sse_events = MagicMock(return_value=None)
+        handler._format_sse_event = MagicMock(
+            side_effect=lambda ev, data: f"event: {ev}\ndata: {data}\n\n"
+        )
+        request = MagicMock()
+        request.workspace_id = None
+        request.locale = None
+        request.timezone = None
+
+        with (
+            patch(
+                "src.server.handlers.chat._common.WorkflowTracker"
+            ) as mock_tracker_cls,
+            patch(
+                "src.server.handlers.chat._common.release_burst_slot",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tracker_cls.get_instance.return_value = tracker
+            events = [
+                ev
+                async for ev in handle_workflow_error(
+                    exc,
+                    thread_id="t-1",
+                    user_id="u-1",
+                    workspace_id="w-1",
+                    handler=handler,
+                    token_callback=None,
+                    persistence_service=persistence_service,
+                    start_time=0.0,
+                    request=request,
+                    is_byok=False,
+                    msg_type="ptc",
+                    log_prefix="PTC_TEST",
+                )
+            ]
+
+        # The client still sees a clean error event...
+        assert any("event: error" in ev for ev in events)
+        assert any("compacting" in ev for ev in events)
+        # ...but the conflict is never persisted as a turn failure and never
+        # clobbers the (possibly peer-owned) tracker status.
+        persistence_service.persist_error.assert_not_awaited()
+        tracker.mark_failed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_409_http_exception_is_persisted_and_marked_failed(self):
+        """The skip path is scoped to the 409 admission/cancellation contract.
+        A non-409 HTTPException (e.g. a 503 raised because the agent isn't
+        initialized) is a genuine failure: it must flow through the normal
+        failure path — persist the error, mark the turn failed, and be labeled
+        as a real workflow error, NOT mislabeled as an admission conflict."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import handle_workflow_error
+
+        exc = HTTPException(status_code=503, detail="backend not ready")
+
+        persistence_service = AsyncMock()
+        tracker = AsyncMock()
+        handler = MagicMock()
+        handler.get_tool_usage = MagicMock(return_value=None)
+        handler.get_sse_events = MagicMock(return_value=None)
+        handler._format_sse_event = MagicMock(
+            side_effect=lambda ev, data: f"event: {ev}\ndata: {data}\n\n"
+        )
+        request = MagicMock()
+        request.workspace_id = None
+        request.locale = None
+        request.timezone = None
+
+        with (
+            patch(
+                "src.server.handlers.chat._common.WorkflowTracker"
+            ) as mock_tracker_cls,
+            patch(
+                "src.server.handlers.chat._common.release_burst_slot",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tracker_cls.get_instance.return_value = tracker
+            events = [
+                ev
+                async for ev in handle_workflow_error(
+                    exc,
+                    thread_id="t-1",
+                    user_id="u-1",
+                    workspace_id="w-1",
+                    handler=handler,
+                    token_callback=None,
+                    persistence_service=persistence_service,
+                    start_time=0.0,
+                    request=request,
+                    is_byok=False,
+                    msg_type="ptc",
+                    log_prefix="PTC_TEST",
+                )
+            ]
+
+        # A genuine 503 is persisted and marked failed (real failure path)...
+        persistence_service.persist_error.assert_awaited()
+        tracker.mark_failed.assert_awaited()
+        # ...and is never mislabeled as a transient admission conflict.
+        assert not any("admission_conflict" in ev for ev in events)
+
+    @pytest.mark.asyncio
+    async def test_409_without_admission_code_is_persisted_and_marked_failed(self):
+        """The skip path is keyed on the admission-conflict CODE, not the bare
+        409 status. A 409 raised elsewhere in the generator (no structured
+        admission code) is a genuine failure: it must persist + mark_failed, not
+        silently skip them — otherwise a future non-admission 409 would clobber a
+        peer turn the same way the original bug #2 did."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import handle_workflow_error
+
+        # A plain-string 409 (no {"code": ...}) — e.g. a future conflict raised
+        # by middleware — must NOT be treated as an admission conflict.
+        exc = HTTPException(status_code=409, detail="some unrelated conflict")
+
+        persistence_service = AsyncMock()
+        tracker = AsyncMock()
+        handler = MagicMock()
+        handler.get_tool_usage = MagicMock(return_value=None)
+        handler.get_sse_events = MagicMock(return_value=None)
+        handler._format_sse_event = MagicMock(
+            side_effect=lambda ev, data: f"event: {ev}\ndata: {data}\n\n"
+        )
+        request = MagicMock()
+        request.workspace_id = None
+        request.locale = None
+        request.timezone = None
+
+        with (
+            patch(
+                "src.server.handlers.chat._common.WorkflowTracker"
+            ) as mock_tracker_cls,
+            patch(
+                "src.server.handlers.chat._common.release_burst_slot",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tracker_cls.get_instance.return_value = tracker
+            events = [
+                ev
+                async for ev in handle_workflow_error(
+                    exc,
+                    thread_id="t-1",
+                    user_id="u-1",
+                    workspace_id="w-1",
+                    handler=handler,
+                    token_callback=None,
+                    persistence_service=persistence_service,
+                    start_time=0.0,
+                    request=request,
+                    is_byok=False,
+                    msg_type="ptc",
+                    log_prefix="PTC_TEST",
+                )
+            ]
+
+        persistence_service.persist_error.assert_awaited()
+        tracker.mark_failed.assert_awaited()
+        assert not any("admission_conflict" in ev for ev in events)
 
 
 # ---------------------------------------------------------------------------
@@ -993,95 +1304,130 @@ class TestSetupSteeringTracking:
 
 
 # ---------------------------------------------------------------------------
-# inject_skills
+# prepare_skill_contexts
 # ---------------------------------------------------------------------------
 
 
-class TestInjectSkills:
+class TestPrepareSkillContexts:
     def test_no_skills_returns_empty(self):
-        from src.server.handlers.chat._common import inject_skills
+        from src.server.handlers.chat._common import prepare_skill_contexts
 
         request = MagicMock()
         request.additional_context = None
         request.hitl_response = None
         messages = [{"role": "user", "content": "hello"}]
-        config = MagicMock()
 
         with patch(f"{COMMON}.parse_skill_contexts", return_value=[]):
-            result = inject_skills(messages, request, config, mode="flash")
+            result = prepare_skill_contexts(messages, request, mode="flash")
 
         assert result == []
 
     def test_skill_from_additional_context(self):
-        from src.server.handlers.chat._common import inject_skills
+        from src.server.handlers.chat._common import prepare_skill_contexts
 
         request = MagicMock()
         request.additional_context = [MagicMock(type="skills")]
         request.hitl_response = None
         messages = [{"role": "user", "content": "hello"}]
-        config = MagicMock()
-        config.skills.local_skill_dirs_with_sandbox.return_value = [
-            ("/skills/dir", "/sandbox/dir")
-        ]
 
-        skill_result = MagicMock()
-        skill_result.content = "skill content"
-        skill_result.loaded_skill_names = ["research"]
+        ctx = SkillContext(type="skills", name="research", instruction="find news")
+        with patch(f"{COMMON}.parse_skill_contexts", return_value=[ctx]):
+            result = prepare_skill_contexts(messages, request, mode="flash")
 
-        with (
-            patch(f"{COMMON}.parse_skill_contexts", return_value=["skill_ctx"]),
-            patch(f"{COMMON}.build_skill_content", return_value=skill_result),
-        ):
-            result = inject_skills(messages, request, config, mode="flash")
+        # Returns plain dicts to thread through config; no body injected here.
+        assert result == [{"name": "research", "instruction": "find news"}]
+        assert messages[0]["content"] == "hello"
 
-        assert result == ["research"]
-        assert "skill content" in messages[0]["content"]
-
-    def test_slash_command_detection_fallback(self):
-        from src.server.handlers.chat._common import inject_skills
+    def test_slash_command_detection_fallback_strips_prefix(self):
+        from src.server.handlers.chat._common import prepare_skill_contexts
 
         request = MagicMock()
         request.additional_context = None
         request.hitl_response = None
         messages = [{"role": "user", "content": "/research market analysis"}]
-        config = MagicMock()
-        config.skills.local_skill_dirs_with_sandbox.return_value = []
 
-        detected_skill = MagicMock()
-        skill_result = MagicMock()
-        skill_result.content = "research skill loaded"
-        skill_result.loaded_skill_names = ["research"]
-
+        ctx = SkillContext(type="skills", name="research")
         with (
             patch(f"{COMMON}.parse_skill_contexts", return_value=[]),
             patch(
                 f"{COMMON}.detect_slash_commands",
-                return_value=("market analysis", [detected_skill]),
+                return_value=("market analysis", [ctx]),
             ),
-            patch(f"{COMMON}.build_skill_content", return_value=skill_result),
         ):
-            result = inject_skills(messages, request, config, mode="flash")
+            result = prepare_skill_contexts(messages, request, mode="flash")
 
-        assert result == ["research"]
-        # The message text should be cleaned (slash command stripped) then
-        # skill content appended
-        assert messages[0]["content"].startswith("market analysis")
-        assert "research skill loaded" in messages[0]["content"]
+        assert result == [{"name": "research", "instruction": None}]
+        # The /command prefix is stripped in place; no skill body appended.
+        assert messages[0]["content"] == "market analysis"
 
     def test_hitl_response_skips_slash_detection(self):
-        from src.server.handlers.chat._common import inject_skills
+        from src.server.handlers.chat._common import prepare_skill_contexts
 
         request = MagicMock()
         request.additional_context = None
         request.hitl_response = {"int-1": {}}
         messages = [{"role": "user", "content": "/research something"}]
-        config = MagicMock()
 
         with (
             patch(f"{COMMON}.parse_skill_contexts", return_value=[]),
             patch(f"{COMMON}.detect_slash_commands") as mock_detect,
         ):
-            result = inject_skills(messages, request, config, mode="flash")
+            result = prepare_skill_contexts(messages, request, mode="flash")
+
+        mock_detect.assert_not_called()
+        assert result == []
+
+    def test_slash_detection_on_multimodal_list_content(self):
+        """A supported attachment rewrites content into a block list; the slash
+        command must still activate, be stripped in its own text block, and leave
+        the attachment blocks intact."""
+        from src.server.handlers.chat._common import prepare_skill_contexts
+
+        request = MagicMock()
+        request.additional_context = None
+        request.hitl_response = None
+        image_block = {"type": "image_url", "image_url": {"url": "data:image/png;x"}}
+        text_block = {"type": "text", "text": "/research market analysis"}
+        messages = [{"role": "user", "content": [image_block, text_block]}]
+
+        ctx = SkillContext(type="skills", name="research")
+        with (
+            patch(f"{COMMON}.parse_skill_contexts", return_value=[]),
+            patch(
+                f"{COMMON}.detect_slash_commands",
+                return_value=("market analysis", [ctx]),
+            ),
+        ):
+            result = prepare_skill_contexts(messages, request, mode="flash")
+
+        assert result == [{"name": "research", "instruction": None}]
+        # Prefix stripped in the text block; the image block survives untouched.
+        assert messages[0]["content"][0] is image_block
+        assert messages[0]["content"][1]["text"] == "market analysis"
+
+    def test_list_content_without_slash_block_skips_detection(self):
+        """List content whose text blocks don't lead with `/` activates nothing."""
+        from src.server.handlers.chat._common import prepare_skill_contexts
+
+        request = MagicMock()
+        request.additional_context = None
+        request.hitl_response = None
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Attached image: chart.png]"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;x"}},
+                    {"type": "text", "text": "what do you see"},
+                ],
+            }
+        ]
+
+        with (
+            patch(f"{COMMON}.parse_skill_contexts", return_value=[]),
+            patch(f"{COMMON}.detect_slash_commands") as mock_detect,
+        ):
+            result = prepare_skill_contexts(messages, request, mode="flash")
 
         mock_detect.assert_not_called()
         assert result == []

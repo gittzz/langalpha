@@ -6,6 +6,7 @@ from typing import Any
 import structlog
 
 from ptc_agent.agent.provenance import SNIPPET_MAX_CHARS
+from ptc_agent.agent.provenance.types import RESULT_BODY_MAX_BYTES
 from ptc_agent.config.core import MCPServerConfig
 
 from .mcp_registry import MCPToolInfo
@@ -28,7 +29,16 @@ logger = structlog.get_logger(__name__)
 # re-uploaded to a reused sandbox. Folding this constant into the tool_modules
 # version makes a bump force the regenerated client onto every workspace on its
 # next sync. See ptc_sandbox._compute_sandbox_manifest.
-MCP_CLIENT_CODEGEN_VERSION = "1"
+MCP_CLIENT_CODEGEN_VERSION = "2"
+
+# Aggregate per-execution ceiling on result_body bytes emitted BY THE GENERATED
+# CLIENT, interpolated into it. This keeps a cooperative run's trace small (per
+# call still capped at RESULT_BODY_MAX_BYTES; this bounds their sum to ~4 MiB).
+# It is NOT a host-memory security bound: MCP_TRACE_FILE is visible to agent
+# code, which can append to the JSONL directly and bypass this counter. The hard
+# host-side bound on what _collect_mcp_trace reads lives in ptc_sandbox (it sizes
+# the file and skips one far past any legit trace).
+RESULT_BODY_TRACE_BUDGET_BYTES = 4 * 1024 * 1024
 
 
 def _safe_func_name(name: str) -> str:
@@ -972,6 +982,22 @@ _sse_sessions: dict[str, bool] = {{}}  # server_name -> initialized
 # MCP server configurations
 _SERVER_CONFIGS = {servers_dict}
 {vault_block}
+# Per-execution running sum of emitted result_body bytes. Each execute_code runs
+# in a FRESH interpreter process — both the Daytona and Docker providers spawn a
+# new `python` per code_run (a one-shot run, NOT a persistent kernel/session), so
+# this module is re-imported and the counter resets to 0 every run. It therefore
+# accumulates only across the MCP calls within ONE execute_code, never session-
+# wide. Caps interpolated at codegen
+# time from agent/provenance/types.py (RESULT_BODY_MAX_BYTES = per-call body cap;
+# the budget is the aggregate ceiling): once the running sum crosses the budget
+# we stop emitting result_body (snippet/sha/size still recorded) to keep a
+# cooperative run's trace small. This is a courtesy bound only — agent code can
+# write MCP_TRACE_FILE directly; the hard host-memory bound is in
+# ptc_sandbox._collect_mcp_trace, which sizes the file before reading it.
+_RESULT_BODY_MAX_BYTES = {RESULT_BODY_MAX_BYTES}
+_RESULT_BODY_TRACE_BUDGET_BYTES = {RESULT_BODY_TRACE_BUDGET_BYTES}
+_result_body_emitted_bytes = 0
+
 
 def _trace_mcp_call(server: str, tool: str, args: Any, result: Any) -> None:
     """Append one JSONL provenance line for an MCP call (best-effort, never raises).
@@ -980,6 +1006,7 @@ def _trace_mcp_call(server: str, tool: str, args: Any, result: Any) -> None:
     computed in-sandbox and must reproduce the host-side fingerprint_result
     contract byte-for-byte.
     """
+    global _result_body_emitted_bytes
     try:
         trace_file = os.environ.get("MCP_TRACE_FILE")
         if not trace_file:
@@ -1002,6 +1029,8 @@ def _trace_mcp_call(server: str, tool: str, args: Any, result: Any) -> None:
             "tool": tool,
             "args": args if isinstance(args, dict) else {{}},
             "result_sha256": hashlib.sha256(encoded).hexdigest(),
+            # TRUE full byte length — independent of the body cap below, so the
+            # host can derive truncation as byte_len > len(stored body).
             "result_size": len(encoded),
             # Cap interpolated from the canonical SNIPPET_MAX_CHARS in
             # agent/provenance/types.py at codegen time, so host + sandbox
@@ -1009,6 +1038,15 @@ def _trace_mcp_call(server: str, tool: str, args: Any, result: Any) -> None:
             "result_snippet": canonical[:{SNIPPET_MAX_CHARS}],
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }}
+        # Per-call body = first RESULT_BODY_MAX_BYTES *bytes* of the canonical
+        # result (decode with errors="ignore" so a multibyte char split at the
+        # cap is dropped, not mojibake). Hash-consistent: the body is a prefix of
+        # the exact bytes that produced result_sha256. Skip once the aggregate
+        # per-execution budget is exhausted — snippet/sha/size always survive.
+        if _result_body_emitted_bytes < _RESULT_BODY_TRACE_BUDGET_BYTES:
+            body = encoded[:_RESULT_BODY_MAX_BYTES].decode("utf-8", errors="ignore")
+            entry["result_body"] = body
+            _result_body_emitted_bytes += len(body.encode("utf-8"))
         os.makedirs(os.path.dirname(trace_file), exist_ok=True)
         with open(trace_file, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, default=str, ensure_ascii=False) + "\\n")

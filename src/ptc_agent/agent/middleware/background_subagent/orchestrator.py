@@ -10,6 +10,7 @@ from typing import Any
 import structlog
 from langchain_core.messages import HumanMessage
 
+from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.middleware.background_subagent.middleware import (
     BackgroundSubagentMiddleware,
 )
@@ -113,7 +114,7 @@ class BackgroundSubagentOrchestrator:
                 )
                 await self.agent.aupdate_state(
                     config,
-                    {"messages": [notification_message]},
+                    {"messages": ensure_message_ids([notification_message])},
                     as_node="__start__",
                 )
                 current_state = None  # Resume from updated checkpoint
@@ -145,7 +146,7 @@ class BackgroundSubagentOrchestrator:
                     )
                     await self.agent.aupdate_state(
                         config,
-                        {"messages": [notification_message]},
+                        {"messages": ensure_message_ids([notification_message])},
                         as_node="__start__",
                     )
                     current_state = None  # Resume from updated checkpoint
@@ -250,7 +251,7 @@ class BackgroundSubagentOrchestrator:
                 )
                 await self.agent.aupdate_state(
                     config,
-                    {"messages": [notification_message]},
+                    {"messages": ensure_message_ids([notification_message])},
                     as_node="__start__",
                 )
                 current_state = None  # Resume from updated checkpoint
@@ -304,7 +305,7 @@ class BackgroundSubagentOrchestrator:
             )
             await self.agent.aupdate_state(
                 config,
-                {"messages": [notification_message]},
+                {"messages": ensure_message_ids([notification_message])},
                 as_node="__start__",
             )
             current_state = None  # Resume from updated checkpoint
@@ -420,7 +421,7 @@ class BackgroundSubagentOrchestrator:
         )
         await self.agent.aupdate_state(
             config,
-            {"messages": [trigger]},
+            {"messages": ensure_message_ids([trigger])},
             as_node="__start__",
         )
         return True

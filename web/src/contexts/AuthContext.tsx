@@ -1,10 +1,12 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { supabase } from '../lib/supabase';
-import { setTokenGetter } from '../api/client';
+import { setTokenGetter, setTokenRefresher } from '../api/client';
 import { queryKeys } from '../lib/queryKeys';
 import { OAUTH_BROADCAST_CHANNEL, OAUTH_POPUP_WINDOW_NAME, OAUTH_POPUP_FEATURES } from '../lib/oauthPopup';
 import { clearFlashWorkspaceCache } from '@/pages/MarketView/utils/flashWorkspace';
+import { resetNavPanelExpansion } from '@/pages/ChatAgent/components/navExpansionStore';
+import { resetStableNavOrder, resetSharedWorkspaceThreads } from '@/pages/ChatAgent/hooks/useNavigationData';
 
 import type { AuthResponse, OAuthResponse, Provider, Session } from '@supabase/supabase-js';
 
@@ -65,6 +67,9 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
   const wireTokenGetter = useCallback(() => {
     setTokenGetter(() =>
       sb.auth.getSession().then((r) => r.data.session?.access_token ?? null)
+    );
+    setTokenRefresher(() =>
+      sb.auth.refreshSession().then((r) => r.data.session?.access_token ?? null)
     );
   }, [sb]);
 
@@ -142,7 +147,14 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
         // Logged out — wipe all cached data
         queryClient.clear();
         clearFlashWorkspaceCache();
+        // Module-level nav stores live on globalThis (no page reload on logout),
+        // so they'd otherwise leak one user's folders/thread lists into the next
+        // user's session on a shared tab. Reset them on every sign-out.
+        resetNavPanelExpansion();
+        resetStableNavOrder();
+        resetSharedWorkspaceThreads();
         setTokenGetter(() => Promise.resolve(null));
+        setTokenRefresher(() => Promise.resolve(null));
       }
     });
 

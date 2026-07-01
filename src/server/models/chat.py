@@ -8,9 +8,32 @@ that use the ptc-agent library for code execution in Daytona sandboxes.
 import copy
 from typing import Any, Dict, List, Literal, Mapping, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.server.models.additional_context import AdditionalContext
+
+# Roles the chat path can VALIDLY persist into the ``messages`` channel. The
+# chat path writes ``{"role", "content"}`` dicts straight in; under DeltaChannel
+# that raw write is stored BEFORE the reducer runs, so a role must clear TWO bars:
+#
+#   1. ``convert_to_messages`` must rebuild it from ``{"role", "content"}`` alone
+#      — it is replayed on every reconstruction. ``tool``/``function`` fail here:
+#      they map to ToolMessage/FunctionMessage and need ``tool_call_id``/``name``
+#      ``ChatMessage`` can't supply, so they raise on every resume and brick the
+#      thread.
+#   2. langgraph's ``ensure_message_ids`` must STAMP it at ``put_writes`` (role in
+#      langgraph's ``_MESSAGE_ROLES``). An accepted-but-unstamped role persists
+#      id-less; the hard-stop checkpoint flush / offload write the full list back
+#      via ``aupdate_state`` (which does NOT re-run ``ensure_message_ids``), and the
+#      non-minting reducer can't dedup an id-less message, so it DUPLICATES.
+#
+# ``developer`` clears bar 1 (``convert_to_messages`` maps it to SystemMessage) but
+# FAILS bar 2 (not in langgraph's ``_MESSAGE_ROLES``), so it is excluded — clients
+# wanting developer semantics send ``system``, which maps identically and stamps.
+# ``role`` is client-controlled; reject the rest with a clean 422 before persisting.
+_VALID_MESSAGE_ROLES = frozenset(
+    {"user", "assistant", "system", "human", "ai"}
+)
 
 
 # =============================================================================
@@ -169,6 +192,22 @@ class ChatMessage(BaseModel):
         description="The content of the message, either a string or a list of content items",
     )
 
+    @field_validator("role")
+    @classmethod
+    def _validate_role(cls, v: str) -> str:
+        """Reject roles unsafe under delta replay — see ``_VALID_MESSAGE_ROLES``.
+
+        An unsupported role either raises in ``convert_to_messages`` on every
+        reconstruction (a bricked thread) or persists id-less and duplicates on
+        the hard-stop flush; both are rejected with a 422 before anything persists.
+        """
+        if v not in _VALID_MESSAGE_ROLES:
+            allowed = ", ".join(sorted(_VALID_MESSAGE_ROLES))
+            raise ValueError(
+                f"Unsupported message role {v!r}. Must be one of: {allowed}."
+            )
+        return v
+
 
 # =============================================================================
 # Chat Request/Response Models
@@ -261,6 +300,15 @@ class ChatRequest(BaseModel):
     query_type: Optional[str] = Field(
         default=None,
         description="Override query_type for this request. Internal use only.",
+    )
+
+    # Internal: PTC thread id whose report-back this flash run consumes. When a
+    # flash report-back run (dispatched after PTC completion) finishes, its
+    # completion hook clears the durable flash_watch entry for this PTC thread.
+    report_back_ptc_thread_id: Optional[str] = Field(
+        default=None,
+        description="PTC thread id this flash report-back run consumes. "
+        "Internal use only.",
     )
 
     # External thread identity (for channel integrations like Telegram, Slack)

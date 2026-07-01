@@ -89,6 +89,8 @@ background_execution:
   sse_drain_timeout: 30                 # Seconds to wait for per-task SSE drain before clearing events
   shutdown_timeout: 50                  # Max seconds for graceful shutdown of running workflows
   checkpoint_flush_timeout: 10          # Timeout for checkpoint state reads/writes
+  admission_compaction_wait_timeout: 180 # Max seconds a new turn waits at admission for an in-progress compaction before returning "compacting" -> 409. Summarize is a full LLM call over a large transcript and can run minutes, so this is generous to avoid spurious 409s; keep it under the governing in-request limits — the upstream nginx proxy_read_timeout and the client read timeout (the connection is held open this long while the new turn waits). NOTE: server.py timeout_keep_alive (300) is NOT the bound — it only caps idle time BETWEEN requests, not an in-flight request. Admission floors this at compaction_timeout + ~20s so a healthy compaction is never 409'd before its own call budget self-terminates
+  compaction_timeout: 180               # Wall-clock budget for a single compaction LLM call (auto Tier-2 summarize + manual /compact). Wrapped in asyncio.wait_for so a hung summarize fails naturally instead of blocking the thread forever; bounded below the httpx client timeout (600) and below admission_compaction_wait_timeout
   wait_for_persistence_timeout: 30      # Max seconds callers block waiting for persistence
   stop_drain_timeout: 1.5               # Max seconds to drain killed-subagent events before teardown sentinel
   max_workflow_retries: 3               # Max transient-error retry count

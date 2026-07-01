@@ -97,6 +97,13 @@ const PROPOSAL_DATA_KEY_MAP: Record<string, string> = {
 /** Secretary action interrupt types (for type guard in handlers). */
 const SECRETARY_ACTION_TYPES = new Set(['delete_workspace', 'stop_workspace', 'delete_thread']);
 
+/**
+ * Stop polling `/status` for a PTC report-back after this many ~3s ticks (~3min)
+ * so a report-back that never arrives (e.g. PTC dispatch failed, flash_watch
+ * never cleared) doesn't poll forever.
+ */
+const REPORT_BACK_MAX_POLLS = 60;
+
 /** Pending HITL interrupt state. */
 interface PendingInterrupt {
   type?: string;
@@ -169,6 +176,8 @@ interface WorkflowStatusResponse {
   active_tasks?: string[];
   is_shared?: boolean;
   pending_report_back?: boolean;
+  report_back_run_id?: string | null;
+  run_id?: string | null;
   [key: string]: unknown;
 }
 
@@ -539,6 +548,22 @@ export function useChatMessages(
   // Widen this union when backend adds a new sandbox_state discriminator.
   const [workspaceStarting, setWorkspaceStarting] = useState<false | 'starting' | 'archived'>(false);
   const [isCompacting, setIsCompacting] = useState<string | false>(false);  // Context compaction in progress (summarize/offload)
+  // A message the user pressed Send on while the agent was compacting. Held
+  // until compaction finishes (mirrors the backend admission gate, which 409s
+  // a POST that arrives mid-compaction), then auto-sent: steered if a turn is
+  // still running, else a fresh turn. queuedSend (the preview text) drives the
+  // chip; queuedSendRef holds the full payload to replay.
+  const [queuedSend, setQueuedSend] = useState<string | false>(false);
+  const queuedSendRef = useRef<{
+    message: string;
+    planMode: boolean;
+    additionalContext: Record<string, unknown>[] | null;
+    attachmentMeta: Record<string, unknown>[] | null;
+    modelOptions: ModelOptions;
+    // id of the optimistic shimmer bubble shown while parked, so it can be
+    // removed on flush (before the real send re-adds it) or on stop.
+    messageId: string;
+  } | null>(null);
   const [messageError, setMessageError] = useState<string | StructuredError | null>(null);
   // Steering returned by the server (agent finished before consuming it)
   const [returnedSteering, setReturnedSteering] = useState<string | null>(null);
@@ -573,10 +598,38 @@ export function useChatMessages(
   // the client-side reader stops immediately (instant stop) — the matching POST
   // /cancel tears down the backend run. Null when no main stream is in flight.
   const mainStreamAbortRef = useRef<AbortController | null>(null);
+  // The reconnect that currently owns the "Reconnecting…" spinner. Its finally
+  // clears the spinner only if it's still the owner — a newer reconnect takes
+  // ownership and manages its own spinner, so a stale/superseded reconnect can
+  // neither clobber the new one's spinner nor strand its own.
+  const isReconnectingOwnerRef = useRef<AbortController | null>(null);
+  // The thread a reconnect stream is attached to (set when reconnectToStream
+  // marks isStreamingRef). Lets the thread-load effect tell "this thread is
+  // streaming" (skip the load) from "a DIFFERENT thread is streaming" (e.g. a
+  // flash report-back) — in the latter case it supersedes that stream so the
+  // navigated-to thread can still load and reconnect. Null when no reconnect
+  // stream is in flight.
+  const streamingThreadIdRef = useRef<string | null>(null);
   // Guards finalizeStreamingMessage / stopWorkflow so a double-click stop (or
   // handler re-entry) doesn't append duplicate synthetic close events. Cleared
   // on the next send.
   const wasStoppedRef = useRef(false);
+  // Set by the foreground (visibilitychange/pageshow) handler when it aborts a
+  // likely-dead main stream on tab resume, so the stream's result handler
+  // re-kicks the existing reconnect instead of treating the abort as a user
+  // stop. Consumed (cleared) by the send/reconnect/HITL/checkpoint result
+  // sites; also reset at every stream entry point (alongside wasStoppedRef) so
+  // a stream type that doesn't consume it (e.g. steering) can't leak a stale
+  // flag into a later abort and mis-fire a reconnect onto the wrong turn.
+  const backgroundReconnectRef = useRef(false);
+  // True once the tab was GENUINELY suspended (Page Lifecycle `pagehide`/`freeze`)
+  // since it last became visible — the only state in which the SSE socket was
+  // actually torn down. A plain desktop tab-switch fires `visibilitychange` but
+  // NOT these, and keeps the socket alive; gating the foreground reconnect on
+  // this flag means alt-tabbing never aborts a healthy stream (no regression for
+  // non-suspended users). Set on suspend, consumed+cleared by the first resume
+  // handler so one suspend→resume cycle triggers at most one reconnect.
+  const tabSuspendedRef = useRef(false);
 
   // Refs for history loading state
   const historyLoadingRef = useRef(false);
@@ -606,6 +659,19 @@ export function useChatMessages(
   // Track if streaming is in progress to prevent history loading during streaming
   const isStreamingRef = useRef(false);
 
+  // (isStreamingRef, streamingThreadIdRef) are one invariant: a reconnect stream
+  // is owned by exactly one thread, or none. Mutate them only through these so
+  // the flag and the owner can never drift out of sync (the supersede logic and
+  // the thread-load guard both depend on them agreeing).
+  const acquireStreamOwnership = (tid: string | null) => {
+    isStreamingRef.current = true;
+    streamingThreadIdRef.current = tid;
+  };
+  const releaseStreamOwnership = () => {
+    isStreamingRef.current = false;
+    streamingThreadIdRef.current = null;
+  };
+
   // Feedback state: { [turnIndex]: { rating, ... } }
   const feedbackMapRef = useRef<Record<number, { rating: string | null; [key: string]: unknown }>>({});
 
@@ -628,6 +694,24 @@ export function useChatMessages(
   // Report-back watch: after PTC dispatch, watch for the flash report-back workflow via SSE
   const awaitingReportBackRef = useRef(false);
   const reportBackWatchAbortRef = useRef<AbortController | null>(null);
+  const reportBackPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The flash thread the active report-back watch belongs to. The watch is keyed
+  // to this thread, NOT the visible thread, so it survives navigation into the
+  // dispatched PTC thread and only renders when this flash thread is back on
+  // screen. This is what lets the flash report-back and a live PTC stream coexist
+  // instead of fighting over the single visible-thread slot. Null when no watch.
+  const reportBackWatchThreadIdRef = useRef<string | null>(null);
+  // The report-back run id once the backend names it (wake payload or /status).
+  // Captured even while the user is away on the PTC thread, so the report-back
+  // still streams when they return to the flash thread. Cleared on attach/stop.
+  const reportBackRunIdRef = useRef<string | null>(null);
+  // Generation token for the report-back watch. Bumped whenever a watch is torn
+  // down (consume, hard-stop, re-arm for a DIFFERENT flash thread, unmount). An
+  // in-flight wake/poll callback captures its generation and bails if it no
+  // longer matches. (Can't key off threadIdRef: it has two writers — the
+  // prop-sync effect and the stream metadata handler — that disagree transiently
+  // on a fresh thread, which would bail even the in-session case.)
+  const reportBackWatchEpochRef = useRef(0);
 
   // Track the last received SSE event ID for reconnection
   const lastEventIdRef = useRef<number | string | null>(null);
@@ -688,6 +772,58 @@ export function useChatMessages(
     }
   }, [workspaceId, threadId]);
 
+  // iOS Safari freezes a backgrounded tab and tears down its SSE socket; the
+  // frozen reader.read() may not reject promptly on return, hanging the turn.
+  // On foreground, if a main stream is genuinely active and reconnectable,
+  // abort the (likely dead) reader and flag it so the stream's result handler
+  // runs the existing reconnect rather than treating the abort as a user stop.
+  //
+  // CRITICAL: only act when the tab was ACTUALLY suspended (`pagehide`/`freeze`),
+  // not on a bare `visibilitychange`. A desktop alt-tab fires visibility events
+  // but keeps the socket alive — aborting there would needlessly tear down a
+  // healthy stream and flash "Reconnecting…" on every refocus. The lifecycle
+  // suspend events fire only when the OS froze the tab (the case the socket
+  // dies), so gating on tabSuspendedRef keeps non-suspended users unaffected.
+  useEffect(() => {
+    const onSuspend = () => { tabSuspendedRef.current = true; };
+    const onForeground = () => {
+      if (typeof document === 'undefined' || document.visibilityState !== 'visible') return;
+      // No genuine suspend since we were last visible → socket is still alive,
+      // nothing to recover. Consume the flag so each suspend→resume cycle
+      // triggers at most one reconnect (pageshow + visibilitychange both fire).
+      if (!tabSuspendedRef.current) return;
+      tabSuspendedRef.current = false;
+      if (!isLoading || !mainStreamAbortRef.current) return;        // nothing streaming
+      // Use the latched thread ref, not the threadId prop: a brand-new chat
+      // keeps the prop at '__default__' until the first SSE event updates the
+      // route, but Content-Location already latched the real thread into
+      // threadIdRef. Keying off the prop would skip recovery for the entire
+      // first-answer window (e.g. a PTC sandbox spin-up), which is the most
+      // common "ask, switch apps, come back" moment.
+      const tid = threadIdRef.current;
+      if (!tid || tid === '__default__') return;                    // no addressable run
+      if (!currentRunIdRef.current || wasStoppedRef.current) return; // not reconnectable / user stop
+      backgroundReconnectRef.current = true;
+      mainStreamAbortRef.current.abort();
+    };
+    // Suspend signals: pagehide (iOS app-background / bfcache) + freeze (Chromium
+    // background-tab freeze). Both fire only on a real suspend, never on a tab-switch.
+    window.addEventListener('pagehide', onSuspend);
+    document.addEventListener('freeze', onSuspend);
+    // Resume triggers: pageshow (bfcache restore) + visibilitychange (return to visible).
+    document.addEventListener('visibilitychange', onForeground);
+    window.addEventListener('pageshow', onForeground);
+    return () => {
+      window.removeEventListener('pagehide', onSuspend);
+      document.removeEventListener('freeze', onSuspend);
+      document.removeEventListener('visibilitychange', onForeground);
+      window.removeEventListener('pageshow', onForeground);
+    };
+    // Only isLoading is read in the handler closure; the thread identity comes
+    // from threadIdRef.current, not the prop, so threadId is intentionally NOT a
+    // dep — including it would re-register the listeners on every thread nav.
+  }, [isLoading]); // refs are stable
+
   // Reset thread ID when workspace or initialThreadId changes
   useEffect(() => {
     if (workspaceId) {
@@ -712,6 +848,13 @@ export function useChatMessages(
         setMessages([]);
         setThreadModels([]);
         setLastThreadModel(null);
+        // A compaction + a message parked during it belong to the thread we're
+        // leaving. Clear them so the isCompacting→false flush can never replay
+        // thread A's queued payload into thread B (and B doesn't inherit A's
+        // stale compacting indicator).
+        setQueuedSend(false);
+        queuedSendRef.current = null;
+        setIsCompacting(false);
         // Reset refs
         contentOrderCounterRef.current = 0;
         currentReasoningIdRef.current = null;
@@ -2014,10 +2157,26 @@ export function useChatMessages(
    * Reconnects to an in-progress workflow stream after page refresh.
    * Creates an assistant message placeholder and processes live SSE events.
    */
-  const reconnectToStream = async ({ activeTasks = [] }: { activeTasks?: string[] } = {}) => {
-    if (!threadId || threadId === '__default__') return;
+  const reconnectToStream = async ({ activeTasks = [], runId, resetCursor = false }: { activeTasks?: string[]; runId?: string | null; resetCursor?: boolean } = {}) => {
+    // Reconnect targets the LATCHED thread, not the threadId prop. A brand-new
+    // chat keeps the prop at '__default__' until the first SSE event updates the
+    // route, but Content-Location already latched the real id into threadIdRef.
+    // Keying off the prop would bail this whole first-answer window (the most
+    // common "ask, background the tab, come back" moment). Snapshot once so the
+    // id stays stable across this single reconnect attempt.
+    const tid = threadIdRef.current;
+    if (!tid || tid === '__default__') return;
 
-    console.log('[Reconnect] Starting reconnection for thread:', threadId);
+    // Callers that (re)attach to the thread's CURRENT active run — thread-load,
+    // cross-thread navigation, post-HITL resume, report-back — pass that run's
+    // id and rewind the cursor. Without this, currentRunIdRef/lastEventIdRef
+    // still point at the PRIOR thread's stream, so we attach to a dead key
+    // (zero live events → content only appears on a later refetch). The
+    // mid-stream disconnect path omits both and keeps its in-progress cursor.
+    if (runId !== undefined) currentRunIdRef.current = runId;
+    if (resetCursor) lastEventIdRef.current = null;
+
+    console.log('[Reconnect] Starting reconnection for thread:', tid);
 
     // Clear subagent cards to prevent duplicate content from cache + Redis overlap
     if (clearSubagentCards) {
@@ -2027,13 +2186,14 @@ export function useChatMessages(
 
     setIsLoading(true);
     setIsReconnecting(true);
-    isStreamingRef.current = true;
+    acquireStreamOwnership(tid);
     // Fresh stream: clear any stale stop flag from a PRIOR turn (e.g. user
     // hard-stopped thread A, then switched to live thread B). Without this the
     // stop-during-reconnect guards below (result.aborted || wasStoppedRef) would
     // bail this legitimate reconnect and leave isLoading stuck. Matches the reset
     // every other stream entry point does (handleSendMessage, resume, steering).
     wasStoppedRef.current = false;
+    backgroundReconnectRef.current = false;
 
     // Create assistant message placeholder for reconnection
     const assistantMessageId = `assistant-reconnect-${Date.now()}`;
@@ -2158,20 +2318,28 @@ export function useChatMessages(
     // stop already tore everything down.
     const abortController = new AbortController();
     mainStreamAbortRef.current = abortController;
+    // This reconnect now owns the spinner set above (setIsReconnecting(true)).
+    isReconnectingOwnerRef.current = abortController;
 
     try {
       // Replay buffered events first — this processes artifact{task,spawned} events
       // which create subagent cards with the correct description/type. Per-task streams
       // are opened AFTER so they merge into existing cards instead of creating empty ones.
       const result = await reconnectToWorkflowStream(
-        threadId,
+        tid,
         currentRunIdRef.current,
         lastEventIdRef.current as number | null,
         processEvent,
         abortController.signal,
       );
       // User stop aborted the reader — stopWorkflow owns teardown; bail.
+      // Exception: a foreground handler aborted this stream because the tab
+      // resumed (background abort, not a user stop) — re-kick the reconnect.
       if (result?.aborted || wasStoppedRef.current) {
+        if (backgroundReconnectRef.current && !wasStoppedRef.current) {
+          backgroundReconnectRef.current = false;
+          attemptReconnectAfterDisconnect(currentMessageRef.current || assistantMessageId);
+        }
         return;
       }
       if (result?.disconnected) {
@@ -2219,7 +2387,7 @@ export function useChatMessages(
       if (activeTasks.length > 0) {
         console.log('[Reconnect] Opening per-task streams for active tasks:', activeTasks);
         for (const taskId of activeTasks) {
-          openSubagentStream(threadId, taskId, processEvent);
+          openSubagentStream(tid, taskId, processEvent);
         }
       }
     } catch (err: unknown) {
@@ -2237,8 +2405,6 @@ export function useChatMessages(
         setMessageError((err as Error).message || 'Failed to reconnect to stream');
       }
     } finally {
-      setIsReconnecting(false);
-
       // Clean up empty reconnect messages (no content segments = nothing was
       // streamed). Skip on a user stop: finalizeStreamingMessage just stamped
       // this bubble `stopped: true` (with the "⏹ Stopped" chip) but left it
@@ -2252,13 +2418,37 @@ export function useChatMessages(
         return prev;
       });
 
-      // Skip cleanup on a user stop — stopWorkflow already cleared isLoading /
+      // Only finalize if this reconnect is still the active stream. Navigation
+      // can supersede it (the thread-load effect aborts a report-back stream on
+      // the prior thread and starts a fresh stream for the new thread); running
+      // cleanup here would then reset isStreamingRef / re-arm watches and clobber
+      // the new thread's stream. The owner that superseded us manages that state.
+      const stillActive = mainStreamAbortRef.current === abortController;
+      // Skip cleanup on a user stop too — stopWorkflow already cleared isLoading /
       // hasActiveSubagents and ran finalize; re-running it here would re-toggle
-      // loading and re-open the report-back watch after the stop.
-      if (!wasInterruptedRef.current && !wasStoppedRef.current) {
+      // loading and re-open the report-back watch after the stop. Also skip when
+      // this reconnect's own stream was aborted (a foreground re-kick on tab
+      // resume): the re-kicked reconnect, suspended at its getWorkflowStatus
+      // await, still owns mainStreamAbortRef, so cleaning up here would null the
+      // spinner mid-resume. The per-stream abort signal is the reliable guard.
+      if (
+        stillActive &&
+        !wasInterruptedRef.current &&
+        !wasStoppedRef.current &&
+        !abortController.signal.aborted
+      ) {
         cleanupAfterStreamEnd(assistantMessageId);
       }
-      if (mainStreamAbortRef.current === abortController) {
+      // Clear the spinner only if THIS reconnect still owns it. A newer reconnect
+      // (cross-thread nav) took ownership and manages its own spinner — clobbering
+      // it would hide the new thread's reconnect. Any other teardown that swapped
+      // the stream out from under us (user stop, steering demoted to a new turn)
+      // leaves ownership with us, so we still clear and never strand the spinner.
+      if (isReconnectingOwnerRef.current === abortController) {
+        setIsReconnecting(false);
+        isReconnectingOwnerRef.current = null;
+      }
+      if (stillActive) {
         mainStreamAbortRef.current = null;
       }
     }
@@ -2275,15 +2465,22 @@ export function useChatMessages(
 
     setIsReconnecting(true);
 
+    // Target the latched thread, not the threadId prop: a first-turn disconnect
+    // (background during a brand-new chat's first answer) still has the prop at
+    // '__default__' while the real id lives in threadIdRef. Snapshot once so the
+    // ~31s retry loop stays pinned to the run we started reconnecting, matching
+    // the prior closure-captured semantics.
+    const tid = threadIdRef.current;
+
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      if (!threadId || threadId === '__default__') break;
+      if (!tid || tid === '__default__') break;
 
       if (attempt > 0) {
         await new Promise((r) => setTimeout(r, BASE_DELAY * Math.pow(2, attempt - 1)));
       }
 
       try {
-        const status = await getWorkflowStatus(threadId);
+        const status = await getWorkflowStatus(tid);
         if (!status.can_reconnect) {
           console.log('[Reconnect] Workflow no longer reconnectable, cleaning up');
           break;
@@ -2311,50 +2508,173 @@ export function useChatMessages(
   // that receives a push notification (via Redis pub/sub) when this happens.
 
   const stopReportBackWatch = () => {
+    // Invalidate the current watch generation so any in-flight wake/poll callback
+    // bails instead of attaching after teardown.
+    reportBackWatchEpochRef.current += 1;
+    reportBackWatchThreadIdRef.current = null;
+    reportBackRunIdRef.current = null;
     if (reportBackWatchAbortRef.current) {
       reportBackWatchAbortRef.current.abort();
       reportBackWatchAbortRef.current = null;
     }
+    if (reportBackPollRef.current) {
+      clearInterval(reportBackPollRef.current);
+      reportBackPollRef.current = null;
+    }
   };
 
-  const startReportBackWatch = () => {
-    stopReportBackWatch();
-
-    const tid = threadIdRef.current;
+  // Drive the flash thread to the PTC report-back turn once the PTC completes.
+  //
+  // The watch is KEYED to the flash thread (`flashThreadId`), not the visible
+  // thread, and persists across navigation. When the user jumps into the
+  // dispatched PTC thread, the watch keeps running but does NOT render — it only
+  // attaches when its flash thread is the one on screen and idle. That is how the
+  // flash report-back and a live PTC stream coexist: the watch holds the named
+  // run id (captured from a wake even while away) and streams it the moment the
+  // user returns to the flash thread.
+  //
+  // The backend names the report-back run explicitly — no inference from run_id
+  // changes. It signals readiness via a fire-and-forget Redis pub/sub wake
+  // (`thread:wake:{tid}`) carrying the run_id, and durably records that run_id so
+  // it's also readable from `/status` (`report_back_run_id`). An in-session
+  // client attaches straight from the wake's run_id; a client that missed the
+  // wake (slow connect or a full reload) discovers the run via a `/status` poll.
+  const startReportBackWatch = (flashThreadId?: string | null) => {
+    const tid = flashThreadId ?? threadIdRef.current;
     if (!tid || tid === '__default__') return;
 
-    if (import.meta.env.DEV) console.log('[ReportBack] Opening watch connection for thread:', tid);
+    // Idempotent: a watch for this flash thread is already running. It survives
+    // navigation, so re-arming on return (loadAndMaybeReconnect / stream-end)
+    // must NOT tear it down — that would drop the run id it has already captured.
+    if (reportBackWatchAbortRef.current && reportBackWatchThreadIdRef.current === tid) return;
 
-    const { abort } = watchThread(tid, async () => {
-      reportBackWatchAbortRef.current = null;
+    stopReportBackWatch();
+    reportBackWatchThreadIdRef.current = tid;
+
+    // This watch generation. If a teardown bumps the epoch (consume, hard-stop,
+    // re-arm for a different flash thread, unmount), a wake/poll callback captured
+    // here is stale and must not attach.
+    const epoch = reportBackWatchEpochRef.current;
+
+    let consumed = false;
+    let inFlight = false;
+    let polls = 0;
+
+    // Attach to the named report-back run's per-run stream — which still replays
+    // its buffered events even after completion — so the summary streams into a
+    // fresh bubble naturally, with no jarring full-history reload (a reload also
+    // duplicates the live dispatch card, since history replay re-adds it next to
+    // the surviving live bubble). Skip if the named run is the one already on
+    // screen (the dispatch turn, or a report-back run we already attached to).
+    const attach = async (runId: string | null, activeTasks: string[]) => {
+      if (!runId || runId === currentRunIdRef.current) return false;
+      consumed = true;
       awaitingReportBackRef.current = false;
+      reportBackRunIdRef.current = null;
+      stopReportBackWatch();
+      await reconnectToStream({ activeTasks, runId, resetCursor: true });
+      return true;
+    };
 
-      // If flash is currently streaming, the report-back system message was
-      // steered into the active turn — no separate reconnect needed.
-      if (isStreamingRef.current) {
-        if (import.meta.env.DEV) console.log('[ReportBack] Steered into active stream, skipping reconnect');
+    const reconcile = async (source: string, wakeRunId?: string | null) => {
+      // Stale generation (re-armed for another thread / hard-stopped / unmounted).
+      if (reportBackWatchEpochRef.current !== epoch) return;
+      if (consumed) return;
+
+      // Remember the named run as soon as we learn it — even if the flash thread
+      // is NOT the one on screen right now. A wake fires once, when the PTC run
+      // finishes; if the user is away on the PTC thread at that instant we still
+      // capture the id so the report-back streams on return.
+      if (wakeRunId) reportBackRunIdRef.current = wakeRunId;
+
+      // Render gate: only attach when this flash thread is the visible thread and
+      // no other stream owns the slot. Off-thread (e.g. the user jumped into the
+      // PTC thread) we just hold the run id and leave the PTC stream untouched.
+      if (threadIdRef.current !== tid || isStreamingRef.current || inFlight) return;
+
+      // On the flash thread and idle. Attach a known run id immediately (no
+      // /status round-trip needed — the wake or a prior poll already named it).
+      if (reportBackRunIdRef.current) {
+        await attach(reportBackRunIdRef.current, []);
         return;
       }
 
-      if (import.meta.env.DEV) console.log('[ReportBack] Report-back workflow detected, reconnecting');
-
-      // Small delay to let the workflow buffer initial events
-      await new Promise((r) => setTimeout(r, 500));
-
+      inFlight = true;
+      let status: WorkflowStatusResponse;
       try {
-        const status = await getWorkflowStatus(tid);
-        if (status.can_reconnect) {
-          await reconnectToStream({ activeTasks: status.active_tasks || [] });
-        }
-      } catch (err) {
-        if (import.meta.env.DEV) console.log('[ReportBack] Reconnect after watch failed:', (err as Error).message);
+        status = await getWorkflowStatus(tid);
+      } catch {
+        inFlight = false;
+        return;
       }
+      inFlight = false;
+      // Re-check generation/visibility after the await: the watch may have been
+      // torn down, or the user may have navigated away, while /status was in flight.
+      if (consumed || reportBackWatchEpochRef.current !== epoch) return;
+      if (threadIdRef.current !== tid || isStreamingRef.current) return;
+
+      if (status.report_back_run_id) reportBackRunIdRef.current = status.report_back_run_id;
+      if (await attach(reportBackRunIdRef.current, status.active_tasks || [])) return;
+
+      // No report-back run named yet (still pending) or none is coming (the PTC
+      // dispatch failed). Keep polling, but give up after a bounded window so a
+      // never-arriving report-back doesn't poll forever.
+      if (source === 'poll' && ++polls >= REPORT_BACK_MAX_POLLS) {
+        consumed = true;
+        awaitingReportBackRef.current = false;
+        stopReportBackWatch();
+      }
+    };
+
+    const { abort } = watchThread(tid, async (payload) => {
+      const wakeRunId = payload?.run_id ?? null;
+      if (wakeRunId) {
+        await reconcile('wake', wakeRunId);
+        return;
+      }
+      // Payload-less wake (older backend / malformed): fall back to a /status
+      // reconcile. A short delay lets the report-back run register so
+      // report_back_run_id is populated.
+      await new Promise((r) => setTimeout(r, 500));
+      await reconcile('wake');
     });
     reportBackWatchAbortRef.current = abort;
+    reportBackPollRef.current = setInterval(() => reconcile('poll'), 3000);
   };
 
   // Load history when workspace or threadId changes, then check for reconnection
   useEffect(() => {
+    // A reconnect stream is live on a DIFFERENT thread than the one we're now
+    // loading — e.g. a flash report-back is streaming on the flash thread and the
+    // user clicked the dispatch card to jump into the running PTC thread. Without
+    // this, the isStreamingRef guard below would skip the PTC load and it would
+    // appear blank (the report-back stream "holds" the global streaming flag).
+    // Supersede that stream: abort it (it continues server-side and replays on
+    // return) so THIS thread can load and reconnect. The aborted stream's finally
+    // is a no-op now (its `stillActive` check fails — see reconnectToStream).
+    //
+    // We do NOT stop the report-back watch here. Superseding the visible flash
+    // reader (so the PTC thread can take the slot) must not erase the independent
+    // pending report-back: the keyed watch persists, holds its run id, and renders
+    // again when the user returns to the flash thread. Its render gate
+    // (threadIdRef === its flash thread) keeps it off the PTC thread meanwhile.
+    const supersedeOtherThreadStream =
+      isStreamingRef.current &&
+      streamingThreadIdRef.current !== null &&
+      // A '__default__' owner is a new-conversation send whose id hasn't resolved
+      // yet; its prop transitions '__default__' → realTid, which must NOT supersede
+      // its own in-flight stream. The isStreamingRef guard below skips the
+      // redundant load instead.
+      streamingThreadIdRef.current !== '__default__' &&
+      streamingThreadIdRef.current !== threadId &&
+      !!threadId &&
+      threadId !== '__default__';
+    if (supersedeOtherThreadStream) {
+      mainStreamAbortRef.current?.abort();
+      mainStreamAbortRef.current = null;
+      releaseStreamOwnership();
+    }
+
     // Guard: Only load if we have a workspaceId and a valid threadId (not '__default__')
     // Also skip if streaming is in progress (prevents race condition when thread ID changes during streaming)
     if (!workspaceId || !threadId || threadId === '__default__' || historyLoadingRef.current || isStreamingRef.current) {
@@ -2405,11 +2725,30 @@ export function useChatMessages(
         historyLoadedKeyRef.current = loadKey;
       }
 
+      // A pending PTC report-back is caught by the watch — the reliable mechanism
+      // that attaches to the run /status names (report_back_run_id) or a wake
+      // carries. Arm it here, BEFORE the reconnect branch below, so it runs
+      // regardless of whether this load also reconnects to an active run. On a
+      // refresh right as the report-back becomes due, /status can report
+      // can_reconnect=true AND pending_report_back=true; reconnecting to
+      // status.run_id alone can miss the report-back run (stale/drained run, or a
+      // short summary that finishes before attach), and without the watch it would
+      // only surface on a later history-replay refresh. The watch stays dormant
+      // while a reconnect stream is live (its reconcile bails on isStreamingRef),
+      // and attach() skips the run already on screen — so this never double-streams.
+      if (status.pending_report_back) {
+        if (import.meta.env.DEV) console.log('[ReportBack] Pending report-back detected on load, opening watch');
+        awaitingReportBackRef.current = true;
+        // Key the watch to THIS thread (the flash thread — pending_report_back is
+        // a flash-thread property). Idempotent if a watch for it already persists.
+        startReportBackWatch(threadId);
+      }
+
       if (historyHasUnresolvedInterruptRef.current && status.can_reconnect) {
         // Workflow is active → interrupt was answered, reconnect will deliver resolution
         console.log('[Reconnect] Unresolved interrupt from history, reconnecting to get resolution events');
         historyHasUnresolvedInterruptRef.current = false;
-        await reconnectToStream({ activeTasks: status.active_tasks || [] });
+        await reconnectToStream({ activeTasks: status.active_tasks || [], runId: status.run_id ?? null, resetCursor: true });
         unresolvedHistoryInterruptRef.current = [];
       } else if (historyHasUnresolvedInterruptRef.current && !status.can_reconnect) {
         // Workflow genuinely paused → make interrupt(s) interactive
@@ -2476,7 +2815,7 @@ export function useChatMessages(
         historyHasUnresolvedInterruptRef.current = false;
       } else if (status.can_reconnect) {
         console.log('[Reconnect] Workflow status:', status.status, 'can_reconnect:', status.can_reconnect, 'active_tasks:', status.active_tasks);
-        await reconnectToStream({ activeTasks: status.active_tasks || [] });
+        await reconnectToStream({ activeTasks: status.active_tasks || [], runId: status.run_id ?? null, resetCursor: true });
       } else if (status.active_tasks && status.active_tasks.length > 0) {
         // Main workflow completed but subagent tasks still running.
         // Reopen per-task SSE streams so cards stay live after refresh.
@@ -2527,30 +2866,36 @@ export function useChatMessages(
         if (finalizePendingTodos) finalizePendingTodos();
         // Also patch inline todoListProcesses in messages
         setMessages((prev) => finalizeTodoListProcessesInMessages(prev));
-
-        // Re-open watch if a PTC report-back is still pending (e.g., user navigated away and back)
-        if (status.pending_report_back) {
-          if (import.meta.env.DEV) console.log('[ReportBack] Pending report-back detected on load, opening watch');
-          awaitingReportBackRef.current = true;
-          startReportBackWatch();
-        }
+        // (Report-back watch is armed earlier, before the reconnect branch, so it
+        // covers the active-reconnect case too — see that block above.)
       }
     };
 
     loadAndMaybeReconnect();
 
-    // Cleanup: Cancel loading if workspace or thread changes or component unmounts
+    // Cleanup: Cancel loading if workspace or thread changes or component unmounts.
+    // The report-back watch is deliberately NOT torn down here — it is keyed to its
+    // flash thread and must survive navigation into the dispatched PTC thread (a
+    // dedicated unmount-only effect stops it when the component truly goes away).
     return () => {
       cancelled = true;
       historyLoadingRef.current = false;
       closeAllSubagentStreams();
       subagentStateRefsRef.current = {};
-      stopReportBackWatch();
-      awaitingReportBackRef.current = false;
     };
     // Note: loadConversationHistory is not in deps because it uses workspaceId and threadId from closure
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, threadId, reloadTrigger]);
+
+  // The report-back watch survives thread navigation (so a flash report-back and a
+  // live PTC stream coexist), so the thread-load effect above can't own its
+  // teardown. Stop it only when the chat hook itself unmounts.
+  useEffect(() => {
+    return () => {
+      stopReportBackWatch();
+      awaitingReportBackRef.current = false;
+    };
+  }, []);
 
   /**
    * Marks all subagentTasks in messages as 'completed'.
@@ -2668,7 +3013,7 @@ export function useChatMessages(
     setWorkspaceStarting(false);
     setIsCompacting(false);
     currentMessageRef.current = null;
-    isStreamingRef.current = false;
+    releaseStreamOwnership();
 
     const hasOpenStreams = subagentStreamsRef.current.size > 0;
     if (!hasOpenStreams) {
@@ -2682,9 +3027,16 @@ export function useChatMessages(
     if (finalizePendingTodos) finalizePendingTodos();
     setMessages((prev) => finalizeTodoListProcessesInMessages(prev, assistantMessageId));
 
-    // Open watch connection for report-back if a PTC agent was dispatched with report_back enabled
+    // Open watch connection for report-back if a PTC agent was dispatched with
+    // report_back enabled. The watch attaches to the run the backend names (wake
+    // payload or /status's report_back_run_id), skipping the run currently on
+    // screen (this just-finished "Dispatched." turn). Key it to the flash thread
+    // that dispatched: an already-running watch names it (re-arm is then a no-op);
+    // otherwise this is the initial in-session arm, where the visible thread IS
+    // the flash thread. Without the key, a stream-end while the user is on the
+    // dispatched PTC thread would wrongly re-point the watch at the PTC thread.
     if (awaitingReportBackRef.current) {
-      startReportBackWatch();
+      startReportBackWatch(reportBackWatchThreadIdRef.current ?? threadIdRef.current);
     }
   };
 
@@ -2805,6 +3157,16 @@ export function useChatMessages(
     }
   };
 
+  // Forget a message parked during compaction (clear ref + chip + optimistic shimmer bubble).
+  const dropQueuedSend = () => {
+    const queuedMsgId = queuedSendRef.current?.messageId;
+    queuedSendRef.current = null;
+    setQueuedSend(false);
+    if (queuedMsgId) {
+      setMessages((prev) => prev.filter((m) => m.id !== queuedMsgId));
+    }
+  };
+
   /**
    * Hard stop: terminates the current turn immediately while preserving state.
    * (a) aborts the main reader (stop feels instant); (b) finalizes the open
@@ -2841,9 +3203,16 @@ export function useChatMessages(
     // Stopping mid-bringup or mid-compaction must clear these too — otherwise a
     // stuck "starting sandbox" / "compacting" indicator outlives the stop.
     // cleanupAfterStreamEnd resets them, but the stop path skips that cleanup.
+    // (isReconnecting is handled by the reconnect finally's ownership check: the
+    // abort above unwinds the reader, whose finally still owns and clears it.)
     setWorkspaceStarting(false);
     setIsCompacting(false);
-    isStreamingRef.current = false;
+    // Drop any message queued during compaction: the user just cancelled, so it
+    // must NOT auto-send when the isCompacting→false transition fires the flush
+    // effect. dropQueuedSend clears the ref synchronously (before the effect runs
+    // post-render) and removes its optimistic shimmer bubble.
+    dropQueuedSend();
+    releaseStreamOwnership();
     currentMessageRef.current = null;
 
     // (c) Abort per-task subagent streams + the report-back watch so no
@@ -2867,6 +3236,31 @@ export function useChatMessages(
         } catch {
           toast({ description: t('chat.stopFailed'), variant: 'destructive' });
         }
+      }
+    }
+  };
+
+  /**
+   * Stop an in-flight MANUAL compaction (/compact or /offload). Unlike
+   * stopWorkflow this is not a streaming-turn teardown — manual compaction
+   * registers no turn — so it only clears the local compaction state, drops any
+   * queued send, and asks the backend to cancel the in-flight compaction call
+   * (workflow_handler routes a run-less /cancel to cancel_compaction). The
+   * summarize/offload request then rejects; ChatView suppresses that error
+   * because the user initiated the stop.
+   */
+  const stopCompaction = async () => {
+    const tid = threadIdRef.current;
+    setIsCompacting(false);
+    // Drop a message queued during compaction so the isCompacting→false flush
+    // effect doesn't auto-send it after the user cancelled, and remove its
+    // optimistic shimmer bubble.
+    dropQueuedSend();
+    if (tid && tid !== '__default__') {
+      try {
+        await cancelWorkflow(tid);
+      } catch (err) {
+        console.warn('[stopCompaction] cancel failed:', err);
       }
     }
   };
@@ -3869,7 +4263,7 @@ export function useChatMessages(
         }
 
         setIsLoading(false);
-        isStreamingRef.current = false;
+        releaseStreamOwnership();
         currentMessageRef.current = null;
         if (wasInterruptedRef) wasInterruptedRef.current = true;
       }
@@ -3892,9 +4286,11 @@ export function useChatMessages(
    * badge) and switch subsequent events to the standard stream processor so the
    * new turn renders normally.
    */
-  const handleSendSteering = async (message: string, planMode: boolean = false, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null) => {
-    // Show user message in chat with steering indicator
-    const userMsg = createUserMessage(message, attachmentMeta as AttachmentMeta[] | null);
+  const handleSendSteering = async (message: string, planMode: boolean = false, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { widgetSnapshots, chartSelections }: ModelOptions = {}) => {
+    // Show user message in chat with steering indicator. Preserve any inline
+    // context cards (widget snapshots / chart selections) so a message queued
+    // during compaction keeps them when the flush routes through steering.
+    const userMsg = createUserMessage(message, attachmentMeta as AttachmentMeta[] | null, widgetSnapshots ?? null, chartSelections ?? null);
     const userMessage: MessageRecord = { ...userMsg, steering: true };
     recentlySentTrackerRef.current.track(message.trim(), userMessage.timestamp, userMessage.id);
     setMessages((prev) => appendMessage(prev,userMessage));
@@ -3943,11 +4339,12 @@ export function useChatMessages(
       const assistantMessage = createAssistantMessage(newAssistantId);
       setMessages((prev) => appendMessage(prev, assistantMessage));
       currentMessageRef.current = newAssistantId;
-      isStreamingRef.current = true;
+      acquireStreamOwnership(threadId);
       setIsLoading(true);
       // This demoted POST is now the active main turn; clear the stopped guard
       // and register its controller so stopWorkflow can abort it.
       wasStoppedRef.current = false;
+      backgroundReconnectRef.current = false;
       mainStreamAbortRef.current = steeringAbort;
       const refs = {
         contentOrderCounterRef,
@@ -3964,7 +4361,7 @@ export function useChatMessages(
 
     try {
       // Send to same endpoint — backend will auto-accept steering and return steering_accepted SSE
-      await sendChatMessageStream(
+      const result = await sendChatMessageStream(
         message,
         workspaceId,
         threadId,
@@ -4025,8 +4422,32 @@ export function useChatMessages(
       if (mainStreamAbortRef.current === steeringAbort) {
         mainStreamAbortRef.current = null;
       }
-      // User hit stop on the demoted turn: stopWorkflow owns the teardown.
-      if (wasStoppedRef.current) {
+      // A background abort (foreground handler on tab resume) or a transport
+      // drop returns a result flag instead of throwing. This is the one steering
+      // sub-case the foreground handler can hit: once we demote to a real new
+      // turn, steeringAbort owns mainStreamAbortRef, so an abort here lands on a
+      // live backend turn. Re-kick the existing reconnect instead of finalizing
+      // it as truncated-complete. A user stop is owned by stopWorkflow.
+      if (result?.aborted || wasStoppedRef.current) {
+        const reconnectId = currentMessageRef.current || demotedAssistantId;
+        if (
+          demotedToNewTurn &&
+          backgroundReconnectRef.current &&
+          !wasStoppedRef.current &&
+          reconnectId
+        ) {
+          backgroundReconnectRef.current = false;
+          attemptReconnectAfterDisconnect(reconnectId);
+        }
+        return;
+      }
+      // Natural transport drop on the demoted turn: reconnect rather than
+      // finalizing — the turn may still be running on the backend.
+      if (result?.disconnected && demotedToNewTurn) {
+        const reconnectId = currentMessageRef.current || demotedAssistantId;
+        if (reconnectId) {
+          attemptReconnectAfterDisconnect(reconnectId);
+        }
         return;
       }
       if (demotedToNewTurn) {
@@ -4063,7 +4484,7 @@ export function useChatMessages(
           }))
         );
         setMessageError((err as Error).message || 'Failed to send message');
-        isStreamingRef.current = false;
+        releaseStreamOwnership();
         setIsLoading(false);
         return;
       }
@@ -4088,9 +4509,45 @@ export function useChatMessages(
     // (clicking around never reorders; new threads surface via the new-id rule).
     bumpThreadNavOrder(workspaceId, threadIdRef.current);
 
+    // If the agent is compacting its context, hold this message and auto-send
+    // it once compaction finishes (mirrors the backend admission gate, which
+    // 409s a POST that arrives mid-compaction). Must come BEFORE the isLoading
+    // steering branch: during an auto Tier-2 summarize the turn is still
+    // running, so steering now would corrupt the in-flight context rewrite.
+    // Keying off isCompacting covers every compaction path uniformly — SSE
+    // auto-summarize plus manual /compact and /offload (both set isCompacting
+    // in ChatView).
+    if (isCompacting) {
+      // Show the parked message as a shimmer bubble (like a pending steering
+      // message) so the user sees what will send. Only the latest queued
+      // message is held, so replace any earlier optimistic bubble.
+      const prevQueuedId = queuedSendRef.current?.messageId;
+      const queuedMsg = createUserMessage(
+        message,
+        attachmentMeta as AttachmentMeta[] | null,
+        widgetSnapshots ?? null,
+        chartSelections ?? null,
+      );
+      const queuedMessage: MessageRecord = { ...queuedMsg, queued: true };
+      queuedSendRef.current = {
+        message,
+        planMode,
+        additionalContext,
+        attachmentMeta,
+        modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections },
+        messageId: queuedMessage.id as string,
+      };
+      setMessages((prev) => {
+        const base = prevQueuedId ? prev.filter((m) => m.id !== prevQueuedId) : prev;
+        return appendMessage(base, queuedMessage);
+      });
+      setQueuedSend(message.trim() || '…');
+      return;
+    }
+
     // If agent is already streaming, send as steering message
     if (isLoading) {
-      return handleSendSteering(message, planMode, additionalContext, attachmentMeta);
+      return handleSendSteering(message, planMode, additionalContext, attachmentMeta, { widgetSnapshots, chartSelections });
     }
 
     // Store planMode so HITL interrupt handler can access it
@@ -4159,8 +4616,12 @@ export function useChatMessages(
     completedTaskIdsRef.current.clear();
     // Clear the stopped guard so a fresh send can finalize again on stop.
     wasStoppedRef.current = false;
-    // Mark streaming as in progress to prevent history loading during streaming
-    isStreamingRef.current = true;
+    backgroundReconnectRef.current = false;
+    // Mark streaming as in progress (prevents history loading during streaming)
+    // AND claim ownership for this thread, so navigating to another thread mid-send
+    // supersedes this stream rather than leaving it orphaned (the load guard would
+    // otherwise block the new thread because isStreamingRef is still set).
+    acquireStreamOwnership(threadId);
 
     // Create assistant message placeholder
     const assistantMessageId = `assistant-${Date.now()}`;
@@ -4235,8 +4696,14 @@ export function useChatMessages(
       );
 
       // The user hit stop: stopWorkflow already finalized the message and ran
-      // teardown. Skip reconnect/cleanup so we don't double-fire.
+      // teardown. Skip reconnect/cleanup so we don't double-fire. Exception: a
+      // foreground handler aborted this stream because the tab resumed
+      // (background abort, not a user stop) — re-kick the reconnect instead.
       if (result?.aborted || wasStoppedRef.current) {
+        if (backgroundReconnectRef.current && !wasStoppedRef.current) {
+          backgroundReconnectRef.current = false;
+          attemptReconnectAfterDisconnect(currentMessageRef.current || assistantMessageId);
+        }
         return;
       }
 
@@ -4347,6 +4814,36 @@ export function useChatMessages(
         }
       };
 
+  // Flush a message queued during compaction once it finishes. If a turn is
+  // still running (auto Tier-2 summarize), steer into it; otherwise start a
+  // fresh turn — the exact branch handleSendMessage would have taken had the
+  // message arrived now. queuedSendRef is cleared in stopWorkflow, so a queued
+  // message is never replayed into a turn the user just cancelled.
+  useEffect(() => {
+    if (isCompacting) return;
+    const queued = queuedSendRef.current;
+    if (!queued) return;
+    queuedSendRef.current = null;
+    setQueuedSend(false);
+    const { message, planMode, additionalContext, attachmentMeta, modelOptions, messageId } = queued;
+    // Drop the optimistic shimmer bubble; the send path re-adds the real one
+    // (steering shimmer if a turn is still running, else a normal user bubble).
+    if (messageId) {
+      setMessages((prev) => prev.filter((m) => m.id !== messageId));
+    }
+    if (isLoading) {
+      handleSendSteering(message, planMode, additionalContext, attachmentMeta, modelOptions);
+    } else {
+      handleSendMessage(message, planMode, additionalContext, attachmentMeta, modelOptions);
+    }
+    // Fires on isCompacting transitions. isLoading and the send handlers are
+    // captured from the render where isCompacting went false — that render is
+    // the correct moment to decide steer-vs-fresh. Handlers are omitted from
+    // deps because the values they actually close over (workspaceId/threadId)
+    // don't change mid-compaction, so a stale closure here isn't possible.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCompacting]);
+
   /**
    * Resumes an interrupted workflow with an HITL response (approve or reject).
    * Follows the same pattern as handleSendMessage but sends messages: [] with hitl_response.
@@ -4373,7 +4870,8 @@ export function useChatMessages(
     setIsLoading(true);
     setMessageError(null);
     wasStoppedRef.current = false;
-    isStreamingRef.current = true;
+    backgroundReconnectRef.current = false;
+    acquireStreamOwnership(threadId);
     // Fresh AbortController so stopWorkflow can abort this resumed stream.
     const abortController = new AbortController();
     mainStreamAbortRef.current = abortController;
@@ -4414,8 +4912,16 @@ export function useChatMessages(
         abortController.signal,
       );
 
-      // User hit stop: stopWorkflow already finalized + tore down.
+      // User hit stop: stopWorkflow already finalized + tore down. Exception: a
+      // foreground handler aborted this stream on tab resume (background abort,
+      // not a user stop) — treat it as a disconnect and re-kick the reconnect so
+      // the resumed-from-stop turn recovers instead of dying silently.
       if (result?.aborted || wasStoppedRef.current) {
+        if (backgroundReconnectRef.current && !wasStoppedRef.current) {
+          backgroundReconnectRef.current = false;
+          wasDisconnected = true;
+          attemptReconnectAfterDisconnect(assistantMessageId);
+        }
         return;
       }
 
@@ -4709,7 +5215,8 @@ export function useChatMessages(
     setHasActiveSubagents(false);
     completedTaskIdsRef.current.clear();
     wasStoppedRef.current = false;
-    isStreamingRef.current = true;
+    backgroundReconnectRef.current = false;
+    acquireStreamOwnership(threadId);
 
     // Truncate messages and add new user message (if editing) + assistant placeholder
     const assistantMessageId = `assistant-${Date.now()}`;
@@ -4783,8 +5290,16 @@ export function useChatMessages(
         abortController.signal,
       );
 
-      // User hit stop: stopWorkflow already finalized + tore down.
+      // User hit stop: stopWorkflow already finalized + tore down. Exception: a
+      // foreground handler aborted this stream on tab resume (background abort,
+      // not a user stop) — treat it as a disconnect and re-kick the reconnect so
+      // the resumed turn recovers instead of dying silently.
       if (result?.aborted || wasStoppedRef.current) {
+        if (backgroundReconnectRef.current && !wasStoppedRef.current) {
+          backgroundReconnectRef.current = false;
+          wasDisconnected = true;
+          attemptReconnectAfterDisconnect(assistantMessageId);
+        }
         return;
       }
 
@@ -4997,6 +5512,7 @@ export function useChatMessages(
     workspaceStarting,
     isCompacting,
     setIsCompacting,
+    queuedSend,
     isLoadingHistory,
     isReconnecting,
     messageError,
@@ -5004,6 +5520,7 @@ export function useChatMessages(
     clearReturnedSteering: () => setReturnedSteering(null),
     handleSendMessage,
     stopWorkflow,
+    stopCompaction,
     pendingInterrupt,
     pendingRejection,
     handleApproveInterrupt,

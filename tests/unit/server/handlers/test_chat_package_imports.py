@@ -74,7 +74,7 @@ class TestSubmoduleImports:
         assert hasattr(mod, "apply_fetch_override")
         assert hasattr(mod, "ensure_thread")
         assert hasattr(mod, "persist_or_skip_replay")
-        assert hasattr(mod, "inject_skills")
+        assert hasattr(mod, "prepare_skill_contexts")
         assert hasattr(mod, "build_graph_config")
         assert hasattr(mod, "wait_or_steer")
         assert hasattr(mod, "handle_workflow_error")

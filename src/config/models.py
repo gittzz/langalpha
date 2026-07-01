@@ -72,6 +72,37 @@ class BackgroundExecutionConfig(BaseModel):
     checkpoint_flush_timeout: float = Field(
         default=10.0, description="Timeout (seconds) for checkpoint state reads/writes"
     )
+    admission_compaction_wait_timeout: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            "Max seconds a new turn blocks at admission for an in-progress "
+            "compaction (auto Tier-2 summarize or manual /compact|/offload) to "
+            "finish before returning 'compacting' -> 409 retry. Summarize is a "
+            "full LLM call over a large transcript and can run minutes, so this "
+            "is generous to avoid spurious 409s; keep it under the governing "
+            "in-request limits — the upstream nginx proxy_read_timeout and the "
+            "client read timeout (the connection is held this long while the "
+            "turn waits). NOTE: timeout_keep_alive (300s) is NOT the bound; it "
+            "only caps idle time BETWEEN requests, not an in-flight request. "
+            "Admission floors this at compaction_timeout + a small margin so a "
+            "healthy in-progress compaction is never 409'd before its own call "
+            "budget self-terminates and releases the guard."
+        ),
+    )
+    compaction_timeout: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            "Wall-clock budget (seconds) for a single compaction LLM call "
+            "(auto Tier-2 summarize and manual /compact). The call is wrapped "
+            "in asyncio.wait_for so a hung summarize fails naturally — auto "
+            "emits a 'summarize error' (closing the window), manual raises -> "
+            "HTTP 500 — instead of blocking the thread forever. Bounded below "
+            "the httpx client timeout (600s) and below admission_compaction_"
+            "wait_timeout so the call self-terminates before admission 409s."
+        ),
+    )
     wait_for_persistence_timeout: float = Field(
         default=30.0, description="Max seconds callers block waiting for persistence completion"
     )

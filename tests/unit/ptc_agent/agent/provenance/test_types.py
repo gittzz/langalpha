@@ -11,6 +11,7 @@ from ptc_agent.agent.provenance import (
     ProvenanceSource,
     build_provenance_event,
     fingerprint_result,
+    fingerprint_result_with_body,
     hash_args,
     redact_args,
 )
@@ -79,6 +80,25 @@ def test_fingerprint_handles_odd_inputs_without_raising():
         assert isinstance(sha, str) and len(sha) == 64
         assert isinstance(size, int) and size >= 0
         assert isinstance(snippet, str)
+
+
+def test_fingerprint_with_body_matches_fingerprint_and_is_hash_consistent():
+    # The 4-tuple's sha/size/snippet must equal fingerprint_result's, and the
+    # returned body must be byte-identical to the string that produced the sha —
+    # that identity is the whole point (a verifier hashes the stored body).
+    for value in (
+        {"gamma": {"y": 2, "x": 1}, "alpha": 1},
+        [1, {"k": "v"}, None],
+        "plain string result",
+        "x" * 5000,
+        None,
+    ):
+        sha, size, snippet = fingerprint_result(value)
+        sha_b, size_b, snippet_b, body = fingerprint_result_with_body(value)
+        assert (sha_b, size_b, snippet_b) == (sha, size, snippet)
+        assert hashlib.sha256(body.encode("utf-8")).hexdigest() == sha
+        assert len(body.encode("utf-8")) == size
+        assert body[:500] == snippet  # snippet is the canonical body's head
 
 
 def test_build_event_generates_record_id_and_timestamp_when_omitted():
@@ -169,6 +189,51 @@ def test_build_event_has_full_key_set():
         "agent",
     }
     assert set(event.keys()) == expected_keys
+
+
+def test_build_event_never_carries_result_body():
+    """The transient ``result_body`` is consumed live by the middleware and must
+    NEVER ride the SSE event — that keeps ``sse_events`` gaining 0 bytes. The
+    event key set stays exactly the pre-body shape even when the source carries
+    a large body."""
+    source = ProvenanceSource(
+        record_id="rec-1",
+        source_type="web_fetch",
+        identifier="https://example.test/a",
+        timestamp="2026-01-01T00:00:00+00:00",
+        result_sha256="deadbeef",
+        result_size=99999,
+        result_snippet="snip",
+        result_body="x" * 50000,  # a substantial full body
+    )
+
+    event = build_provenance_event(source)
+
+    assert "result_body" not in event
+    # No value in the event equals the body (it isn't smuggled under another key).
+    assert source.result_body not in event.values()
+    # The key set is unchanged vs. the documented pre-body shape.
+    assert set(event.keys()) == {
+        "type",
+        "record_id",
+        "source_type",
+        "identifier",
+        "title",
+        "detail",
+        "provider",
+        "tool_call_id",
+        "args_fingerprint",
+        "args",
+        "result_sha256",
+        "result_size",
+        "result_snippet",
+        "timestamp",
+        "agent",
+    }
+    # build_provenance_event takes no result_body kwarg (a TypeError guards the
+    # contract that the body can't be injected through the builder either).
+    with pytest.raises(TypeError):
+        build_provenance_event(result_body="leak")  # type: ignore[call-arg]
 
 
 # ----- redact_args: security-critical deny-list -----------------------------

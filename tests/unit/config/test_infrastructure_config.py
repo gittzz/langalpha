@@ -63,6 +63,33 @@ class TestBackgroundExecutionSubagentTimeouts:
         assert cfg.subagent_orphan_collector_timeout == 600
 
 
+class TestCompactionTimeoutValidation:
+    """The compaction/admission timeouts gate ``asyncio.wait_for``; a 0 or
+    negative value would fire the timeout instantly (a hung-summarize false
+    positive on every turn), so they must be strictly positive at config load."""
+
+    @pytest.mark.parametrize("value", [0, -1, -180.0])
+    def test_rejects_non_positive_compaction_timeout(self, value):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            BackgroundExecutionConfig(compaction_timeout=value)
+
+    @pytest.mark.parametrize("value", [0, -1, -180.0])
+    def test_rejects_non_positive_admission_compaction_wait_timeout(self, value):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            BackgroundExecutionConfig(admission_compaction_wait_timeout=value)
+
+    def test_accepts_positive_values(self):
+        cfg = BackgroundExecutionConfig(
+            compaction_timeout=120.0, admission_compaction_wait_timeout=200.0
+        )
+        assert cfg.compaction_timeout == 120.0
+        assert cfg.admission_compaction_wait_timeout == 200.0
+
+
 class TestInfrastructureConfigComplete:
     def test_extra_fields_allowed(self):
         """InfrastructureConfig allows extra fields (forward compat)."""

@@ -376,6 +376,14 @@ def get_checkpoint_flush_timeout() -> float:
     return get_infrastructure_config().background_execution.checkpoint_flush_timeout
 
 
+def get_admission_compaction_wait_timeout() -> float:
+    return get_infrastructure_config().background_execution.admission_compaction_wait_timeout
+
+
+def get_compaction_timeout() -> float:
+    return get_infrastructure_config().background_execution.compaction_timeout
+
+
 def get_wait_for_persistence_timeout() -> float:
     return get_infrastructure_config().background_execution.wait_for_persistence_timeout
 

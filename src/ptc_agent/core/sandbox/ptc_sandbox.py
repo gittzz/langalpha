@@ -172,6 +172,11 @@ class PTCSandbox:
 
         # Per-command sessions for background Bash commands (cmd_id → session_id)
         self._bg_sessions: dict[str, str] = {}
+        # Per-command MCP provenance trace paths for background Bash (cmd_id →
+        # trace_path). Harvested when get_background_command_status observes the
+        # command finished, so a backgrounded script's MCP calls are recorded
+        # too (the foreground/ExecuteCode path harvests inline).
+        self._bg_trace_paths: dict[str, str] = {}
         # Per-port sessions for preview servers (port → (session_id, cmd_id))
         self._preview_sessions: dict[int, tuple[str, str]] = {}
         # Per-port locks to serialize start_and_get_preview_url (avoids races)
@@ -644,6 +649,7 @@ class PTCSandbox:
 
         # Clear stale state — sessions and preview links don't survive stop/start
         self._bg_sessions.clear()
+        self._bg_trace_paths.clear()
         self._preview_sessions.clear()
         self._preview_link_cache.clear()
 
@@ -2687,9 +2693,39 @@ except OSError as e:
         partial write (e.g. after a crash) never breaks result assembly. Never
         raises — tracing is provenance-only and must not affect execution.
         """
+        # Host-memory bound on the read. The generated client's per-execution
+        # body budget caps what IT emits, but MCP_TRACE_FILE is visible to
+        # agent-authored sandbox code, which can append to the JSONL directly —
+        # so the budget is not a host-side safety bound. Size the file first and
+        # skip a file far past any legit trace rather than pulling it (possibly
+        # GBs) into memory. ~4x the body budget (RESULT_BODY_TRACE_BUDGET_BYTES)
+        # leaves slack for snippets/args/metadata; the extractor clamps anyway.
+        _MCP_TRACE_READ_MAX_BYTES = 16 * 1024 * 1024
+
         records: list[dict] = []
+        content: str | None = None
         try:
-            content = await self.aread_file_text(trace_path)
+            size_res = await self._runtime_call(
+                self.runtime.exec,
+                f"wc -c < {shlex.quote(trace_path)} 2>/dev/null",
+                retry_policy=RetryPolicy.SAFE,
+            )
+            trace_bytes = int((getattr(size_res, "stdout", "") or "").strip() or 0)
+            if trace_bytes == 0:
+                # No trace written — the common case for a bash command that
+                # imported no MCP wrappers (git/npm/ls/...). The file was never
+                # created, so skip BOTH the read and the rm below (nothing to
+                # delete): saves two sandbox round-trips on every non-MCP bash run.
+                return records
+            if trace_bytes > _MCP_TRACE_READ_MAX_BYTES:
+                logger.warning(
+                    "MCP trace file over read cap; skipping",
+                    path=trace_path,
+                    bytes=trace_bytes,
+                    cap=_MCP_TRACE_READ_MAX_BYTES,
+                )
+            else:
+                content = await self.aread_file_text(trace_path)
         except Exception as e:
             logger.debug("Failed to read MCP trace file", path=trace_path, error=str(e))
             content = None
@@ -3237,8 +3273,31 @@ except OSError as e:
                 # Can't check status (e.g. sandbox restarted) — treat as
                 # finished to avoid zombie entries that permanently block the cap.
                 finished.append(cmd_id)
-        # Delete finished sessions
+        # Delete finished sessions. A finished command's MCP trace is normally
+        # harvested by the BashOutput that observes completion (provenance is
+        # attributed to that observation). A command that finished but was never
+        # observed before the cap forced eviction has no tool-call surface to
+        # attribute its trace to, so it's dropped — log it so the rare provenance
+        # gap is observable, not silent. (Faithful harvest-on-evict would need a
+        # deferred-trace channel keyed to the original launch; out of scope here.)
         for cmd_id in finished:
+            dropped_trace = self._bg_trace_paths.pop(cmd_id, None)
+            if dropped_trace:
+                logger.info(
+                    "Evicting finished bg session with unharvested MCP trace",
+                    cmd_id=cmd_id,
+                )
+                # The pop above drops the last host-side reference to this trace,
+                # so delete the JSONL now — otherwise it leaks on the sandbox
+                # until teardown (no later path knows the filename to reap it).
+                try:
+                    await self._runtime_call(
+                        self.runtime.exec,
+                        f"rm -f {shlex.quote(dropped_trace)}",
+                        retry_policy=RetryPolicy.SAFE,
+                    )
+                except Exception:
+                    logger.debug("Evict bg trace cleanup failed", path=dropped_trace)
             sid = self._bg_sessions.pop(cmd_id, None)
             if sid:
                 try:
@@ -3313,6 +3372,7 @@ except OSError as e:
                 "stdout": "",
                 "stderr": "No background session found for this command",
                 "cmd_id": cmd_id,
+                "mcp_trace": [],
             }
 
         result: SessionCommandResult = await self._runtime_call(
@@ -3323,9 +3383,18 @@ except OSError as e:
         )
         is_running = result.exit_code is None
 
+        # Harvest the backgrounded command's MCP provenance trace exactly once,
+        # when it finishes. This rides the same status path that returns the
+        # command's output to the agent, so there's no result-bearing path that
+        # skips provenance (the stop action returns no output). Best-effort.
+        mcp_trace: list[dict] = []
+
         # Auto-clean: if the command finished (e.g. killed via pkill), tear
         # down the orphaned session so it doesn't leak on the Daytona side.
         if not is_running:
+            trace_path = self._bg_trace_paths.pop(cmd_id, None)
+            if trace_path:
+                mcp_trace = await self._collect_mcp_trace(trace_path)
             sid = self._bg_sessions.pop(cmd_id, None)
             if sid:
                 try:
@@ -3343,6 +3412,7 @@ except OSError as e:
             "stdout": result.stdout,
             "stderr": result.stderr,
             "cmd_id": cmd_id,
+            "mcp_trace": mcp_trace,
         }
 
     async def stop_background_command(self, cmd_id: str) -> bool:
@@ -3355,6 +3425,9 @@ except OSError as e:
             return False
         await self._wait_ready()
         assert self.runtime is not None
+        # Drop the trace mapping (the ephemeral sandbox FS owns the file itself).
+        # A stopped command yields no output, so there's nothing to attest.
+        self._bg_trace_paths.pop(cmd_id, None)
         try:
             await self._runtime_call(
                 self.runtime.delete_session,
@@ -3460,6 +3533,12 @@ except OSError as e:
         await self._wait_ready()
         start_time = time.time()
 
+        # Per-execution MCP provenance trace file (foreground only; set just
+        # before exec). Initialized here so the finally can clean it up on a
+        # cancel that skips the except below.
+        trace_path: str | None = None
+        trace_collected = False
+
         try:
             # Generate bash execution ID for tracking
             self.bash_execution_count += 1
@@ -3525,6 +3604,14 @@ except OSError as e:
             if background:
                 session_id = await self._create_bg_session(bash_id)
                 assert self.runtime is not None
+                # Inject the same MCP provenance trace env the foreground path
+                # uses so a backgrounded `python script.py` that imports the MCP
+                # wrappers records its mcp_trace too — harvested on completion in
+                # get_background_command_status. The audit .sh stays clean; only
+                # the executed command carries the exports.
+                bg_trace_path, bg_command = self._build_trace_env_command(
+                    bash_id, full_command
+                )
                 # Track immediately so cleanup() can find it if execute fails
                 sentinel_key = f"_pending:{session_id}"
                 self._bg_sessions[sentinel_key] = session_id
@@ -3532,7 +3619,7 @@ except OSError as e:
                     result = await self._runtime_call(
                         self.runtime.session_execute,
                         session_id,
-                        full_command,
+                        bg_command,
                         run_async=True,
                         retry_policy=RetryPolicy.UNSAFE,
                         total_timeout=30,
@@ -3552,6 +3639,7 @@ except OSError as e:
                 # Replace sentinel with real cmd_id key
                 self._bg_sessions.pop(sentinel_key, None)
                 self._bg_sessions[result.cmd_id] = session_id
+                self._bg_trace_paths[result.cmd_id] = bg_trace_path
                 logger.debug(
                     "Background command started",
                     bash_id=bash_id,
@@ -3570,11 +3658,20 @@ except OSError as e:
                     "command_hash": command_hash,
                 }
 
-            # Execute directly via process.exec — no file upload dependency
+            # Execute directly via process.exec — no file upload dependency.
+            # Inject a per-execution MCP provenance trace file + the wrapper
+            # import path so a python script run here (e.g. `python analysis.py`
+            # importing `tools.{server}`) records the same mcp_trace ExecuteCode
+            # does — closing the bash provenance bypass. PYTHONPATH is prepended
+            # (preserving any existing value). The audit .sh above stays clean;
+            # only the executed command carries the exports.
             assert self.runtime is not None
+            trace_path, exec_command = self._build_trace_env_command(
+                bash_id, full_command
+            )
             exec_result = await self._runtime_call(
                 self.runtime.exec,
-                full_command,
+                exec_command,
                 timeout=timeout,
                 retry_policy=RetryPolicy.UNSAFE,
                 total_timeout=timeout + 30,
@@ -3588,6 +3685,11 @@ except OSError as e:
                 {"success": "true" if exit_code == 0 else "false", "kind": "bash"},
             )
 
+            # Harvest the in-sandbox MCP trace (best-effort; reads + deletes the
+            # file). No MCP call → file absent → empty list, no behavior change.
+            mcp_trace = await self._collect_mcp_trace(trace_path)
+            trace_collected = True
+
             if exit_code == 0:
                 return {
                     "success": True,
@@ -3596,6 +3698,7 @@ except OSError as e:
                     "exit_code": 0,
                     "bash_id": bash_id,
                     "command_hash": command_hash,
+                    "mcp_trace": mcp_trace,
                 }
 
             return {
@@ -3605,6 +3708,7 @@ except OSError as e:
                 "exit_code": exit_code,
                 "bash_id": bash_id,
                 "command_hash": command_hash,
+                "mcp_trace": mcp_trace,
             }
 
         except Exception as e:
@@ -3628,6 +3732,11 @@ except OSError as e:
                 exc_info=True,
                 extra={"is_timeout": is_timeout},
             )
+            # Recover any MCP trace flushed before the failure (best-effort).
+            recovered_trace: list[dict] = []
+            if trace_path is not None:
+                recovered_trace = await self._collect_mcp_trace(trace_path)
+                trace_collected = True
             return {
                 "success": False,
                 "stdout": "",
@@ -3635,7 +3744,61 @@ except OSError as e:
                 "exit_code": -1,
                 "bash_id": locals().get("bash_id"),
                 "command_hash": None,
+                "mcp_trace": recovered_trace,
             }
+        finally:
+            # asyncio.CancelledError (BaseException) skips the except above, so a
+            # cancel after MCP_TRACE_FILE was set would leave the JSONL behind.
+            # Delete it here when neither path collected. shield() so the rm still
+            # runs even though this await is itself unwinding a cancel.
+            if (
+                trace_path is not None
+                and not trace_collected
+                and self.runtime is not None
+            ):
+                try:
+                    await asyncio.shield(
+                        self._runtime_call(
+                            self.runtime.exec,
+                            f"rm -f {shlex.quote(trace_path)}",
+                            retry_policy=RetryPolicy.SAFE,
+                        )
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug(
+                        "Failed to clean up bash MCP trace file on cancel",
+                        path=trace_path,
+                        error=str(e),
+                    )
+
+    def _build_trace_env_command(
+        self, bash_id: str, full_command: str
+    ) -> tuple[str, str]:
+        """Wrap a bash command with the MCP-provenance trace env.
+
+        Returns ``(trace_path, command)``. ``command`` exports ``MCP_TRACE_FILE``
+        plus the wrapper ``PYTHONPATH`` (prepended, preserving any existing value)
+        before running ``full_command``, so a ``python script.py`` that imports the
+        MCP wrappers records the same ``mcp_trace`` ExecuteCode does. Shared by the
+        foreground and background bash paths so the two can't drift in how they
+        build PYTHONPATH or quote the trace path.
+        """
+        # Use the cached working dir (set on create/reconnect via
+        # fetch_working_dir, and used by normalize_path on this same bash path) so
+        # wrapping a command doesn't add a Daytona round-trip per bash invocation.
+        sandbox_root = self._work_dir
+        internal_dir = f"{sandbox_root}/_internal"
+        pythonpath = f"{sandbox_root}:{internal_dir}/src:{internal_dir}"
+        trace_path = f"{sandbox_root}/.system/trace/{bash_id}_{uuid.uuid4().hex}.jsonl"
+        command = (
+            f"export MCP_TRACE_FILE={shlex.quote(trace_path)} && "
+            f"export PYTHONPATH={shlex.quote(pythonpath)}"
+            f"${{PYTHONPATH:+:$PYTHONPATH}} && "
+            f"{full_command}"
+        )
+        return trace_path, command
 
     async def _list_result_files(self) -> list[str]:
         """List files in the results directory.
@@ -4297,6 +4460,7 @@ except OSError as e:
                         logger.debug("Failed to delete session", session_id=sid)
                 self._preview_sessions.clear()
                 self._bg_sessions.clear()
+                self._bg_trace_paths.clear()
 
                 try:
                     await self._runtime_call(
