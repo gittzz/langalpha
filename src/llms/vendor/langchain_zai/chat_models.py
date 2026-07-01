@@ -231,10 +231,12 @@ class ChatZai(BaseChatOpenAI):
     @model_validator(mode="after")
     def validate_environment(self) -> Self:
         """Validate necessary environment vars and build the OpenAI clients."""
-        if self.api_base == DEFAULT_API_BASE and not (
-            self.api_key and self.api_key.get_secret_value()
-        ):
-            msg = "If using the default api base, ZAI_API_KEY must be set."
+        if not (self.api_key and self.api_key.get_secret_value()):
+            msg = (
+                "Zhipu AI / z.ai API key not found. Set the ZAI_API_KEY "
+                "environment variable or pass `api_key`. ChatZai never falls "
+                "back to OPENAI_API_KEY, regardless of `api_base`."
+            )
             raise ValueError(msg)
         client_params: dict = {
             k: v
@@ -405,7 +407,13 @@ def _normalize_message_content(messages: list[dict]) -> None:
     """
     for message in messages:
         if message.get("role") == "tool" and isinstance(message.get("content"), list):
-            message["content"] = json.dumps(message["content"])
+            parts = [
+                block.get("text", "")
+                if isinstance(block, dict) and block.get("type") == "text"
+                else json.dumps(block, ensure_ascii=False)
+                for block in message["content"]
+            ]
+            message["content"] = "".join(parts)
         elif message.get("role") == "assistant" and isinstance(
             message.get("content"), list
         ):
@@ -424,11 +432,30 @@ def _coerce_tool_choice(payload: dict) -> None:
     ``tool_choice``; the OpenAI named form
     ``{"type": "function", "function": {"name": ...}}`` is rejected (error 1210).
     ``with_structured_output`` and forced ``bind_tools`` emit the named form, so
-    map it to ``"required"`` — exact when a single tool is bound (the
-    structured-output case), and the closest available semantics otherwise.
+    map it to ``"required"`` and, to preserve the forcing semantics exactly,
+    filter ``tools`` down to the named tool when it is present in the list. If
+    the named tool is absent, ``tools`` is left untouched (defensive fallback).
     """
-    if isinstance(payload.get("tool_choice"), dict):
-        payload["tool_choice"] = "required"
+    tool_choice = payload.get("tool_choice")
+    if not isinstance(tool_choice, dict):
+        return
+    payload["tool_choice"] = "required"
+
+    function = tool_choice.get("function")
+    name = function.get("name") if isinstance(function, dict) else None
+    tools = payload.get("tools")
+    if not name or not isinstance(tools, list):
+        return
+    named = [
+        tool
+        for tool in tools
+        if isinstance(tool, dict)
+        and tool.get("type") == "function"
+        and isinstance(tool.get("function"), dict)
+        and tool["function"].get("name") == name
+    ]
+    if named:
+        payload["tools"] = named
 
 
 def _reinject_reasoning(
@@ -459,15 +486,20 @@ def _disable_clear_thinking(payload: dict) -> None:
     """Set ``thinking.clear_thinking=false`` (nested) so GLM reads fed-back reasoning.
 
     The flag must live inside the ``thinking`` object; a top-level
-    ``clear_thinking`` is silently ignored by the server.
+    ``clear_thinking`` is silently ignored by the server. Copy-on-write:
+    ``payload["extra_body"]`` may be the caller's own ``extra_body`` dict, so it
+    is rebuilt rather than mutated.
     """
-    extra_body = payload.setdefault("extra_body", {})
+    extra_body = payload.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
     thinking = extra_body.get("thinking")
     if not isinstance(thinking, dict):
-        thinking = {"type": "enabled"}
-    thinking.setdefault("type", "enabled")
-    thinking["clear_thinking"] = False
-    extra_body["thinking"] = thinking
+        thinking = {}
+    payload["extra_body"] = {
+        **extra_body,
+        "thinking": {"type": "enabled", **thinking, "clear_thinking": False},
+    }
 
 
 def _zai_reasoning_block(
