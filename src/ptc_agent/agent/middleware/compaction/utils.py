@@ -500,19 +500,35 @@ def truncate_read_results(
 # =============================================================================
 
 
+def _is_tool_message(message: Any) -> bool:
+    """True for a tool result in either typed (``ToolMessage``) or dict shape.
+
+    The checkpoint reducer coerces every write via ``convert_to_messages`` (see
+    ``messages_delta_reducer``), so only typed messages should reach
+    reconstruction. But this predicate backs the orphaned-``tool_result`` crash
+    backstop, so it stays agnostic to message shape rather than trusting that
+    invariant — a dict-shaped tool result slipping in must still be caught.
+    """
+    if isinstance(message, ToolMessage):
+        return True
+    if isinstance(message, dict):
+        return message.get("role") == "tool" or message.get("type") == "tool"
+    return False
+
+
 def _strip_leading_orphan_tool_messages(
     tail: list[AnyMessage],
 ) -> list[AnyMessage]:
-    """Drop leading ``ToolMessage``s from a reconstructed tail.
+    """Drop leading tool-result messages from a reconstructed tail.
 
-    A summary message followed by a ``ToolMessage`` reconstructs into an
-    Anthropic ``user`` turn whose first content block is an orphaned
-    ``tool_result`` (no preceding ``tool_use``) -> 400. Stripping any leading
-    tool results makes that structurally impossible. Plain-dict messages are
-    left untouched (``isinstance`` is ``False``); they never carry the orphan.
+    A summary message followed by a tool result reconstructs into an Anthropic
+    ``user`` turn whose first content block is an orphaned ``tool_result`` (no
+    preceding ``tool_use``) -> 400. Stripping any leading tool results makes that
+    structurally impossible. This is the crash backstop, so it matches both typed
+    ``ToolMessage`` objects and dict-shaped tool results via ``_is_tool_message``.
     """
     i = 0
-    while i < len(tail) and isinstance(tail[i], ToolMessage):
+    while i < len(tail) and _is_tool_message(tail[i]):
         i += 1
     return tail[i:] if i else tail
 

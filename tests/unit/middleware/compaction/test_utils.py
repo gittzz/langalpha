@@ -171,6 +171,28 @@ class TestGetEffectiveMessages:
             isinstance(m, ToolMessage) for m in result[1:2]
         ), "reconstruction must not start with an orphaned tool_result"
 
+    def test_orphan_strip_matches_dict_shaped_tool_result(self):
+        """Backstop is format-agnostic: a dict-shaped tool result is stripped too.
+
+        The checkpoint reducer coerces writes to typed messages, so this can't
+        occur on the persisted path today — but the orphan-strip is the crash
+        backstop and must not rely on that invariant holding forever.
+        """
+        raw = [
+            {"role": "tool", "content": "orphan", "tool_call_id": "tc2", "id": "2"},
+            HumanMessage(content="q3", id="3"),
+            AIMessage(content="a4", id="4"),
+        ]
+        legacy: CompactionEvent = {
+            "cutoff_index": 0,  # lands on the dict-shaped tool result
+            "summary_message": _summary(),
+            "file_path": None,
+        }
+        result = get_effective_messages(raw, legacy)
+        assert result[0] is legacy["summary_message"]
+        # The leading dict-shaped tool result must be stripped, not passed through.
+        assert result[1:] == [raw[1], raw[2]]
+
     def test_anchor_resolves_after_left_shift_removal(self):
         """A removed pre-cutoff message left-shifts the tail; anchor still finds it."""
         raw = _conversation()
