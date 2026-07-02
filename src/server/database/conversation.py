@@ -788,6 +788,9 @@ async def get_latest_turn_index(conversation_thread_id: str) -> Optional[int]:
     Read failures also return None — callers treat it as "no signal", so a DB
     blip degrades to the pre-signal behavior instead of failing the status read.
     """
+    conversation_thread_id = normalize_uuid(conversation_thread_id)
+    if not conversation_thread_id:
+        return None
     try:
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:

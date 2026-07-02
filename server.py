@@ -78,8 +78,9 @@ if __name__ == "__main__":
             "Starting with %d uvicorn workers: the concurrent-PTC report-back "
             "serialization (in-process dispatch caps + LINDEX/LREM queue drain) "
             "assumes a SINGLE worker and is not atomic across processes — it can "
-            "double-drain report-backs or overshoot caps. Use 1 worker if this "
-            "deployment relies on report-back.",
+            "double-drain report-backs or overshoot caps, and the /status BTM "
+            "liveness cross-check can heal a run held by another worker to "
+            "COMPLETED. Use 1 worker if this deployment relies on report-back.",
             args.workers,
         )
 

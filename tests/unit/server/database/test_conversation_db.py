@@ -261,7 +261,7 @@ async def test_get_latest_turn_index(mock_db_connection, mock_cursor):
 
     mock_cursor.fetchone.return_value = {"latest_turn_index": 4}
 
-    assert await get_latest_turn_index("t-1") == 4
+    assert await get_latest_turn_index("11111111-1111-1111-1111-111111111111") == 4
     sql = mock_cursor.execute.call_args[0][0]
     assert "MAX(turn_index)" in sql
 
@@ -273,7 +273,16 @@ async def test_get_latest_turn_index_no_turns_is_none(mock_db_connection, mock_c
 
     mock_cursor.fetchone.return_value = {"latest_turn_index": None}
 
-    assert await get_latest_turn_index("t-1") is None
+    assert await get_latest_turn_index("11111111-1111-1111-1111-111111111111") is None
+
+
+@pytest.mark.asyncio
+async def test_get_latest_turn_index_non_uuid_is_none(mock_db_connection, mock_cursor):
+    """A non-UUID id is rejected before the query (same guard as siblings)."""
+    from src.server.database.conversation import get_latest_turn_index
+
+    assert await get_latest_turn_index("not-a-uuid") is None
+    mock_cursor.execute.assert_not_called()
 
 
 @pytest.mark.asyncio
