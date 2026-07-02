@@ -12,21 +12,6 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
-
-from tests.conftest import create_test_app
-
-
-@pytest_asyncio.fixture
-async def threads_client():
-    from src.server.app.threads import router
-
-    app = create_test_app(router)
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        yield client
 
 
 def _pubsub_cache(queue):

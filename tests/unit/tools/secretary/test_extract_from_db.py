@@ -20,6 +20,7 @@ import pytest
 
 from src.tools.secretary.utils import (
     MAX_OUTPUT_CHARS,
+    _EMPTY_LATEST_FALLBACK_TURNS,
     _MAX_HISTORY_TURNS,
     _TURN_SEPARATOR,
     _extract_from_db,
@@ -114,12 +115,14 @@ async def test_concatenates_chunks_within_a_turn():
 
 @pytest.mark.asyncio
 async def test_no_responses_returns_empty_list():
+    """An empty thread returns [] after the single read — no fallback re-read."""
     recent = AsyncMock(return_value=[])
 
     with patch(_RECENT, recent):
         result = await _extract_from_db("t-1")
 
     assert result == []
+    recent.assert_awaited_once_with("t-1", limit=1)
 
 
 @pytest.mark.asyncio
@@ -132,6 +135,52 @@ async def test_turns_with_empty_text_are_dropped():
         result = await _extract_from_db("t-1", turns=0)
 
     assert result == ["kept", "also kept"]
+
+
+@pytest.mark.asyncio
+async def test_turns_one_empty_latest_falls_back_to_recent_nonempty():
+    """turns=1 on a text-less newest turn returns the most-recent turn with text.
+
+    A tool-only / chart-only newest turn used to return empty (read as "the
+    agent produced nothing"). The fallback widens the read once and surfaces the
+    last turn that actually carries text.
+    """
+    latest_only = [_response(9)]  # newest turn has no text content
+    window = [_response(7, "real answer"), _response(8), _response(9)]
+    recent = AsyncMock(side_effect=[latest_only, window])
+
+    with patch(_RECENT, recent):
+        result = await _extract_from_db("t-1", turns=1)
+
+    assert result == ["real answer"]
+    assert recent.await_count == 2
+    # Hot path stays at limit=1; the fallback widens only on the empty latest.
+    assert recent.await_args_list[0].kwargs == {"limit": 1}
+    assert recent.await_args_list[1].kwargs == {"limit": _EMPTY_LATEST_FALLBACK_TURNS}
+
+
+@pytest.mark.asyncio
+async def test_turns_one_all_recent_empty_returns_empty():
+    """When the latest AND the fallback window are all text-less, return []."""
+    recent = AsyncMock(side_effect=[[_response(9)], [_response(8), _response(9)]])
+
+    with patch(_RECENT, recent):
+        result = await _extract_from_db("t-1", turns=1)
+
+    assert result == []
+    assert recent.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_turns_n_empty_latest_does_not_fall_back():
+    """Only the default single-turn read falls back; an explicit window does not."""
+    recent = AsyncMock(return_value=[_response(8), _response(9)])  # both text-less
+
+    with patch(_RECENT, recent):
+        result = await _extract_from_db("t-1", turns=2)
+
+    assert result == []
+    recent.assert_awaited_once_with("t-1", limit=2)
 
 
 @pytest.mark.asyncio

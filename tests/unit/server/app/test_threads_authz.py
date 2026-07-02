@@ -1,16 +1,8 @@
-"""IDOR guard in ``_handle_send_message`` (shared by both POST message routes).
+"""IDOR guards in ``_handle_send_message`` (shared by both POST message routes).
 
-An existing thread must belong to the caller. The guard reads the thread's
-owner via ``get_thread_owner_id`` (thread -> workspace JOIN):
-
-  - owner is another user  -> 403 Forbidden.
-  - owner is the caller    -> proceeds.
-  - no owner (brand-new thread_id, owner is None) -> proceeds (creation).
-  - internal report-back dispatch sets ``X-User-Id`` to the thread owner, so
-    ``auth.user_id == owner_id`` and the guard passes.
-
-The guard fires before workspace resolution, so the passing cases only need the
-downstream (resolve/credit/stream) chain stubbed to reach a 200 stream.
+Two dimensions: the target thread must belong to the caller (or be brand-new),
+and the resolved workspace must belong to the caller — so a send can't reach
+another user's thread or run inside their sandbox.
 """
 
 from contextlib import contextmanager
@@ -66,11 +58,12 @@ def _app_for(user_id: str):
 
 
 @contextmanager
-def _stub_downstream(owner_id):
-    """Patch the IDOR guard's owner lookup + everything past it.
+def _stub_downstream(owner_id, ws_owner=CALLER):
+    """Patch the IDOR guards' lookups + everything past them.
 
-    With ``owner_id`` matching the caller (or ``None``), a POST should sail
-    through the guard and reach a 200 SSE stream.
+    With ``owner_id`` matching the caller (or ``None``) AND ``ws_owner`` matching
+    the auth user, a POST should sail through both the thread and workspace
+    guards and reach a 200 SSE stream.
     """
     from src.server.app import setup as setup_module
 
@@ -81,6 +74,11 @@ def _stub_downstream(owner_id):
         patch(
             "src.server.app.threads.get_thread_owner_id",
             new=AsyncMock(return_value=owner_id),
+        ),
+        # Workspace IDOR guard reads the workspace owner via get_workspace.
+        patch(
+            "src.server.database.workspace.get_workspace",
+            new=AsyncMock(return_value={"user_id": ws_owner, "status": "running"}),
         ),
         patch.object(setup_module, "agent_config", MagicMock()),
         patch(
@@ -102,6 +100,11 @@ def _stub_downstream(owner_id):
         patch(
             "src.server.app.threads.observe_chat_stream",
             side_effect=lambda gen, **_: gen,
+        ),
+        # A 403 unwinds through the burst-slot release; keep it hermetic.
+        patch(
+            "src.server.dependencies.usage_limits.release_burst_slot",
+            new=AsyncMock(),
         ),
     ):
         yield
@@ -130,17 +133,7 @@ async def _post(app, path: str, *, headers=None):
 async def test_post_existing_thread_owned_by_other_user_is_forbidden():
     """The core IDOR: caller POSTs to a thread owned by someone else -> 403."""
     app = _app_for(CALLER)
-    with (
-        patch(
-            "src.server.app.threads.get_thread_owner_id",
-            new=AsyncMock(return_value=OWNER),
-        ),
-        # The 403 unwinds through the burst-slot release; keep it hermetic.
-        patch(
-            "src.server.dependencies.usage_limits.release_burst_slot",
-            new=AsyncMock(),
-        ),
-    ):
+    with _stub_downstream(owner_id=OWNER):
         resp = await _post(app, "/api/v1/threads/tid-existing/messages")
     assert resp.status_code == 403
     assert resp.json()["detail"] == "Forbidden"
@@ -175,10 +168,21 @@ async def test_internal_dispatch_with_owner_user_id_proceeds():
     user to the owner; the guard must let the dispatch through (no 403).
     """
     app = _app_for(OWNER)
-    with _stub_downstream(owner_id=OWNER):
+    with _stub_downstream(owner_id=OWNER, ws_owner=OWNER):
         resp = await _post(
             app,
             "/api/v1/threads/tid-dispatch/messages",
             headers={"X-Dispatch": "background"},
         )
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_post_new_thread_with_other_users_workspace_is_forbidden():
+    """Workspace IDOR: a fresh thread_id paired with someone else's workspace_id
+    -> 403, so a run can't start inside the victim's sandbox."""
+    app = _app_for(CALLER)
+    with _stub_downstream(owner_id=None, ws_owner=OWNER):
+        resp = await _post(app, "/api/v1/threads/messages")
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Forbidden"

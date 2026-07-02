@@ -1280,58 +1280,317 @@ class TestCancelCompaction:
 # ---------------------------------------------------------------------------
 
 class TestClearReportBackWatch:
-    """A report-back flash run that fails/cancels must clear the watch, since the
-    success-only completion hook never runs on a terminal failure (else /status
-    reports the report-back pending until its 24h TTL)."""
+    """A terminal report-back-adjacent run must clear its flash report-back watch,
+    since the success-only completion hook never runs on a terminal failure/cancel
+    (else /status reports the report-back pending until its 24h TTL). The PTC
+    thread whose origin to tear down is resolved exactly as the crash path does:
+    ``report_back_ptc_thread_id`` else ``thread_id``, then ``ptc_origin``."""
 
-    @pytest.mark.asyncio
-    async def test_clears_when_metadata_has_ptc_thread_id(self):
-        btm = _make_btm()
+    @staticmethod
+    def _cache_with_origin(origin):
         cache = MagicMock()
         cache.enabled = True
         cache.client = MagicMock()
+        cache.client.publish = AsyncMock()
+        cache.get = AsyncMock(return_value=origin)
+        return cache
+
+    @pytest.mark.asyncio
+    async def test_clears_report_back_flash_run_via_origin(self):
+        """A report-back flash run (report_back_ptc_thread_id set) resolves its
+        origin by that ptc id and clears the originating flash's watch + wakes it."""
+        from src.server.handlers.chat.report_back_keys import (
+            ptc_origin_key,
+            thread_wake_key,
+        )
+
+        btm = _make_btm()
+        cache = self._cache_with_origin(
+            {"flash_thread_id": "flash-1", "user_id": "u-1"}
+        )
         mock_clear = AsyncMock()
 
         with patch(
             "src.utils.cache.redis_cache.get_cache_client", return_value=cache
         ), patch(
-            "src.server.handlers.chat.ptc_workflow.clear_flash_report_back", mock_clear
+            "src.server.handlers.chat.report_back.clear_flash_report_back", mock_clear
         ):
             await btm._clear_report_back_watch(
-                "flash-1", {"report_back_ptc_thread_id": "ptc-1"}
+                "flash-1", {"report_back_ptc_thread_id": "ptc-1", "user_id": "u-1"}
             )
 
-        mock_clear.assert_awaited_once_with(cache, "ptc-1", "flash-1")
+        cache.get.assert_awaited_once_with(ptc_origin_key("ptc-1"))
+        # Owner threaded through so the per-user cap slot is released even if
+        # ptc_origin TTL-expired; flash thread comes from the origin record.
+        mock_clear.assert_awaited_once_with(cache, "ptc-1", "flash-1", user_id="u-1")
+        channel, _payload = cache.client.publish.await_args.args
+        assert channel == thread_wake_key("flash-1")
 
     @pytest.mark.asyncio
-    async def test_noop_without_ptc_thread_id(self):
+    async def test_clears_cancelled_dispatched_ptc_via_origin(self):
+        """A user-cancelled dispatched PTC run carries NO report_back_ptc_thread_id
+        and thread_id IS the ptc thread — its origin (keyed by thread_id) still
+        exists, so the flash's watch + per-user cap slot must be cleared and the
+        watching client woken (the crash-clear never fires on a clean cancel)."""
+        from src.server.handlers.chat.report_back_keys import (
+            ptc_origin_key,
+            thread_wake_key,
+        )
+
         btm = _make_btm()
+        cache = self._cache_with_origin(
+            {"flash_thread_id": "flash-9", "user_id": "u-1"}
+        )
         mock_clear = AsyncMock()
 
         with patch(
-            "src.utils.cache.redis_cache.get_cache_client"
-        ) as mock_get_cache, patch(
-            "src.server.handlers.chat.ptc_workflow.clear_flash_report_back", mock_clear
+            "src.utils.cache.redis_cache.get_cache_client", return_value=cache
+        ), patch(
+            "src.server.handlers.chat.report_back.clear_flash_report_back", mock_clear
+        ):
+            await btm._clear_report_back_watch("ptc-1", {"user_id": "u-1"})
+
+        cache.get.assert_awaited_once_with(ptc_origin_key("ptc-1"))
+        mock_clear.assert_awaited_once_with(cache, "ptc-1", "flash-9", user_id="u-1")
+        assert cache.client.publish.await_args.args[0] == thread_wake_key("flash-9")
+
+    @pytest.mark.asyncio
+    async def test_noop_for_ordinary_flash_turn_without_origin(self):
+        """An ordinary flash turn (thread_id is the flash thread, no ptc_origin
+        keyed on it) must stay a no-op — no clear, no wake."""
+        btm = _make_btm()
+        cache = self._cache_with_origin(None)  # no origin for this id
+        mock_clear = AsyncMock()
+
+        with patch(
+            "src.utils.cache.redis_cache.get_cache_client", return_value=cache
+        ), patch(
+            "src.server.handlers.chat.report_back.clear_flash_report_back", mock_clear
         ):
             await btm._clear_report_back_watch("flash-1", {"user_id": "u-1"})
 
         mock_clear.assert_not_called()
-        mock_get_cache.assert_not_called()
+        cache.client.publish.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_swallows_clear_errors(self):
         btm = _make_btm()
-        cache = MagicMock()
-        cache.enabled = True
-        cache.client = MagicMock()
+        cache = self._cache_with_origin(
+            {"flash_thread_id": "flash-1", "user_id": "u-1"}
+        )
 
         with patch(
             "src.utils.cache.redis_cache.get_cache_client", return_value=cache
         ), patch(
-            "src.server.handlers.chat.ptc_workflow.clear_flash_report_back",
+            "src.server.handlers.chat.report_back.clear_flash_report_back",
             AsyncMock(side_effect=RuntimeError("redis down")),
         ):
             # Must not raise — terminal handlers call this best-effort.
             await btm._clear_report_back_watch(
                 "flash-1", {"report_back_ptc_thread_id": "ptc-1"}
             )
+
+
+# ---------------------------------------------------------------------------
+# Terminal stream-end sentinel (WORKFLOW_STREAM_END_EVENT)
+# ---------------------------------------------------------------------------
+
+class _FakePipeline:
+    """Captures xadd/expire calls issued inside ``async with pipeline()``."""
+
+    def __init__(self, calls: list, fail: bool = False):
+        self.calls = calls
+        self.fail = fail
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def xadd(self, key, fields, **kwargs):
+        self.calls.append(("xadd", key, fields))
+
+    def expire(self, key, ttl):
+        self.calls.append(("expire", key, ttl))
+
+    async def execute(self):
+        if self.fail:
+            raise ConnectionError("redis down")
+        return []
+
+
+def _sentinel_cache(calls: list, fail: bool = False) -> MagicMock:
+    cache = MagicMock()
+    cache.enabled = True
+    cache.client = MagicMock()
+    cache.client.pipeline = MagicMock(
+        return_value=_FakePipeline(calls, fail=fail)
+    )
+    return cache
+
+
+class TestAppendStreamEndSentinel:
+
+    @pytest.mark.asyncio
+    async def test_appends_raw_json_sentinel_with_ttl(self):
+        import json as _json
+
+        btm = _make_btm()
+        btm.event_storage_backend = "redis"
+        calls: list = []
+
+        with patch(
+            "src.server.services.background_task_manager.get_cache_client",
+            return_value=_sentinel_cache(calls),
+        ):
+            await btm.append_stream_end_sentinel("t-1", "r-1")
+
+        assert calls[0][0] == "xadd"
+        assert calls[0][1] == "workflow:stream:t-1:r-1"
+        assert _json.loads(calls[0][2][b"event"]) == {
+            "event": "workflow_stream_end"
+        }
+        # TTL refreshed so a sentinel on an expired key can't leak it.
+        assert ("expire", "workflow:stream:t-1:r-1", btm.redis_event_ttl) in calls
+
+    @pytest.mark.asyncio
+    async def test_append_failure_swallowed(self):
+        btm = _make_btm()
+        btm.event_storage_backend = "redis"
+
+        with patch(
+            "src.server.services.background_task_manager.get_cache_client",
+            return_value=_sentinel_cache([], fail=True),
+        ):
+            # Must not raise — terminal paths call this best-effort.
+            await btm.append_stream_end_sentinel("t-1", "r-1")
+
+    @pytest.mark.asyncio
+    async def test_noop_when_backend_not_redis(self):
+        btm = _make_btm()  # event_storage_backend == "memory"
+
+        with patch(
+            "src.server.services.background_task_manager.get_cache_client"
+        ) as mock_get:
+            await btm.append_stream_end_sentinel("t-1", "r-1")
+
+        mock_get.assert_not_called()
+
+
+class TestSentinelAppendedOnTerminalFlavors:
+    """_run_workflow appends the sentinel after the final buffered event for
+    every terminal flavor, and before the _mark_* persistence that may DEL
+    the stream."""
+
+    def _btm_with_task(self, thread_id: str, run_id: str):
+        btm = _make_btm()
+        btm.enable_storage = True
+        btm.tasks[(thread_id, run_id)] = _make_task_info(
+            thread_id=thread_id, run_id=run_id, status=TaskStatus.RUNNING
+        )
+        return btm
+
+    @pytest.mark.asyncio
+    async def test_completed_appends_sentinel_after_last_event(self):
+        btm = self._btm_with_task("t-comp", "r-1")
+        order: list[str] = []
+
+        async def fake_workflow():
+            yield "id: 1\nevent: x\ndata: a\n\n"
+            yield "id: 2\nevent: x\ndata: b\n\n"
+
+        async def record_buffer(thread_id, run_id, event):
+            order.append(f"event:{event.splitlines()[0]}")
+
+        async def record_sentinel(thread_id, run_id):
+            order.append("sentinel")
+
+        async def record_completed(thread_id, run_id):
+            order.append("mark_completed")
+
+        with patch.object(btm, "_buffer_event_redis", side_effect=record_buffer), \
+             patch.object(btm, "append_stream_end_sentinel", side_effect=record_sentinel), \
+             patch.object(btm, "_mark_completed", side_effect=record_completed), \
+             patch.object(btm, "_mark_failed", new_callable=AsyncMock) as mock_failed:
+            await btm._run_workflow(
+                thread_id="t-comp",
+                run_id="r-1",
+                workflow_generator=fake_workflow(),
+                cancel_event=asyncio.Event(),
+            )
+
+        assert order == ["event:id: 1", "event:id: 2", "sentinel", "mark_completed"]
+        mock_failed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_appends_sentinel_before_mark_failed(self):
+        btm = self._btm_with_task("t-fail", "r-1")
+        order: list[str] = []
+
+        async def failing_workflow():
+            yield "id: 1\nevent: x\ndata: a\n\n"
+            raise RuntimeError("boom")
+
+        async def record_buffer(thread_id, run_id, event):
+            order.append("event")
+
+        async def record_sentinel(thread_id, run_id):
+            order.append("sentinel")
+
+        async def record_failed(thread_id, run_id, error):
+            order.append("mark_failed")
+
+        with patch.object(btm, "_buffer_event_redis", side_effect=record_buffer), \
+             patch.object(btm, "append_stream_end_sentinel", side_effect=record_sentinel), \
+             patch.object(btm, "_mark_completed", new_callable=AsyncMock) as mock_completed, \
+             patch.object(btm, "_mark_failed", side_effect=record_failed):
+            await btm._run_workflow(
+                thread_id="t-fail",
+                run_id="r-1",
+                workflow_generator=failing_workflow(),
+                cancel_event=asyncio.Event(),
+            )
+
+        assert order == ["event", "sentinel", "mark_failed"]
+        mock_completed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_appends_sentinel_before_mark_cancelled(self):
+        btm = self._btm_with_task("t-canc", "r-1")
+        order: list[str] = []
+        cancel_event = asyncio.Event()
+
+        async def fake_workflow():
+            for i in range(100):
+                await asyncio.sleep(0.01)
+                yield f"id: {i}\nevent: x\ndata: a\n\n"
+
+        async def record_sentinel(thread_id, run_id):
+            order.append("sentinel")
+
+        async def record_cancelled(thread_id, run_id):
+            order.append("mark_cancelled")
+
+        async def set_cancel():
+            await asyncio.sleep(0.03)
+            cancel_event.set()
+
+        with patch.object(btm, "_buffer_event_redis", new_callable=AsyncMock), \
+             patch.object(btm, "append_stream_end_sentinel", side_effect=record_sentinel), \
+             patch.object(btm, "_mark_completed", new_callable=AsyncMock), \
+             patch.object(btm, "_mark_cancelled", side_effect=record_cancelled), \
+             patch.object(btm, "_mark_failed", new_callable=AsyncMock), \
+             patch.object(btm, "_flush_checkpoint", new_callable=AsyncMock), \
+             patch.object(btm, "_teardown_subagents_on_stop", new_callable=AsyncMock):
+            setter = asyncio.create_task(set_cancel())
+            with pytest.raises(asyncio.CancelledError):
+                await btm._run_workflow(
+                    thread_id="t-canc",
+                    run_id="r-1",
+                    workflow_generator=fake_workflow(),
+                    cancel_event=cancel_event,
+                )
+            await setter
+
+        assert order == ["sentinel", "mark_cancelled"]

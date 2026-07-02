@@ -254,6 +254,38 @@ async def test_get_queries_for_thread(mock_db_connection, mock_cursor):
     assert len(queries) == 2
 
 
+@pytest.mark.asyncio
+async def test_get_latest_turn_index(mock_db_connection, mock_cursor):
+    """get_latest_turn_index returns MAX(turn_index) for the thread."""
+    from src.server.database.conversation import get_latest_turn_index
+
+    mock_cursor.fetchone.return_value = {"latest_turn_index": 4}
+
+    assert await get_latest_turn_index("t-1") == 4
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "MAX(turn_index)" in sql
+
+
+@pytest.mark.asyncio
+async def test_get_latest_turn_index_no_turns_is_none(mock_db_connection, mock_cursor):
+    """A thread with no persisted turns yields None (SQL MAX over zero rows)."""
+    from src.server.database.conversation import get_latest_turn_index
+
+    mock_cursor.fetchone.return_value = {"latest_turn_index": None}
+
+    assert await get_latest_turn_index("t-1") is None
+
+
+@pytest.mark.asyncio
+async def test_get_latest_turn_index_read_failure_is_none(mock_db_connection, mock_cursor):
+    """A DB error degrades to None (no signal) instead of raising."""
+    from src.server.database.conversation import get_latest_turn_index
+
+    mock_cursor.execute.side_effect = RuntimeError("connection lost")
+
+    assert await get_latest_turn_index("t-1") is None
+
+
 # ===========================================================================
 # Response Tests
 # ===========================================================================
@@ -483,3 +515,20 @@ async def test_get_thread_owner_id_normalizes_noncanonical_uuid(
         await get_thread_owner_id(variant)
         params = mock_cursor.execute.call_args[0][1]
         assert params == (canonical,), f"{variant!r} bound {params!r}, not canonical"
+
+
+@pytest.mark.asyncio
+async def test_get_thread_owner_id_returns_user_id_from_auth_meta(
+    mock_db_connection, mock_cursor
+):
+    """get_thread_owner_id delegates to get_thread_auth_meta and returns user_id.
+
+    The delegation issues the superset (user_id + is_shared) query but preserves
+    the scalar return contract: just the owning user_id (or None).
+    """
+    from src.server.database.conversation import get_thread_owner_id
+
+    canonical = "12345678-1234-5678-1234-567812345678"
+    mock_cursor.fetchone.return_value = {"user_id": "owner-42", "is_shared": True}
+
+    assert await get_thread_owner_id(canonical) == "owner-42"

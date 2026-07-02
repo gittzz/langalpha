@@ -13,6 +13,7 @@ tests pin that a legitimate owner reaches dispatch and a non-owner is rejected.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -200,94 +201,109 @@ def _f1_origin() -> dict:
     }
 
 
-@pytest.mark.asyncio
-async def test_cross_flash_reuse_does_not_strand_other_flashs_origin():
-    """A second flash reusing the same PTC thread must NOT clobber or delete the
-    first flash's report-back origin — even when its own dispatch fails and rolls
-    back. Origin is keyed by ptc_thread_id only, so seizing+deleting it would
-    strand the first flash's pending report-back."""
-    store = {f"ptc_origin:{PTC_THREAD_ID}": _f1_origin()}
-    fake_cache = _FakeOriginCache(store)
-    owner = AsyncMock(return_value=USER_ID)
-    by_id = AsyncMock(return_value={
-        "conversation_thread_id": PTC_THREAD_ID,
-        "workspace_id": WORKSPACE_ID,
-    })
+_WIRED_SLOT = (None, {"watch": True, "user": True}, True)
 
+
+@contextlib.contextmanager
+def _dispatch_env(store: dict, *, reserve=_WIRED_SLOT, resp: _FakeResp | None = None):
+    """Patch the continuation dispatch's collaborators; yields the release mock."""
+    release = AsyncMock()
     with patch(
-        "src.server.database.conversation.get_thread_owner_id", owner
+        "src.server.database.conversation.get_thread_owner_id",
+        AsyncMock(return_value=USER_ID),
     ), patch(
-        "src.server.database.conversation.get_thread_by_id", by_id
+        "src.server.database.conversation.get_thread_by_id",
+        AsyncMock(return_value={
+            "conversation_thread_id": PTC_THREAD_ID,
+            "workspace_id": WORKSPACE_ID,
+        }),
     ), patch(
         "src.tools.secretary.tools._hitl_confirm", return_value=(True, {})
     ), patch(
-        "src.tools.secretary.tools._reserve_dispatch_slot",
-        AsyncMock(return_value=(None, {"watch": True, "user": True})),
+        "src.server.handlers.chat.report_back._reserve_slot_membership",
+        AsyncMock(return_value=reserve),
     ), patch(
-        "src.tools.secretary.tools._release_dispatch_slot", AsyncMock()
+        "src.server.handlers.chat.report_back._release_slot_membership", release
     ), patch(
-        "src.utils.cache.redis_cache.get_cache_client", return_value=fake_cache
+        "src.utils.cache.redis_cache.get_cache_client",
+        return_value=_FakeOriginCache(store),
     ), patch(
-        "aiohttp.ClientSession", return_value=_FakeSession(_FakeResp(status=500))
+        "aiohttp.ClientSession", return_value=_FakeSession(resp or _FakeResp())
     ):
-        result = await ptc_agent.ainvoke(
-            _tool_call({"question": "follow up", "thread_id": PTC_THREAD_ID}),
-            # report_back is on and the dispatching flash (F2) differs from the
-            # owner of the existing origin (F1).
-            config={"configurable": {
-                "user_id": USER_ID,
-                "thread_id": "flash-F2",
-                "workspace_id": "flash-ws-F2",
-            }},
-        )
+        yield release
 
-    payload = _payload(result)
+
+async def _dispatch_from(flash: str) -> dict:
+    result = await ptc_agent.ainvoke(
+        _tool_call({"question": "follow up", "thread_id": PTC_THREAD_ID}),
+        config={"configurable": {
+            "user_id": USER_ID,
+            "thread_id": flash,
+            "workspace_id": f"ws-{flash}",
+        }},
+    )
+    return _payload(result)
+
+
+@pytest.mark.asyncio
+async def test_cross_flash_reuse_does_not_strand_other_flashs_origin():
+    """A second flash's failed dispatch must not clobber/delete F1's origin."""
+    store = {f"ptc_origin:{PTC_THREAD_ID}": _f1_origin()}
+
+    with _dispatch_env(store, resp=_FakeResp(status=500)):
+        payload = await _dispatch_from("flash-F2")
+
     assert payload.get("success") is False, payload  # dispatch failed -> rollback
     # F1's origin survives untouched: not overwritten to F2, not deleted.
     assert store.get(f"ptc_origin:{PTC_THREAD_ID}") == _f1_origin()
 
 
 @pytest.mark.asyncio
+async def test_cross_flash_reuse_releases_its_own_reservation():
+    """A cross-flash reuse can't be wired, so it releases its own watch + cap
+    slot (no TTL leak), still dispatches, and leaves F1's origin untouched."""
+    store = {f"ptc_origin:{PTC_THREAD_ID}": _f1_origin()}
+
+    with _dispatch_env(store) as release:
+        payload = await _dispatch_from("flash-F2")
+
+    assert payload.get("success") is True, payload  # dispatch still succeeds
+    # Unwired (another flash owns the origin): must not promise a report-back.
+    assert payload.get("report_back") is False, payload
+    release.assert_awaited_once_with(
+        "flash-F2", PTC_THREAD_ID, USER_ID, {"watch": True, "user": True}
+    )
+    assert store.get(f"ptc_origin:{PTC_THREAD_ID}") == _f1_origin()
+
+
+@pytest.mark.asyncio
 async def test_same_flash_reuse_keeps_origin_ownership():
-    """The same flash continuing its own PTC thread still owns + refreshes the
-    origin (the cross-flash guard must not downgrade a same-flash record)."""
+    """A same-flash continuation still owns + refreshes its origin."""
     same = _f1_origin()
     same["flash_thread_id"] = "flash-F2"  # owned by the dispatching flash
     store = {f"ptc_origin:{PTC_THREAD_ID}": dict(same)}
-    fake_cache = _FakeOriginCache(store)
-    owner = AsyncMock(return_value=USER_ID)
-    by_id = AsyncMock(return_value={
-        "conversation_thread_id": PTC_THREAD_ID,
-        "workspace_id": WORKSPACE_ID,
-    })
 
-    with patch(
-        "src.server.database.conversation.get_thread_owner_id", owner
-    ), patch(
-        "src.server.database.conversation.get_thread_by_id", by_id
-    ), patch(
-        "src.tools.secretary.tools._hitl_confirm", return_value=(True, {})
-    ), patch(
-        "src.tools.secretary.tools._reserve_dispatch_slot",
-        AsyncMock(return_value=(None, {"watch": True, "user": True})),
-    ), patch(
-        "src.utils.cache.redis_cache.get_cache_client", return_value=fake_cache
-    ), patch(
-        "aiohttp.ClientSession", return_value=_FakeSession(_FakeResp())
-    ):
-        result = await ptc_agent.ainvoke(
-            _tool_call({"question": "follow up", "thread_id": PTC_THREAD_ID}),
-            config={"configurable": {
-                "user_id": USER_ID,
-                "thread_id": "flash-F2",
-                "workspace_id": "flash-ws-F2",
-            }},
-        )
+    with _dispatch_env(store):
+        payload = await _dispatch_from("flash-F2")
 
-    payload = _payload(result)
     assert payload.get("success") is True, payload
-    # Origin still present and pointed at the owning (same) flash.
+    # Same flash owns the wired origin + watch member, so report-back is real.
+    assert payload.get("report_back") is True, payload
     assert store[f"ptc_origin:{PTC_THREAD_ID}"]["flash_thread_id"] == "flash-F2"
+
+
+@pytest.mark.asyncio
+async def test_unwired_reserve_reports_back_false_but_still_dispatches():
+    """A fail-open reserve (watch_member False) still dispatches but must not
+    promise a report-back the completion gate would silently drop."""
+    store: dict = {}
+
+    with _dispatch_env(store, reserve=(None, {"watch": False, "user": False}, False)):
+        payload = await _dispatch_from("flash-F1")
+
+    assert payload.get("success") is True, payload
+    assert payload.get("status") == "dispatched", payload
+    assert payload.get("report_back") is False, payload
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ Validates:
 - Keepalive emission on BLOCK timeout + terminal-after-empty exit handshake
 - on_attach / on_detach hooks fire even when generator is cancelled mid-flight
 - Subagent JSON-record rendering to SSE wire format
+- Workflow stream-end sentinel: immediate close on the main consumer path
 """
 
 from __future__ import annotations
@@ -601,6 +602,198 @@ async def test_stream_from_log_bumps_workflow_connection_counter(monkeypatch):
 
     fake_manager.increment_connection.assert_awaited_once_with("t-housekeeping", "r-1")
     fake_manager.decrement_connection.assert_awaited_once_with("t-housekeeping", "r-1")
+
+
+def test_is_stream_end_sentinel_detection():
+    """Detection is strict + cheap: only JSON dicts with the exact event and
+    no ``seq`` match; SSE wire strings (``id:``/``event:``/``:``-first) bail
+    on the ``{`` fast path before any json.loads."""
+    from src.server.handlers.chat.stream_from_log import _is_stream_end_sentinel
+
+    sentinel = "workflow_stream_end"
+    assert _is_stream_end_sentinel(json.dumps({"event": sentinel}), sentinel)
+
+    # Wire strings — including the id-less crash-path error event — never match.
+    assert not _is_stream_end_sentinel("id: 5\nevent: x\ndata: {}\n\n", sentinel)
+    assert not _is_stream_end_sentinel("event: error\ndata: {}\n\n", sentinel)
+    assert not _is_stream_end_sentinel(":keepalive\n\n", sentinel)
+    assert not _is_stream_end_sentinel("", sentinel)
+    # Garbage / wrong shape / wrong event / seq-bearing dicts don't match.
+    assert not _is_stream_end_sentinel("{not json", sentinel)
+    assert not _is_stream_end_sentinel("[1, 2]", sentinel)
+    assert not _is_stream_end_sentinel(json.dumps({"event": "other"}), sentinel)
+    assert not _is_stream_end_sentinel(
+        json.dumps({"event": sentinel, "seq": 1}), sentinel
+    )
+
+
+@pytest.mark.asyncio
+async def test_workflow_consumer_exits_immediately_on_sentinel():
+    """On reading the terminal sentinel the consumer must return within the
+    same XREAD round — no further XREAD, no handshake dwell — and must not
+    yield the sentinel itself. on_detach still fires (finally path)."""
+    real_bytes = b"id: 1\nevent: x\ndata: a\n\n"
+    sentinel_bytes = json.dumps({"event": "workflow_stream_end"}).encode("utf-8")
+    cache = _make_cache(
+        [
+            [
+                (
+                    b"k",
+                    [
+                        (b"1-0", {b"event": real_bytes}),
+                        (b"2-0", {b"event": sentinel_bytes}),
+                    ],
+                )
+            ],
+            # No further rounds: exhausting the side_effect fails loudly if
+            # the consumer keeps XREAD-ing past the sentinel.
+        ]
+    )
+    detach_calls = []
+
+    async def on_attach() -> None:
+        pass
+
+    async def on_detach() -> None:
+        detach_calls.append(True)
+
+    async def terminal() -> bool:
+        return False  # never terminal — only the sentinel can close this
+
+    with patch(
+        "src.server.handlers.chat.stream_from_log.get_cache_client",
+        return_value=cache,
+    ):
+        out = []
+        async for ev in _stream_from_redis_log(
+            stream_key="k",
+            terminal_check=terminal,
+            last_event_id=0,
+            on_attach=on_attach,
+            on_detach=on_detach,
+            sentinel_event="workflow_stream_end",
+        ):
+            out.append(ev)
+
+    assert out == [real_bytes.decode("utf-8")]
+    assert cache.client.xread.await_count == 1
+    assert detach_calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_resume_past_final_event_still_receives_sentinel_and_closes():
+    """Cursor-resume past the last real event: the only remaining entry is
+    the sentinel — the consumer reads it and closes without yielding."""
+    sentinel_bytes = json.dumps({"event": "workflow_stream_end"}).encode("utf-8")
+    cache = _make_cache(
+        [
+            [(b"k", [(b"43-0", {b"event": sentinel_bytes})])],
+        ]
+    )
+
+    async def terminal() -> bool:
+        return False
+
+    with patch(
+        "src.server.handlers.chat.stream_from_log.get_cache_client",
+        return_value=cache,
+    ):
+        out = [
+            ev
+            async for ev in _stream_from_redis_log(
+                stream_key="k",
+                terminal_check=terminal,
+                last_event_id=42,
+                sentinel_event="workflow_stream_end",
+            )
+        ]
+
+    assert out == []
+    assert cache.client.xread.await_count == 1
+    args, kwargs = cache.client.xread.call_args_list[0]
+    streams = args[0] if args else kwargs.get("streams")
+    assert streams == {b"k": b"42-0"}
+
+
+@pytest.mark.asyncio
+async def test_sentinel_passthrough_when_no_sentinel_event_configured():
+    """Without ``sentinel_event`` (legacy key, subagent inner loop) the raw
+    JSON entry passes through untouched — no behavior change there."""
+    sentinel_bytes = json.dumps({"event": "workflow_stream_end"}).encode("utf-8")
+    cache = _make_cache(
+        [
+            [(b"k", [(b"1-0", {b"event": sentinel_bytes})])],
+            [],  # terminal handshake round 1
+            [],  # round 2 → exit
+        ]
+    )
+
+    async def terminal() -> bool:
+        return True
+
+    with patch(
+        "src.server.handlers.chat.stream_from_log.get_cache_client",
+        return_value=cache,
+    ):
+        out = [
+            ev
+            async for ev in _stream_from_redis_log(
+                stream_key="k",
+                terminal_check=terminal,
+                last_event_id=0,
+            )
+            if not ev.startswith(":keepalive")
+        ]
+
+    assert out == [sentinel_bytes.decode("utf-8")]
+
+
+@pytest.mark.asyncio
+async def test_stream_from_log_main_path_closes_on_sentinel(monkeypatch):
+    """End-to-end through ``stream_from_log``: the per-run consumer closes on
+    the producer's sentinel within the same XREAD round, decrementing the
+    connection counter on the way out."""
+    from src.server.handlers.chat import stream_from_log as sfl_mod
+    from src.server.services.background_task_manager import (
+        BackgroundTaskManager,
+        TaskStatus,
+    )
+
+    real_bytes = b"id: 1\nevent: message_chunk\ndata: {}\n\n"
+    sentinel_bytes = json.dumps({"event": "workflow_stream_end"}).encode("utf-8")
+    cache = _make_cache(
+        [
+            [
+                (
+                    b"workflow:stream:t-sent:r-1",
+                    [
+                        (b"1-0", {b"event": real_bytes}),
+                        (b"2-0", {b"event": sentinel_bytes}),
+                    ],
+                )
+            ],
+        ]
+    )
+    monkeypatch.setattr(sfl_mod, "get_cache_client", lambda: cache)
+
+    fake_task = MagicMock()
+    fake_task.run_id = "r-1"
+    fake_task.status = TaskStatus.RUNNING  # not yet terminal — sentinel closes
+
+    fake_manager = MagicMock()
+    fake_manager.tasks = {("t-sent", "r-1"): fake_task}
+    fake_manager._find_latest_for_thread = MagicMock(return_value=fake_task)
+    fake_manager.increment_connection = AsyncMock(return_value=True)
+    fake_manager.decrement_connection = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        BackgroundTaskManager, "get_instance", classmethod(lambda cls: fake_manager)
+    )
+
+    out = [ev async for ev in stream_from_log("t-sent", last_event_id=None)]
+
+    assert out == [real_bytes.decode("utf-8")]
+    assert cache.client.xread.await_count == 1
+    fake_manager.decrement_connection.assert_awaited_once_with("t-sent", "r-1")
 
 
 @pytest.mark.asyncio
