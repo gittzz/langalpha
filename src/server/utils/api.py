@@ -168,7 +168,7 @@ def find_malformed_route_ids(
     """Return (slot, value) pairs where a workspace/thread id isn't a UUID.
 
     Inspects the workspaces/threads path segment and the ``workspace_id`` query
-    param; allowlisted literal segments (messages/flash/reorder) are ignored.
+    param; allowlisted literal segments (messages/flash/reorder/dispatches) are ignored.
     """
     findings: list[tuple[str, str]] = []
 

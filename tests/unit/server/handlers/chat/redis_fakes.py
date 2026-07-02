@@ -173,8 +173,8 @@ def seed_dispatched(cache: FakeCache, flash: str, ptcs: list[str], user: str = "
     """Mirror what reservation + origin recording leave behind for each dispatch."""
     for ptc in ptcs:
         cache.client.sets.setdefault(report_back.flash_watch_key(flash), set()).add(ptc)
-        cache.client.sets.setdefault(f"flash_user_pending:{user}", set()).add(ptc)
-        cache.kv[f"ptc_origin:{ptc}"] = origin(ptc, flash, user)
+        cache.client.sets.setdefault(report_back.flash_user_pending_key(user), set()).add(ptc)
+        cache.kv[report_back.ptc_origin_key(ptc)] = origin(ptc, flash, user)
 
 
 async def drain(flash: str, *, ticks: int = 200) -> None:

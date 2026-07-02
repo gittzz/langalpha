@@ -15,10 +15,10 @@ from unittest.mock import patch
 import pytest
 
 from src.server.handlers.chat import report_back
-from tests.unit.server.handlers.chat.test_flash_report_back import (
-    _drain,
-    _FakeCache,
-    _seed_dispatched,
+from tests.unit.server.handlers.chat.redis_fakes import (
+    FakeCache as _FakeCache,
+    drain as _drain,
+    seed_dispatched as _seed_dispatched,
 )
 
 

@@ -22,7 +22,7 @@ export function apiMockModule() {
     submitFeedback: vi.fn(),
     removeFeedback: vi.fn(),
     getThreadFeedback: vi.fn().mockResolvedValue([]),
-    watchThread: vi.fn().mockReturnValue({ abort: new AbortController() }),
+    watchThread: vi.fn().mockImplementation(() => ({ abort: new AbortController() })),
   };
 }
 
