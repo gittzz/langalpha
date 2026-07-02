@@ -216,6 +216,64 @@ describe('useChatMessages — report-back watch (PTC → flash report-back)', ()
     expect(serialized.filter((s) => s.includes('summary…'))).toHaveLength(1);
   });
 
+  it('keeps the SENT user bubble when a staleness reload replays a turn the user typed', async () => {
+    // Second half of the round-trip repro: the user TYPES a message (its
+    // content lands in the recently-sent dedup tracker), the send finalizes,
+    // then a jump-away/back triggers a corrective reload. The reload clears
+    // the now-isHistory optimistic bubble, so the replay must be allowed to
+    // re-render the user message — the finalize has to release the dedup
+    // tracker, or the replayed user_message is skipped as a "duplicate" of a
+    // bubble that no longer exists (vanished user bubble).
+    mockStatus.mockResolvedValue(threadStatus({ latest_turn_index: 0 }));
+    mockReplay.mockImplementation((_tid: string, onEvent: (e: Record<string, unknown>) => void) => {
+      onEvent({ event: 'user_message', turn_index: 0, content: 'earlier question', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 0, role: 'assistant', agent: 'main', content_type: 'text', content: 'earlier answer' });
+      return Promise.resolve();
+    });
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-rb', 'th-rb'));
+    await waitFor(() => expect(mockReplay).toHaveBeenCalledTimes(1));
+    await settleMountEffect();
+
+    // Live send: streams and success-finalizes (turn 1 persisted server-side).
+    mockSend.mockImplementation(async (...args: unknown[]) => {
+      const onEvent = args[5] as (e: Record<string, unknown>) => void;
+      onEvent({ event: 'message_chunk', role: 'assistant', agent: 'main', content_type: 'text', content: 'resuming both threads' });
+      return { disconnected: false };
+    });
+    await act(async () => {
+      await result.current.handleSendMessage('resume both analyses', false);
+    });
+    expect(JSON.stringify(result.current.messages)).toContain('resume both analyses');
+
+    // Jump away and back: another turn (a report-back) advanced the server
+    // watermark past this view's → corrective reload; its replay now covers
+    // the typed turn too.
+    mockStatus.mockResolvedValue(threadStatus({ latest_turn_index: 2 }));
+    mockReplay.mockImplementation((_tid: string, onEvent: (e: Record<string, unknown>) => void) => {
+      onEvent({ event: 'user_message', turn_index: 0, content: 'earlier question', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 0, role: 'assistant', agent: 'main', content_type: 'text', content: 'earlier answer' });
+      onEvent({ event: 'user_message', turn_index: 1, content: 'resume both analyses', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 1, role: 'assistant', agent: 'main', content_type: 'text', content: 'resuming both threads' });
+      onEvent({ event: 'user_message', turn_index: 2, content: 'report back instruction', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 2, role: 'assistant', agent: 'main', content_type: 'text', content: 'late summary' });
+      return Promise.resolve();
+    });
+
+    await act(async () => {
+      await result.current.reconnectIfStaleRun();
+    });
+    await waitFor(() => expect(mockReplay).toHaveBeenCalledTimes(2));
+    await settleMountEffect();
+
+    // The typed user message survives the reload exactly once — neither
+    // vanished (dedup ate the replay) nor twinned (optimistic bubble kept).
+    const users = result.current.messages.filter((m) => m.role === 'user' && JSON.stringify(m).includes('resume both analyses'));
+    expect(users).toHaveLength(1);
+    const serialized = result.current.messages.map((m) => JSON.stringify(m));
+    expect(serialized.filter((s) => s.includes('resuming both threads'))).toHaveLength(1);
+  });
+
   it('discovers a DRAINED report-back via recent_report_back_run_ids when the wake was missed, attaches it, THEN tears down', async () => {
     // BUG B, deterministic for fast tasks: the wake fired with zero /watch
     // subscribers (pub/sub has no replay) and the turn DRAINED before this

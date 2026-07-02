@@ -728,6 +728,12 @@ export function useChatMessages(
         ? prev.map((m) => (m.isHistory ? m : { ...m, isHistory: true }))
         : prev,
     );
+    // The recently-sent dedup exists to keep a replay from twinning an
+    // optimistic user bubble that is still on screen. The bubbles just became
+    // clearable-by-reload, so replay is now their only source — keeping the
+    // tracker armed would make the reload's replay SKIP the user message
+    // whose optimistic bubble it just cleared (vanished user bubble).
+    recentlySentTrackerRef.current.clear();
   }, []);
   const reportBackWatch = useReportBackWatch({
     threadId,
