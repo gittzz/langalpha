@@ -35,6 +35,12 @@ import {
   streamWorkspaceEvents,
   watchThread,
   reconnectToWorkflowStream,
+  getReportBackStatus,
+  getDispatchLiveness,
+  // Re-exported by the API boundary from ../reportBackSignal — importing them here
+  // pins that the boundary surface exposes the decoded signal.
+  decodeReportBackSignal,
+  shouldArmReportBack,
 } from '../api';
 
 const mockGet = api.get as Mock;
@@ -479,12 +485,15 @@ describe('ChatAgent API utilities', () => {
         'event: workflow_started\ndata: {"run_id":"rb-2"}\n\n',
       ]);
       const payloads: Array<{ run_id?: string | null } | undefined> = [];
+      const onResubscribed = vi.fn();
       await new Promise<void>((resolve) => {
         // onClosed (3rd arg) fires when the backend ends the stream — resolve then.
-        watchThread('flash-1', (p) => { payloads.push(p); }, resolve);
+        watchThread('flash-1', (p) => { payloads.push(p); }, resolve, onResubscribed);
       });
       expect(payloads).toEqual([{ run_id: 'rb-1' }, { run_id: 'rb-2' }]);
       expect(reader.cancel).not.toHaveBeenCalled();
+      // The initial (non-retry) subscription is not a recovery.
+      expect(onResubscribed).not.toHaveBeenCalled();
     });
 
     it('invokes onClosed when the backend closes the stream without a deliberate abort', async () => {
@@ -525,6 +534,68 @@ describe('ChatAgent API utilities', () => {
       abort.abort();
       await new Promise((r) => setTimeout(r, 0));
       expect(onClosed).not.toHaveBeenCalled();
+    });
+
+    it('fires onResubscribed when the in-loop retry lands a fresh subscription, without double-firing onClosed', async () => {
+      // A transient error drops the connection; the internal retry re-subscribes.
+      // Wakes published during that gap are lost (pub/sub, no replay), so the
+      // caller must be told to run a catch-up — that is onResubscribed. It is a
+      // recovery signal, NOT a close: onClosed still fires exactly once, at the
+      // eventual final close.
+      vi.useFakeTimers();
+      try {
+        const encoder = new TextEncoder();
+        const chunks = ['event: workflow_started\ndata: {"run_id":"rb-after-gap"}\n\n'];
+        const reader = {
+          read: vi.fn(async () =>
+            chunks.length
+              ? { done: false, value: encoder.encode(chunks.shift()!) }
+              : { done: true, value: undefined },
+          ),
+          cancel: vi.fn(async () => {}),
+        };
+        global.fetch = vi
+          .fn()
+          .mockRejectedValueOnce(new TypeError('network dropped'))
+          .mockResolvedValue({ ok: true, status: 200, body: { getReader: () => reader } }) as unknown as typeof fetch;
+
+        const onResubscribed = vi.fn();
+        const onClosed = vi.fn();
+        const payloads: Array<{ run_id?: string | null } | undefined> = [];
+        const done = new Promise<void>((resolve) => {
+          watchThread(
+            'flash-1',
+            (p) => { payloads.push(p); },
+            () => { onClosed(); resolve(); },
+            onResubscribed,
+          );
+        });
+        // Attempt 0 rejects → the loop backs off 1s → attempt 1 re-subscribes.
+        await vi.advanceTimersByTimeAsync(1000);
+        await done;
+
+        expect(onResubscribed).toHaveBeenCalledTimes(1);
+        // The wake buffered on the fresh connection was still delivered.
+        expect(payloads).toEqual([{ run_id: 'rb-after-gap' }]);
+        // Final close signalled exactly once — the recovery didn't double-fire it.
+        expect(onClosed).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does NOT fire onResubscribed for a hard-failing endpoint (non-ok response is a final close, not a recovery)', async () => {
+      // A non-ok response returns immediately (no retry loop): there is no fresh
+      // subscription to catch up from, so signalling a recovery would make the
+      // caller reconcile against a dead endpoint. onClosed still fires once.
+      mockWatchResponse([], { ok: false });
+      const onResubscribed = vi.fn();
+      const onClosed = vi.fn();
+      await new Promise<void>((resolve) => {
+        watchThread('flash-1', () => {}, () => { onClosed(); resolve(); }, onResubscribed);
+      });
+      expect(onResubscribed).not.toHaveBeenCalled();
+      expect(onClosed).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -573,6 +644,57 @@ describe('ChatAgent API utilities', () => {
       const result = await reconnectToWorkflowStream('t-1');
       expect(result.disconnected).toBe(true);
       expect(result.aborted).toBe(false);
+    });
+  });
+
+  describe('report-back signal decoding', () => {
+    // The backend's `pending_report_back` is a TRI-STATE wire value; the decoder
+    // is the single place it's converted into an explicit domain signal so raw
+    // `boolean | null | undefined` never reaches UI control flow.
+    it('decodeReportBackSignal maps every wire value to its signal', () => {
+      expect(decodeReportBackSignal(true)).toBe('pending');
+      expect(decodeReportBackSignal(false)).toBe('idle');
+      expect(decodeReportBackSignal(null)).toBe('unknown');
+      expect(decodeReportBackSignal(undefined)).toBe('none');
+    });
+
+    it('shouldArmReportBack arms on pending|unknown, not on idle|none (arm↔drain asymmetry)', () => {
+      // Arm on an explicit pending AND on unknown (the backend's own Redis read
+      // failed — keep watching), but never on a drained `idle` or an absent `none`.
+      expect(shouldArmReportBack('pending')).toBe(true);
+      expect(shouldArmReportBack('unknown')).toBe(true);
+      expect(shouldArmReportBack('idle')).toBe(false);
+      expect(shouldArmReportBack('none')).toBe(false);
+    });
+
+    it('getReportBackStatus returns the raw report-back slice for the decoder', async () => {
+      mockGet.mockResolvedValueOnce({
+        data: { thread_id: 't-1', pending_report_back: null, report_back_run_id: 'rb-1' },
+      });
+      const res = await getReportBackStatus('t-1');
+      expect(mockGet).toHaveBeenCalledWith('/api/v1/threads/t-1/status', {
+        params: { fields: 'report_back' },
+      });
+      expect(decodeReportBackSignal(res.pending_report_back)).toBe('unknown');
+      expect(res.report_back_run_id).toBe('rb-1');
+    });
+  });
+
+  describe('getDispatchLiveness', () => {
+    it('resolves to [] for an empty id list WITHOUT issuing a request', async () => {
+      const res = await getDispatchLiveness([]);
+      expect(res).toEqual([]);
+      expect(mockGet).not.toHaveBeenCalled();
+    });
+
+    it('resolves to [] when the response body omits `liveness`, joining ids comma-separated', async () => {
+      // Null-safe extraction: a body without the `liveness` key must not throw.
+      mockGet.mockResolvedValueOnce({ data: {} });
+      const res = await getDispatchLiveness(['t-1', 't-2']);
+      expect(res).toEqual([]);
+      expect(mockGet).toHaveBeenCalledWith('/api/v1/threads/dispatches/liveness', {
+        params: { ids: 't-1,t-2' },
+      });
     });
   });
 });

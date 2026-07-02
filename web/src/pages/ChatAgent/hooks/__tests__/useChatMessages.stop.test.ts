@@ -331,8 +331,11 @@ describe('useChatMessages — stopWorkflow (hard stop)', () => {
 
     const { result } = renderHookWithProviders(() => useChatMessages('ws-stop', 'th-stop'));
 
-    // Mount effect kicks off the reconnect.
-    await waitFor(() => expect(result.current.isReconnecting).toBe(true));
+    // Mount effect kicks off the reconnect. The first streamed event proves the
+    // stream is live, so the "Reconnecting…" spinner clears even while the run
+    // keeps streaming — isLoading (the stop button) stays on.
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+    expect(result.current.isReconnecting).toBe(false);
     // The reconnect reader was handed a live, un-aborted signal (the fix:
     // without it, stopWorkflow's abort would be a no-op during reconnect).
     expect(reconnectSignal).toBeDefined();

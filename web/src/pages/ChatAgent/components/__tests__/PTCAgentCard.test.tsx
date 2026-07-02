@@ -1,8 +1,9 @@
 /**
  * PTCAgentCard — pending approval flow + the live dispatch status indicator.
  *
- * The approved card polls the dispatched thread's /status (getWorkflowStatus)
- * and maps the backend WorkflowStatus enum onto a pill: active → Working,
+ * The approved card reads its dispatched thread's liveness from the shared
+ * DispatchStatusProvider (one batched getDispatchLiveness request per turn) and
+ * maps the backend WorkflowStatus enum onto a pill: active → Working,
  * interrupted → Needs input, completed → Completed, etc. The kicker shows the
  * workspace name. These tests mock the api module so the card's wiring is
  * exercised without a real backend.
@@ -13,13 +14,20 @@ import { screen, waitFor, fireEvent } from '@testing-library/react';
 import { renderWithProviders } from '@/test/utils';
 
 vi.mock('../../utils/api', () => ({
-  getWorkflowStatus: vi.fn(),
+  getDispatchLiveness: vi.fn(),
 }));
 
-import { getWorkflowStatus } from '../../utils/api';
-import PTCAgentCard from '../PTCAgentCard';
+// The card now localizes every label via useTranslation(); mock it so `t()`
+// echoes the key, letting assertions target stable keys instead of English copy.
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
 
-const mockStatus = getWorkflowStatus as unknown as Mock;
+import { getDispatchLiveness } from '../../utils/api';
+import PTCAgentCard from '../PTCAgentCard';
+import { DispatchStatusProvider } from '../../hooks/usePTCDispatchStatus';
+
+const mockLiveness = getDispatchLiveness as unknown as Mock;
 
 const APPROVED = {
   status: 'approved' as const,
@@ -29,10 +37,19 @@ const APPROVED = {
   workspace_id: 'ws-1',
 };
 
+/** Render an approved card inside the batched-liveness provider. */
+function renderApproved(proposalData = APPROVED) {
+  return renderWithProviders(
+    <DispatchStatusProvider>
+      <PTCAgentCard proposalData={proposalData} onApprove={vi.fn()} onReject={vi.fn()} />
+    </DispatchStatusProvider>,
+  );
+}
+
 describe('PTCAgentCard — pending approval', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('shows the workspace name as the kicker, question, and actions; never polls /status', () => {
+  it('shows the workspace name as the kicker, question, and actions; never polls liveness', () => {
     const onApprove = vi.fn();
     renderWithProviders(
       <PTCAgentCard
@@ -43,10 +60,25 @@ describe('PTCAgentCard — pending approval', () => {
     );
 
     expect(screen.getByText('Semiconductors')).toBeInTheDocument();
-    expect(screen.getByText('Awaiting approval')).toBeInTheDocument();
+    expect(screen.getByText('chat.ptcCard.awaitingApproval')).toBeInTheDocument();
     expect(screen.getByText('Compare NVDA vs AMD')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /approve/i })).toBeInTheDocument();
-    expect(mockStatus).not.toHaveBeenCalled();
+    expect(mockLiveness).not.toHaveBeenCalled();
+  });
+
+  it('exposes the report-back control as a switch reflecting its checked state', () => {
+    renderWithProviders(
+      <PTCAgentCard
+        proposalData={{ status: 'pending', question: 'Q', report_back: true }}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+
+    const toggle = screen.getByRole('switch');
+    expect(toggle).toHaveAttribute('aria-checked', 'true');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
   });
 
   it('approves with the current report-back choice', () => {
@@ -60,7 +92,7 @@ describe('PTCAgentCard — pending approval', () => {
     );
 
     // Toggle report-back off, then approve.
-    fireEvent.click(screen.getByRole('button', { name: /report back/i }));
+    fireEvent.click(screen.getByRole('switch'));
     fireEvent.click(screen.getByRole('button', { name: /approve/i }));
     expect(onApprove).toHaveBeenCalledWith({ report_back: false });
   });
@@ -69,36 +101,37 @@ describe('PTCAgentCard — pending approval', () => {
 describe('PTCAgentCard — live dispatch status', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('shows "Working" while the dispatched run is active', async () => {
-    mockStatus.mockResolvedValue({ status: 'active', run_id: 'run-1', can_reconnect: true });
-    renderWithProviders(<PTCAgentCard proposalData={APPROVED} onApprove={vi.fn()} onReject={vi.fn()} />);
+  it('shows "Working" while the dispatched run is active, via one batched liveness read', async () => {
+    mockLiveness.mockResolvedValue([
+      { thread_id: 'thread-123', status: 'active', run_id: 'run-1', can_reconnect: true },
+    ]);
+    renderApproved();
 
-    await waitFor(() => expect(screen.getByText('Working')).toBeInTheDocument());
-    expect(mockStatus).toHaveBeenCalledWith('thread-123');
-    expect(screen.getByText('Semiconductors')).toBeInTheDocument();
-    expect(screen.getByText('Open thread')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('chat.ptcCard.statusWorking')).toBeInTheDocument());
+    expect(mockLiveness).toHaveBeenCalledWith(['thread-123']);
+    expect(screen.getByText('Semiconductors')).toBeInTheDocument(); // workspace kicker
+    // Footer hint + CTA come from the same STATUS_UI row as the pill.
+    expect(screen.getByText('chat.ptcCard.hintWorking')).toBeInTheDocument();
+    expect(screen.getByText('chat.ptcCard.ctaOpenThread')).toBeInTheDocument();
   });
 
-  it('maps interrupted → "Needs input" with an answer affordance', async () => {
-    mockStatus.mockResolvedValue({ status: 'interrupted' });
-    renderWithProviders(<PTCAgentCard proposalData={APPROVED} onApprove={vi.fn()} onReject={vi.fn()} />);
+  // Backend WorkflowStatus → pill / hint / CTA row (a missing liveness row means
+  // the run hasn't registered yet → 'starting').
+  it.each<[string | null, string, string | null, string]>([
+    [null, 'statusStarting', 'hintProvisioning', 'ctaOpenThread'],
+    ['interrupted', 'statusNeedsInput', null, 'ctaAnswerContinue'],
+    ['completed', 'statusCompleted', null, 'ctaOpenThread'],
+    ['failed', 'statusFailed', 'hintFailed', 'ctaViewThread'],
+    ['cancelled', 'statusStopped', 'hintStopped', 'ctaViewThread'],
+  ])('maps wire status %s → %s pill + footer', async (wire, pill, hint, cta) => {
+    mockLiveness.mockResolvedValue(
+      wire === null ? [] : [{ thread_id: 'thread-123', status: wire, run_id: null, can_reconnect: false }],
+    );
+    renderApproved();
 
-    await waitFor(() => expect(screen.getByText('Needs input')).toBeInTheDocument());
-    expect(screen.getByText('Answer & continue')).toBeInTheDocument();
-  });
-
-  it('maps completed → "Completed"', async () => {
-    mockStatus.mockResolvedValue({ status: 'completed' });
-    renderWithProviders(<PTCAgentCard proposalData={APPROVED} onApprove={vi.fn()} onReject={vi.fn()} />);
-
-    await waitFor(() => expect(screen.getByText('Completed')).toBeInTheDocument());
-  });
-
-  it('maps failed → "Failed"', async () => {
-    mockStatus.mockResolvedValue({ status: 'failed' });
-    renderWithProviders(<PTCAgentCard proposalData={APPROVED} onApprove={vi.fn()} onReject={vi.fn()} />);
-
-    await waitFor(() => expect(screen.getByText('Failed')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(`chat.ptcCard.${pill}`)).toBeInTheDocument());
+    if (hint) expect(screen.getByText(`chat.ptcCard.${hint}`)).toBeInTheDocument();
+    expect(screen.getByText(`chat.ptcCard.${cta}`)).toBeInTheDocument();
   });
 });
 
@@ -109,7 +142,17 @@ describe('PTCAgentCard — rejected', () => {
     renderWithProviders(
       <PTCAgentCard proposalData={{ status: 'rejected', question: 'Q' }} onApprove={vi.fn()} onReject={vi.fn()} />,
     );
-    expect(screen.getByText('Research declined')).toBeInTheDocument();
-    expect(mockStatus).not.toHaveBeenCalled();
+    expect(screen.getByText('chat.ptcCard.researchDeclined')).toBeInTheDocument();
+    expect(mockLiveness).not.toHaveBeenCalled();
+  });
+
+  it('toggles aria-expanded when the declined row is opened', () => {
+    renderWithProviders(
+      <PTCAgentCard proposalData={{ status: 'rejected', question: 'Q' }} onApprove={vi.fn()} onReject={vi.fn()} />,
+    );
+    const toggle = screen.getByRole('button', { name: /researchDeclined/i });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
   });
 });
