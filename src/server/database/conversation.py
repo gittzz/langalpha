@@ -782,6 +782,30 @@ async def get_threads_for_user(
 # ==================== Query Operations ====================
 
 
+async def get_latest_turn_index(conversation_thread_id: str) -> Optional[int]:
+    """Highest persisted turn_index for a thread; None when it has no turns.
+
+    Read failures also return None — callers treat it as "no signal", so a DB
+    blip degrades to the pre-signal behavior instead of failing the status read.
+    """
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT MAX(turn_index) AS latest_turn_index
+                    FROM conversation_queries
+                    WHERE conversation_thread_id = %s
+                """,
+                    (conversation_thread_id,),
+                )
+                result = await cur.fetchone()
+                return result["latest_turn_index"] if result else None
+    except Exception as e:
+        logger.error(f"Error reading latest turn index: {e}")
+        return None
+
+
 async def get_next_turn_index(conversation_thread_id: str, conn=None) -> int:
     """
     Calculate the next turn_index for a thread (0-based).
@@ -1088,6 +1112,14 @@ async def get_queries_for_thread(
 
 
 # ==================== Response Operations ====================
+
+# Full column list for a conversation_responses row, in canonical order. Single
+# source of truth for the response-fetch helpers' SELECT list.
+_RESPONSE_COLUMNS = (
+    "conversation_response_id, conversation_thread_id, turn_index, status, "
+    "interrupt_reason, metadata, warnings, errors, execution_time, created_at, "
+    "sse_events"
+)
 
 
 def _sse_has_provenance(sse_events: Optional[Any]) -> bool:
@@ -1506,12 +1538,8 @@ async def get_responses_for_thread(
                 # Get responses
                 if limit:
                     await cur.execute(
-                        """
-                        SELECT
-                            conversation_response_id, conversation_thread_id, turn_index, status,
-                            interrupt_reason, metadata,
-                            warnings, errors, execution_time, created_at,
-                            sse_events
+                        f"""
+                        SELECT {_RESPONSE_COLUMNS}
                         FROM conversation_responses
                         WHERE conversation_thread_id = %s
                         ORDER BY turn_index ASC
@@ -1521,12 +1549,8 @@ async def get_responses_for_thread(
                     )
                 else:
                     await cur.execute(
-                        """
-                        SELECT
-                            conversation_response_id, conversation_thread_id, turn_index, status,
-                            interrupt_reason, metadata,
-                            warnings, errors, execution_time, created_at,
-                            sse_events
+                        f"""
+                        SELECT {_RESPONSE_COLUMNS}
                         FROM conversation_responses
                         WHERE conversation_thread_id = %s
                         ORDER BY turn_index ASC
@@ -1554,12 +1578,8 @@ async def get_recent_responses_for_thread(
     try:
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                base = """
-                    SELECT
-                        conversation_response_id, conversation_thread_id, turn_index, status,
-                        interrupt_reason, metadata,
-                        warnings, errors, execution_time, created_at,
-                        sse_events
+                base = f"""
+                    SELECT {_RESPONSE_COLUMNS}
                     FROM conversation_responses
                     WHERE conversation_thread_id = %s
                     ORDER BY turn_index DESC
@@ -1860,21 +1880,33 @@ async def get_thread_by_id(conversation_thread_id: str) -> Optional[Dict[str, An
 
 
 async def get_thread_owner_id(thread_id: str) -> Optional[str]:
-    """Return the user_id that owns the thread's workspace, or None if not found."""
-    # Normalize before querying: postgres' uuid type rejects forms uuid.UUID()
-    # accepts (e.g. urn:uuid:...), so binding the raw value risks
-    # InvalidTextRepresentation (22P02) → 500. A non-UUID thread_id (e.g. a
-    # file/dir name from the SPA tree) can't match the column; treat it as
-    # not-found so require_thread_owner returns a clean 404.
+    """Return the user_id that owns the thread's workspace, or None if not found.
+
+    Delegates to ``get_thread_auth_meta`` (the superset query) to avoid a
+    near-duplicate JOIN; UUID normalization / not-found handling live there.
+    """
+    meta = await get_thread_auth_meta(thread_id)
+    return meta["user_id"] if meta else None
+
+
+async def get_thread_auth_meta(thread_id: str) -> Optional[Dict[str, Any]]:
+    """Owner ``user_id`` + ``is_shared`` in one query.
+
+    Lets ``/status`` authorize the caller and read share state from a single
+    round-trip instead of ``get_thread_owner_id`` (JOIN) plus a separate
+    ``get_thread_by_id``. Returns ``None`` if the thread doesn't exist.
+    """
+    # Same UUID normalization as get_thread_owner_id: a non-UUID id can't match
+    # the column, so treat it as not-found (clean 404) rather than risk a 500.
     thread_id = normalize_uuid(thread_id)
     if thread_id is None:
         return None
     try:
         async with get_db_connection() as conn:
-            async with conn.cursor() as cur:
+            async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
-                    SELECT w.user_id
+                    SELECT w.user_id, t.is_shared
                     FROM conversation_threads t
                     JOIN workspaces w ON w.workspace_id = t.workspace_id
                     WHERE t.conversation_thread_id = %s
@@ -1882,9 +1914,46 @@ async def get_thread_owner_id(thread_id: str) -> Optional[str]:
                     (thread_id,),
                 )
                 result = await cur.fetchone()
-                return result[0] if result else None
+                return dict(result) if result else None
     except Exception as e:
-        logger.error(f"Error getting thread owner: {e}")
+        logger.error(f"Error getting thread auth meta: {e}")
+        raise
+
+
+async def get_threads_terminal_status(
+    thread_ids: List[str], user_id: str
+) -> Dict[str, str]:
+    """Durable ``current_status`` for the caller's threads, keyed by canonical id.
+
+    Batched, ownership-filtered read of ``conversation_threads.current_status`` so
+    the dispatch-liveness read-model can resolve ids whose Redis status blob has
+    expired. Non-UUID ids are dropped (they can't match the column) and rows the
+    caller doesn't own are excluded.
+    """
+    # Same UUID normalization as get_thread_auth_meta: a non-UUID id can't match
+    # the column, so drop it rather than risk a 22P02 cast error on ANY(...).
+    normalized = [nid for nid in (normalize_uuid(t) for t in thread_ids) if nid]
+    if not normalized:
+        return {}
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT t.conversation_thread_id, t.current_status
+                    FROM conversation_threads t
+                    JOIN workspaces w ON w.workspace_id = t.workspace_id
+                    WHERE t.conversation_thread_id = ANY(%s) AND w.user_id = %s
+                    """,
+                    (normalized, user_id),
+                )
+                rows = await cur.fetchall()
+                return {
+                    str(row["conversation_thread_id"]): row["current_status"]
+                    for row in rows
+                }
+    except Exception as e:
+        logger.error(f"Error getting threads terminal status: {e}")
         raise
 
 

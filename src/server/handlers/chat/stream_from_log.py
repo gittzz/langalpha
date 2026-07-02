@@ -6,9 +6,10 @@ producer writing to ``workflow:stream:{thread_id}`` and
 ``subagent:stream:{thread_id}:{task_id}``; consumers attach by stream key and
 read by cursor with no in-process state shared with the workflow.
 
-Both streams store pre-rendered SSE wire strings. The subagent consumer also
-handles legacy JSON records (``{seq, event, data, agent_id}``) that age out
-after their TTL window.
+Both streams store pre-rendered SSE wire strings plus a terminal JSON
+sentinel (``{"event": ...}``) that closes attached consumers immediately at
+run end. The subagent consumer also handles legacy JSON records
+(``{seq, event, data, agent_id}``) that age out after their TTL window.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
 )
 from src.server.services.background_registry_store import BackgroundRegistryStore
 from src.server.services.background_task_manager import (
+    WORKFLOW_STREAM_END_EVENT,
     BackgroundTaskManager,
     TaskStatus,
 )
@@ -74,12 +76,33 @@ _SUBAGENT_STARTUP_TIMEOUT = 30.0
 _SUBAGENT_STARTUP_POLL = 0.5
 
 
+def _is_stream_end_sentinel(raw: str, sentinel_event: str) -> bool:
+    """True when ``raw`` is a terminal sentinel record ``{"event": <sentinel>}``.
+
+    Real payloads are SSE wire strings, so anything not starting with ``{``
+    bails before ``json.loads``. ``seq`` must be absent, mirroring
+    ``_classify_subagent_payload``'s sentinel shape.
+    """
+    if not raw or raw[0] != "{":
+        return False
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(record, dict)
+        and record.get("event") == sentinel_event
+        and "seq" not in record
+    )
+
+
 async def _stream_from_redis_log(
     stream_key: str,
     terminal_check: Callable[[], Awaitable[bool]],
     last_event_id: Optional[int] = None,
     on_attach: Optional[Callable[[], Awaitable[None]]] = None,
     on_detach: Optional[Callable[[], Awaitable[None]]] = None,
+    sentinel_event: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Generic XREAD BLOCK loop yielding SSE strings stored in a Redis Stream.
 
@@ -102,6 +125,12 @@ async def _stream_from_redis_log(
     ``on_attach``/``on_detach`` let subagent consumers maintain
     ``sse_consumer_count`` so cleanup waits for live readers to drain
     before DELing the stream.
+
+    ``sentinel_event`` (optional) names a producer-written stream-end
+    marker (``{"event": <name>}``): on reading it the generator returns
+    immediately without yielding it, skipping the handshake above. The
+    handshake stays as the fallback for sentinel-less streams (crashed
+    producers, pre-deploy buffers).
     """
     cache = get_cache_client()
     if not cache.enabled or not cache.client:
@@ -202,7 +231,7 @@ async def _stream_from_redis_log(
                         continue
                     if isinstance(payload, bytes):
                         try:
-                            decoded = payload.decode("utf-8")
+                            payload = payload.decode("utf-8")
                         except UnicodeDecodeError:
                             logger.warning(
                                 "[stream_from_log] Non-UTF8 payload in %s entry %s",
@@ -210,9 +239,13 @@ async def _stream_from_redis_log(
                                 entry_id,
                             )
                             continue
-                        yield decoded
-                    else:
-                        yield payload
+                    if sentinel_event is not None and _is_stream_end_sentinel(
+                        payload, sentinel_event
+                    ):
+                        # Producer's end-of-run marker — close without
+                        # yielding it to the wire.
+                        return
+                    yield payload
 
             # Reset terminal-seen on any non-empty XREAD batch: while
             # entries are still arriving the stream is not yet at end, so
@@ -317,6 +350,7 @@ async def stream_from_log(
         last_event_id=last_event_id,
         on_attach=on_attach,
         on_detach=on_detach,
+        sentinel_event=WORKFLOW_STREAM_END_EVENT,
     ):
         yield event
 

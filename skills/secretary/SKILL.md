@@ -45,7 +45,7 @@ Return: `{ text, status, thread_id, workspace_id }`
 - `status: "completed"` — full output available
 - `status: "error"` — something went wrong
 
-**`turns` window** (also on `manage_threads(action="get_output")`): by default you get only the **latest turn's** output. For a thread continued several times, pass `turns=N` for the last N turns or `turns=0` for the full history — turns come back oldest→newest, separated by `---`. A still-streaming turn always returns just that live turn, regardless of `turns`.
+**`turns` window** (also on `manage_threads(action="get_output")`): by default you get only the **latest turn's** output. For a thread continued several times, pass `turns=N` for the last N turns or `turns=0` for recent history (up to the 50 most recent turns) — turns come back oldest→newest, separated by `---`. A still-streaming turn always returns just that live turn, regardless of `turns`.
 
 ---
 

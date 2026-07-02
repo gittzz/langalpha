@@ -9,13 +9,15 @@ logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 8000
 
-# Ceiling on how many turns a single read pulls from the DB. Output is truncated
-# to MAX_OUTPUT_CHARS regardless, so fetching more rows than this only wastes
-# memory on a long thread.
+# Ceiling on how many turns a single read pulls from the DB (output is
+# truncated to MAX_OUTPUT_CHARS regardless).
 _MAX_HISTORY_TURNS = 50
 
-# Inserted between turns when more than one turn is returned so distinct turns'
-# outputs don't run together into one ambiguous blob.
+# When the default single-turn read lands on a text-less newest turn (tool-only
+# / chart-only), look back this many turns for the most-recent turn with text.
+_EMPTY_LATEST_FALLBACK_TURNS = 5
+
+# Inserted between turns when more than one turn is returned.
 _TURN_SEPARATOR = "\n\n---\n\n"
 
 # File extensions recognized as workspace file references (mirrors frontend KNOWN_EXTS)
@@ -330,22 +332,47 @@ def _text_from_response(response: dict[str, Any]) -> str:
     return "".join(chunks)
 
 
-async def _extract_from_db(thread_id: str, turns: int = 1) -> list[str]:
-    """Return per-turn text (oldest -> newest) for the most-recent ``turns`` turns.
+async def _latest_turn_text(thread_id: str) -> list[str]:
+    """Newest turn's text, as ``[]`` or ``[text]``.
 
-    ``turns``: 1 = latest only, N = last N, <= 0 = recent history; capped at
-    ``_MAX_HISTORY_TURNS`` rows since output is truncated anyway. Returns one
-    entry per non-empty turn, and lets read failures propagate so the caller
-    surfaces an error instead of an empty, success-looking result.
+    Hot path is ``limit=1``; a text-less newest turn (tool-only / chart-only)
+    pays one wider ``_EMPTY_LATEST_FALLBACK_TURNS`` read so an empty result
+    isn't mistaken for "the agent produced nothing".
     """
     from src.server.database.conversation import get_recent_responses_for_thread
 
-    if turns == 1:
-        limit = 1
-    elif turns <= 0:
-        limit = _MAX_HISTORY_TURNS
-    else:
-        limit = min(turns, _MAX_HISTORY_TURNS)
+    responses = await get_recent_responses_for_thread(thread_id, limit=1)
+    if responses and (text := _text_from_response(responses[0])):
+        return [text]
 
+    # No turns at all: nothing to widen to.
+    if not responses:
+        return []
+
+    # Newest turn is text-less: re-read the fallback window once and surface the
+    # most-recent turn that carries text.
+    responses = await get_recent_responses_for_thread(
+        thread_id, limit=_EMPTY_LATEST_FALLBACK_TURNS
+    )
+    for text in map(_text_from_response, reversed(responses)):
+        if text:
+            return [text]
+    return []
+
+
+async def _extract_from_db(thread_id: str, turns: int = 1) -> list[str]:
+    """Return per-turn text (oldest -> newest) for the most-recent ``turns`` turns.
+
+    ``turns == 1`` delegates to ``_latest_turn_text``; otherwise reads the last
+    ``turns`` turns (``<= 0`` = recent history), clamped to ``_MAX_HISTORY_TURNS``.
+    Read failures propagate so the caller surfaces an error instead of an empty,
+    success-looking result.
+    """
+    if turns == 1:
+        return await _latest_turn_text(thread_id)
+
+    from src.server.database.conversation import get_recent_responses_for_thread
+
+    limit = _MAX_HISTORY_TURNS if turns <= 0 else min(turns, _MAX_HISTORY_TURNS)
     responses = await get_recent_responses_for_thread(thread_id, limit=limit)
     return [text for text in map(_text_from_response, responses) if text]

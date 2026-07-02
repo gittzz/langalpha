@@ -11,6 +11,7 @@ Key Features:
 - Retry count tracking for transient error handling (max 3 retries)
 """
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -411,6 +412,35 @@ class WorkflowTracker:
         except Exception as e:
             logger.error(f"[WorkflowTracker] Error getting status: {e}")
             return None
+
+    async def get_statuses(
+        self, thread_ids: list[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch status read for many threads in one MGET.
+
+        Returns ``{thread_id: status_blob}`` for the keys that exist; missing or
+        undecodable keys are omitted. Powers the batched liveness endpoint so N
+        dispatch cards cost one round-trip, not N.
+        """
+        if not self.enabled or not self.cache.client or not thread_ids:
+            return {}
+        try:
+            keys = [f"{self.STATUS_PREFIX}{tid}" for tid in thread_ids]
+            raws = await self.cache.client.mget(keys)
+            out: Dict[str, Dict[str, Any]] = {}
+            for tid, raw in zip(thread_ids, raws):
+                if raw is None:
+                    continue
+                try:
+                    blob = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(blob, dict):
+                    out[tid] = blob
+            return out
+        except Exception as e:
+            logger.error(f"[WorkflowTracker] Error getting statuses: {e}")
+            return {}
 
     async def delete_status(self, thread_id: str) -> bool:
         """

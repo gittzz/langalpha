@@ -157,7 +157,7 @@ _ROUTE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 # Literal (non-UUID) path segments that are valid endpoints, not ids.
-_ROUTE_ID_ALLOWLIST = frozenset({"messages", "flash", "reorder"})
+_ROUTE_ID_ALLOWLIST = frozenset({"messages", "flash", "reorder", "dispatches"})
 _WS_PATH_RE = re.compile(r"^/api/v1/workspaces/([^/]+)")
 _THREAD_PATH_RE = re.compile(r"^/api/v1/threads/([^/]+)")
 

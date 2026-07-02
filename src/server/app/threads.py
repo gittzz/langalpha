@@ -96,6 +96,7 @@ async def _consume_background_gen(
     thread_id: str,
     run_id: str,
     report_back_ptc_thread_id: str | None = None,
+    user_id: str | None = None,
 ) -> bool:
     """Drain an async generator in the background, cleaning up Redis on failure."""
     _ok = True
@@ -110,37 +111,11 @@ async def _consume_background_gen(
             f"[{label}] Background workflow failed: thread_id={thread_id} run_id={run_id}",
             exc_info=True,
         )
-        try:
-            from src.utils.cache.redis_cache import get_cache_client
-            from src.server.handlers.chat.ptc_workflow import (
-                clear_flash_report_back,
-            )
+        # Report-back crash teardown is business logic owned by report_back —
+        # it fetches its own cache client and swallows its own failures.
+        from src.server.handlers.chat.report_back import clear_on_crash
 
-            cache = get_cache_client()
-            if cache.enabled and cache.client:
-                # Resolve the PTC thread whose report-back watch this crash should
-                # tear down. The origin is keyed by the *PTC* thread id:
-                #   - PTC_DISPATCH crash: thread_id IS the ptc thread -> direct hit,
-                #     clear (the watched run just died).
-                #   - report-back run crash: report_back_ptc_thread_id names the
-                #     completed PTC -> clear, else a never-finishing report-back
-                #     leaves /status reporting a stale pending run until TTL.
-                #   - ordinary flash-dispatch crash: no report_back id and thread_id
-                #     is the flash thread -> ptc_origin:{flash_tid} misses -> no-op,
-                #     so a still-running dispatched PTC's keys survive for reload
-                #     recovery.
-                ptc_thread_id = report_back_ptc_thread_id or thread_id
-                origin = await cache.get(f"ptc_origin:{ptc_thread_id}")
-                if origin:
-                    flash_tid = origin.get("flash_thread_id")
-                    await clear_flash_report_back(cache, ptc_thread_id, flash_tid)
-                    if flash_tid:
-                        await cache.client.publish(
-                            f"thread:wake:{flash_tid}",
-                            '{"error": "background_workflow_failed"}',
-                        )
-        except Exception:
-            logger.warning(f"[{label}] Redis cleanup after failure also failed", exc_info=True)
+        await clear_on_crash(thread_id, report_back_ptc_thread_id, user_id)
     finally:
         # When the generator raised before reaching start_workflow, the
         # frontend already received {status: dispatched, run_id} and
@@ -151,7 +126,10 @@ async def _consume_background_gen(
         # the placeholder/tracker cleanup below.
         if not _ok:
             try:
-                from src.server.services.background_task_manager import stream_key
+                from src.server.services.background_task_manager import (
+                    BackgroundTaskManager,
+                    stream_key,
+                )
                 from src.utils.cache.redis_cache import get_cache_client
 
                 cache = get_cache_client()
@@ -169,6 +147,12 @@ async def _consume_background_gen(
                     await cache.client.xadd(
                         stream_key(thread_id, run_id),
                         {b"event": sse_wire.encode("utf-8")},
+                    )
+                    # Terminal sentinel after the error event so an attached
+                    # consumer closes now instead of waiting out the
+                    # empty-XREAD handshake (best-effort, swallows failures).
+                    await BackgroundTaskManager.get_instance().append_stream_end_sentinel(
+                        thread_id, run_id
                     )
             except Exception:
                 logger.warning(
@@ -511,26 +495,39 @@ async def _handle_send_message(
                 detail="workspace_id is required for 'ptc' agent mode. Create workspace first via POST /workspaces, or use agent_mode='flash' for lightweight queries.",
             )
 
-        # For flash mode, resolve workspace_id to the shared flash workspace
+        # For flash mode, resolve workspace_id to the shared flash workspace.
+        # The upsert returns the full row, reused by the ownership guard below
+        # and by the flash workflow (skipping a repeat upsert).
+        workspace: dict | None = None
+        flash_workspace: dict | None = None
         if agent_mode == "flash" and not workspace_id:
-            flash_ws = await get_or_create_flash_workspace(user_id)
-            workspace_id = str(flash_ws["workspace_id"])
+            workspace = await get_or_create_flash_workspace(user_id)
+            workspace_id = str(workspace["workspace_id"])
+            flash_workspace = workspace
 
-        # Auto-detect flash workspaces: if the workspace is flash, override agent_mode
-        # so follow-up messages (HITL responses, etc.) route correctly even if
-        # the client doesn't send agent_mode='flash'.
-        # Skip the DB query when a ready session exists (PTC workspace, common path).
+        # Single workspace lookup, shared by the flash auto-detect and the
+        # ownership guard below — one DB round-trip instead of two.
+        if workspace is None and workspace_id:
+            workspace = await get_workspace(workspace_id)
+
+        # Auto-detect flash workspaces: if the workspace is flash, override
+        # agent_mode so follow-up messages (HITL responses, etc.) route
+        # correctly even if the client doesn't send agent_mode='flash'. Skip
+        # the status check when a ready session exists (PTC workspace, common path).
         if agent_mode != "flash" and workspace_id:
             from src.server.services.workspace_manager import WorkspaceManager
-            _wm = WorkspaceManager.get_instance()
-            if not _wm.has_ready_session(workspace_id):
-                ws = await get_workspace(workspace_id)
-                if ws and ws.get("status") == "flash":
+            if not WorkspaceManager.get_instance().has_ready_session(workspace_id):
+                if workspace and workspace.get("status") == "flash":
                     agent_mode = "flash"
                     logger.debug(
                         f"[CHAT] Auto-detected flash workspace {workspace_id}, "
                         f"overriding agent_mode to 'flash'"
                     )
+
+        # IDOR guard (workspace dimension): pairs with the thread guard above so
+        # a fresh thread_id cannot run inside another user's workspace/sandbox.
+        # The internal report-back dispatch sets X-User-Id to the owner, so it passes.
+        require_workspace_owner(workspace, user_id=user_id)
 
         # Extract user input
         user_input = ""
@@ -623,6 +620,7 @@ async def _handle_send_message(
             is_byok=is_byok,
             config=config,
             dispatched=is_flash_dispatch,
+            flash_workspace=flash_workspace,
         )
 
         if is_flash_dispatch:
@@ -640,8 +638,35 @@ async def _handle_send_message(
             # dispatched branch must do it here because it skips
             # wait_or_steer entirely). Released before _track_task
             # schedules the background workflow.
+            #
+            # Report-back idempotency: a lost-response retry of the drainer's
+            # POST must NOT start a second summary run. The claim CM SET-NXs the
+            # per-(flash, ptc) run pointer under the lock; a prior admission's
+            # incumbent run_id is returned instead, and a non-consummated exit
+            # (e.g. a 409 from the gate) releases the claim. No-op unless
+            # report_back_ptc_thread_id is set.
+            rb_ptc = request.report_back_ptc_thread_id
+            rb_cache = None
+            if rb_ptc:
+                from src.utils.cache.redis_cache import get_cache_client
+                rb_cache = get_cache_client()
+            from src.server.handlers.chat import report_back
             admission_lock = await manager.get_admission_lock(thread_id)
-            async with admission_lock:
+            async with admission_lock, report_back.claim(
+                rb_cache, thread_id, rb_ptc, run_id
+            ) as rb_claim:
+                if rb_claim.incumbent is not None:
+                    await release_burst_slot(user_id)
+                    logger.info(
+                        f"[FLASH_DISPATCH] Idempotent report-back: returning "
+                        f"in-flight run {rb_claim.incumbent} for ptc={rb_ptc} on "
+                        f"flash thread {thread_id} (no second run)"
+                    )
+                    return JSONResponse({
+                        "status": "dispatched",
+                        "thread_id": thread_id,
+                        "run_id": rb_claim.incumbent,
+                    })
                 state = await manager.wait_for_admission(
                     thread_id, exclude_run_id=run_id
                 )
@@ -655,6 +680,7 @@ async def _handle_send_message(
                         ),
                     )
                 await manager.pre_register(thread_id, run_id)
+                rb_claim.consummate()
             _track_task(asyncio.create_task(
                 observe_background_chat_turn(
                     _consume_background_gen(
@@ -663,6 +689,7 @@ async def _handle_send_message(
                         thread_id,
                         run_id,
                         report_back_ptc_thread_id=request.report_back_ptc_thread_id,
+                        user_id=user_id,
                     ),
                     mode="flash",
                     model=_model,
@@ -755,7 +782,9 @@ async def _handle_send_message(
 
         _track_task(asyncio.create_task(
             observe_background_chat_turn(
-                _consume_background_gen(ptc_gen, "PTC_DISPATCH", thread_id, run_id),
+                _consume_background_gen(
+                    ptc_gen, "PTC_DISPATCH", thread_id, run_id, user_id=user_id
+                ),
                 mode="ptc",
                 model=_model,
                 user_id=user_id,
@@ -849,47 +878,12 @@ async def watch_thread(thread_id: str, x_user_id: CurrentUserId):
     await require_thread_owner(thread_id, x_user_id)
 
     from src.utils.cache.redis_cache import get_cache_client
-
-    CHANNEL = f"thread:wake:{thread_id}"
-    KEEPALIVE_INTERVAL = 45  # seconds
-    MAX_WATCH_DURATION = 30 * 60  # 30 minutes
+    from src.server.handlers.chat.report_back import watch_wakes
 
     async def watch_generator():
-        import time
-
         cache = get_cache_client()
-        if not cache.enabled or not cache.client:
-            yield 'event: error\ndata: {"error": "watch unavailable"}\n\n'
-            return
-
-        pubsub = cache.client.pubsub()
-        started_at = time.monotonic()
-        try:
-            await pubsub.subscribe(CHANNEL)
-
-            while True:
-                if time.monotonic() - started_at > MAX_WATCH_DURATION:
-                    yield 'event: timeout\ndata: {}\n\n'
-                    break
-
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=KEEPALIVE_INTERVAL)
-
-                if msg and msg["type"] == "message":
-                    data = msg["data"]
-                    if isinstance(data, bytes):
-                        data = data.decode("utf-8")
-                    # Forward EVERY wake, not just the first. A flash thread can
-                    # dispatch N PTCs whose report-backs arrive as separate runs;
-                    # staying subscribed lets the one connection deliver each in
-                    # turn. Breaking here dropped wake #2+ — the client's
-                    # re-subscribe raced the next wake and fell back to the poll,
-                    # which misses a report-back that finishes within its window.
-                    yield f'event: workflow_started\ndata: {data}\n\n'
-                else:
-                    yield ': ping\n\n'
-        finally:
-            await pubsub.unsubscribe(CHANNEL)
-            await pubsub.aclose()
+        async for frame in watch_wakes(cache, thread_id):
+            yield frame
 
     return StreamingResponse(
         watch_generator(),
@@ -1011,12 +1005,144 @@ async def replay_thread_messages(thread_id: str, x_user_id: CurrentUserId):
 
 
 @router.get("/{thread_id}/status")
-async def get_thread_status(thread_id: str, x_user_id: CurrentUserId):
-    """Get current workflow execution status for a thread."""
-    await require_thread_owner(thread_id, x_user_id)
+async def get_thread_status(
+    thread_id: str,
+    x_user_id: CurrentUserId,
+    fields: Optional[str] = Query(
+        None,
+        description="'report_back' returns only the report-back slice (cheap path)",
+    ),
+):
+    """Get current workflow execution status for a thread.
+
+    ``fields=report_back`` returns just the pending-report-back slice, skipping
+    the checkpoint / background-task / share reads — used by the frontend's
+    event-driven catch-up pulls so a reconnect doesn't pay for the full status.
+    """
+    # One query authorizes the caller AND yields is_shared, so the full-status
+    # path below doesn't re-fetch the thread row.
+    from src.server.database.conversation import get_thread_auth_meta
+
+    meta = await get_thread_auth_meta(thread_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if meta["user_id"] != x_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if fields == "report_back":
+        from src.server.handlers.chat.report_back import read_report_back_status
+
+        return await read_report_back_status(thread_id)
+
     from src.server.handlers.workflow_handler import get_workflow_status
 
-    return await get_workflow_status(thread_id)
+    return await get_workflow_status(thread_id, is_shared=bool(meta["is_shared"]))
+
+
+# Upper bound on ids per liveness request — one MGET stays cheap. Ids past the
+# cap are dropped for that request and stay unresolved on the client (there is
+# no per-card fallback); >100 concurrently-unresolved cards would need the
+# frontend to chunk requests.
+_MAX_LIVENESS_IDS = 100
+
+
+@router.get("/dispatches/liveness")
+async def get_dispatches_liveness(
+    x_user_id: CurrentUserId,
+    ids: str = Query(
+        ...,
+        description="Comma-separated thread ids to read liveness for (one MGET).",
+    ),
+):
+    """Batched, client-keyed dispatch liveness — N cards in one round-trip.
+
+    Reads the cheap ``workflow:status`` blobs via a single MGET (no checkpoint
+    deserialize) and returns only threads owned by the caller — ownership comes
+    from each blob's ``user_id``, so there's no per-thread DB read and no IDOR.
+    Unknown or unowned ids are silently omitted.
+    """
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for raw in ids.split(","):
+        tid = raw.strip()
+        if tid and tid not in seen:
+            seen.add(tid)
+            deduped.append(tid)
+
+    if len(deduped) > _MAX_LIVENESS_IDS:
+        logger.warning(
+            f"[LIVENESS] {len(deduped)} ids requested by {x_user_id}; capping at "
+            f"{_MAX_LIVENESS_IDS} (remainder unresolved this request)"
+        )
+        deduped = deduped[:_MAX_LIVENESS_IDS]
+
+    if not deduped:
+        return {"liveness": []}
+
+    from src.server.services.workflow_tracker import WorkflowStatus, WorkflowTracker
+    from src.server.handlers.workflow_handler import (
+        crosscheck_btm_liveness,
+        liveness_from_blob,
+    )
+
+    tracker = WorkflowTracker.get_instance()
+    blobs = await tracker.get_statuses(deduped)
+
+    liveness = []
+    for tid, blob in blobs.items():
+        if blob.get("user_id") != x_user_id:
+            continue
+        slice_ = liveness_from_blob(tid, blob)
+        # A no-TTL ACTIVE blob can survive a process restart that killed its run,
+        # leaving the card a zombie ({running, can_reconnect}) forever. Cross-check
+        # the in-process BTM (authoritative under the single-worker invariant); a
+        # stale ACTIVE with no live task heals to a terminal slice. INTERRUPTED is
+        # resumable-by-design with no live task, so it is left untouched.
+        if slice_["status"] == WorkflowStatus.ACTIVE:
+            result = await crosscheck_btm_liveness(tid, tracker, True)
+            if not result["live"]:
+                slice_ = {
+                    "thread_id": tid,
+                    "status": WorkflowStatus.COMPLETED,
+                    "run_id": None,
+                    "can_reconnect": False,
+                }
+        liveness.append(slice_)
+
+    # A terminal run's status blob has a ~1h TTL; once it expires the blob pass
+    # omits the thread and the client re-freezes the card on 'starting'. Fall
+    # back to the durable current_status so terminal cards stay resolved. A
+    # still-in_progress row is left absent on purpose — its blob just hasn't been
+    # written yet, so the card should keep polling as 'starting'.
+    resolved = {slice_["thread_id"] for slice_ in liveness}
+    absent = [tid for tid in deduped if tid not in resolved]
+    if absent:
+        from src.server.database.conversation import get_threads_terminal_status
+
+        # DB current_status -> WorkflowStatus enum value so the frontend
+        # mapStatus resolves it (a raw 'error' would hit its default -> 'starting'
+        # and re-freeze). 'in_progress' / anything else is intentionally omitted.
+        terminal_by_db_status = {
+            "completed": WorkflowStatus.COMPLETED,
+            "error": WorkflowStatus.FAILED,
+            "cancelled": WorkflowStatus.CANCELLED,
+            "interrupted": WorkflowStatus.INTERRUPTED,
+        }
+        statuses = await get_threads_terminal_status(absent, x_user_id)
+        for tid, current_status in statuses.items():
+            status = terminal_by_db_status.get(current_status)
+            if status is None:
+                continue
+            liveness.append(
+                {
+                    "thread_id": tid,
+                    "status": status,
+                    "run_id": None,
+                    "can_reconnect": False,
+                }
+            )
+
+    return {"liveness": liveness}
 
 
 @router.post("/{thread_id}/cancel", status_code=200)

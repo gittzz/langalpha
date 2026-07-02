@@ -177,12 +177,76 @@ async def cancel_workflow(thread_id: str, run_id: Optional[str] = None) -> dict:
         )
 
 
-async def get_workflow_status(thread_id: str) -> dict:
+def liveness_from_blob(thread_id: str, blob: Optional[dict]) -> dict:
+    """Cheap ``{status, run_id, can_reconnect}`` slice from a tracker status blob.
+
+    No checkpoint deserialize, DB read, or BTM call. Shared by
+    ``/dispatches/liveness`` and ``get_workflow_status`` so both agree on the
+    reconnectability rule.
+    """
+    from src.server.services.workflow_tracker import (
+        RECONNECTABLE_STATUSES,
+        WorkflowStatus,
+    )
+
+    status = blob.get("status", WorkflowStatus.UNKNOWN) if blob else WorkflowStatus.UNKNOWN
+    return {
+        "thread_id": thread_id,
+        "status": status,
+        "run_id": blob.get("run_id") if blob else None,
+        "can_reconnect": status in RECONNECTABLE_STATUSES,
+    }
+
+
+async def crosscheck_btm_liveness(
+    thread_id: str, tracker, reconnectable: bool
+) -> dict:
+    """Cross-check a tracker blob against the in-process BTM, healing stale ACTIVE.
+
+    The in-process BackgroundTaskManager is authoritative for liveness
+    (single-worker invariant, see ``server.py``). No task for a blob claiming a
+    reconnectable status means a restart orphan (``mark_active`` writes no TTL) —
+    heal it to COMPLETED so status reads stop reporting a zombie. Returns
+    ``{"live", "healed", "run_id", "active_tasks"}``.
+    """
+    from src.server.services.background_task_manager import BackgroundTaskManager
+
+    manager = BackgroundTaskManager.get_instance()
+    bg_status = await manager.get_live_task_info(thread_id)
+    if bg_status.get("live"):
+        return {
+            "live": True,
+            "healed": False,
+            "run_id": bg_status.get("run_id"),
+            "active_tasks": bg_status.get("active_tasks", []),
+        }
+    healed = False
+    if reconnectable:
+        logger.info(
+            f"Stale workflow status for {thread_id}: Redis says active but "
+            f"BackgroundTaskManager has no task info. Healing to completed."
+        )
+        try:
+            await tracker.mark_completed(
+                thread_id, metadata={"healed": "stale_active_no_task"}
+            )
+        except Exception:
+            pass
+        healed = True
+    return {"live": False, "healed": healed, "run_id": None, "active_tasks": []}
+
+
+async def get_workflow_status(
+    thread_id: str, is_shared: Optional[bool] = None
+) -> dict:
     """
     Get current workflow execution status.
 
     Args:
         thread_id: Thread ID to check status for
+        is_shared: Pre-resolved share flag. When provided (e.g. the ``/status``
+            route already read it while authorizing), skips a redundant thread
+            lookup; when ``None``, this fetches it.
 
     Returns:
         Dict with current status, reconnectability, and progress info
@@ -219,127 +283,87 @@ async def get_workflow_status(thread_id: str) -> dict:
         except Exception as e:
             logger.debug(f"Could not fetch checkpoint info for {thread_id}: {e}")
 
-        # Determine overall status
+        # Determine overall status; the blob-present path uses the shared
+        # read-model (liveness_from_blob) so the heavy and light paths never
+        # diverge on can_reconnect.
         if redis_status:
-            status = redis_status.get("status", WorkflowStatus.UNKNOWN)
+            base = liveness_from_blob(thread_id, redis_status)
+            status = base["status"]
+            can_reconnect = base["can_reconnect"]
             last_update = redis_status.get("last_update")
             workspace_id = redis_status.get("workspace_id")
             user_id = redis_status.get("user_id")
         elif checkpoint_info and checkpoint_info.get("completed"):
             # Found in checkpoint but not in Redis = old completed workflow
             status = WorkflowStatus.COMPLETED
+            can_reconnect = status in RECONNECTABLE_STATUSES
             last_update = None
             workspace_id = None
             user_id = None
         else:
             # Not in Redis, not in checkpoint = unknown
             status = WorkflowStatus.UNKNOWN
+            can_reconnect = status in RECONNECTABLE_STATUSES
             last_update = None
             workspace_id = None
             user_id = None
-
-        # Determine if reconnection is possible
-        can_reconnect = status in RECONNECTABLE_STATUSES
 
         # Get subagent info from background task manager
         active_tasks = []
         run_id = None
 
         try:
-            from src.server.services.background_task_manager import (
-                BackgroundTaskManager,
-            )
-
-            manager = BackgroundTaskManager.get_instance()
-            bg_status = await manager.get_workflow_status(thread_id)
-            if bg_status.get("status") != "not_found":
-                active_tasks = bg_status.get("active_tasks", [])
-                run_id = bg_status.get("run_id")
-            elif can_reconnect:
-                # Redis says active/disconnected but BackgroundTaskManager has no
-                # record — likely a stale Redis key surviving a server restart.
-                # Downgrade can_reconnect to avoid a guaranteed 404 on /messages/stream.
-                logger.info(
-                    f"Stale workflow status for {thread_id}: Redis says {status} "
-                    f"but BackgroundTaskManager has no task info. Clearing stale status."
-                )
+            # A live task yields active_tasks + run_id; a stale ACTIVE blob
+            # surviving a restart is healed to COMPLETED so a reconnect doesn't
+            # 404 on /messages/stream.
+            result = await crosscheck_btm_liveness(thread_id, tracker, can_reconnect)
+            if result["live"]:
+                active_tasks = result["active_tasks"]
+                run_id = result["run_id"]
+            elif result["healed"]:
                 can_reconnect = False
                 status = WorkflowStatus.COMPLETED
-                # Clean up the stale Redis key so future requests don't hit this path
-                try:
-                    await tracker.mark_completed(thread_id)
-                except Exception:
-                    pass
         except Exception as e:
             logger.debug(
                 f"Could not get background task status for {thread_id}: {e}"
             )
 
-        # Include share status so the UI can show the correct icon without an extra API call
-        is_shared = False
-        try:
-            from src.server.database.conversation import get_thread_by_id
+        # Include share status so the UI can show the correct icon without an
+        # extra API call. The ``/status`` route resolves this while authorizing
+        # and passes it in; only fetch when a caller didn't.
+        if is_shared is None:
+            try:
+                from src.server.database.conversation import get_thread_by_id
 
-            thread_row = await get_thread_by_id(thread_id)
-            if thread_row:
-                is_shared = bool(thread_row.get("is_shared"))
-        except Exception as e:
-            logger.debug(f"Could not fetch share status for {thread_id}: {e}")
+                thread_row = await get_thread_by_id(thread_id)
+                is_shared = bool(thread_row.get("is_shared")) if thread_row else False
+            except Exception as e:
+                logger.debug(f"Could not fetch share status for {thread_id}: {e}")
+                is_shared = False
 
-        # Check if this flash thread has pending PTC report-backs
-        # (flash_watch is a Redis SET of dispatched ptc_thread_ids). When
-        # pending, surface the report-back run_id the backend recorded so the
-        # client attaches to the exact run instead of inferring it from run_id
-        # changes.
-        pending_report_back = False
-        report_back_run_id = None
-        try:
-            from src.server.handlers.chat.ptc_workflow import (
-                ensure_rb_consumer,
-                flash_rb_queue_key,
-                flash_rb_run_key,
-                flash_watch_key,
-            )
-            from src.utils.cache.redis_cache import get_cache_client
+        # Check if this flash thread has pending PTC report-backs.
+        from src.server.handlers.chat.report_back import read_report_back_status
 
-            cache = get_cache_client()
-            if cache.enabled and cache.client:
-                count = await cache.client.scard(flash_watch_key(thread_id))
-                if count and count > 0:
-                    pending_report_back = True
-                    # Resolve the run to attach to from a live per-(flash, ptc)
-                    # pointer — prefer the report-back currently being drained
-                    # (head of the durable queue), else any pending member with
-                    # a pointer. Never a finished run's id.
-                    queue_key = flash_rb_queue_key(thread_id)
-                    head = await cache.client.lindex(queue_key, 0)
-                    candidates: list[str] = []
-                    if head is not None:
-                        candidates.append(
-                            head.decode() if isinstance(head, (bytes, bytearray)) else head
-                        )
-                    members = await cache.client.smembers(flash_watch_key(thread_id))
-                    for member in members or []:
-                        ptc = member.decode() if isinstance(member, (bytes, bytearray)) else member
-                        if ptc not in candidates:
-                            candidates.append(ptc)
-                    for ptc in candidates:
-                        rb = await cache.get(flash_rb_run_key(thread_id, ptc))
-                        if isinstance(rb, dict) and rb.get("run_id"):
-                            report_back_run_id = rb.get("run_id")
-                            break
-                    # Restart-nudge: durable queued work but (after a process
-                    # restart) no live consumer — (re)start it.
-                    if await cache.client.llen(queue_key):
-                        ensure_rb_consumer(thread_id)
-        except Exception:
-            pass
+        rb = await read_report_back_status(thread_id)
+        pending_report_back = rb["pending_report_back"]
+        report_back_run_id = rb["report_back_run_id"]
+        recent_report_back_run_ids = rb.get("recent_report_back_run_ids", [])
+
+        # Staleness signal for cached (never-unmounted) frontend views: once a
+        # run is terminal there is no reconnectable run_id, so the persisted
+        # turn counter is the only way such a view can tell it missed a turn.
+        # Present for terminal AND live threads; None when the thread has no
+        # persisted turns (or the read failed).
+        from src.server.database.conversation import get_latest_turn_index
+
+        latest_turn_index = await get_latest_turn_index(thread_id)
 
         response = {
             "thread_id": thread_id,
             "run_id": run_id,
             "status": status,
             "can_reconnect": can_reconnect,
+            "latest_turn_index": latest_turn_index,
             "last_update": last_update,
             "workspace_id": workspace_id,
             "user_id": user_id,
@@ -348,6 +372,7 @@ async def get_workflow_status(thread_id: str) -> dict:
             "is_shared": is_shared,
             "pending_report_back": pending_report_back,
             "report_back_run_id": report_back_run_id,
+            "recent_report_back_run_ids": recent_report_back_run_ids,
         }
 
         logger.debug(f"Status check for {thread_id}: {status}")
