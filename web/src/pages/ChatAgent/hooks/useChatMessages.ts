@@ -3217,6 +3217,18 @@ export function useChatMessages(
     releaseStreamOwnership();
     currentMessageRef.current = null;
 
+    // An ADMITTED stop (run id latched) is persisted server-side as a
+    // user-cancelled "Stopped" turn (_mark_cancelled folds the partial events
+    // into sse_events), so its bubbles are replay-reproducible — mark them
+    // isHistory and release the recently-sent dedup, same as a success
+    // finalize. Otherwise a later corrective reload appends a replayed twin of
+    // the answer under a dedup-eaten user message, ordered after newer turns.
+    // A PRE-ADMISSION stop has no turn row: replay can't reproduce those
+    // bubbles, so they must stay unmarked to survive reloads.
+    if (stoppedRunId) {
+      markTranscriptPersisted();
+    }
+
     // (c) Abort per-task subagent streams (they belong to THIS turn). Leave the
     // report-back watch running: this flash-thread cancel does not stop the
     // background PTC analyses on their own threads, so their summaries should

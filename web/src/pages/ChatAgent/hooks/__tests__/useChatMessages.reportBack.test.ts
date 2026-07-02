@@ -274,6 +274,143 @@ describe('useChatMessages — report-back watch (PTC → flash report-back)', ()
     expect(serialized.filter((s) => s.includes('resuming both threads'))).toHaveLength(1);
   });
 
+  it('replaces an admitted STOPPED turn exactly once when a staleness reload replays it', async () => {
+    // Stop-path half of the transcript invariant: an ADMITTED stop (run id
+    // latched) is persisted server-side as a user-cancelled "Stopped" turn, so
+    // stopWorkflow must mark its bubbles isHistory and release the dedup like
+    // a success finalize. Before the fix a later corrective reload kept the
+    // unmarked live bubbles (mis-ordered after newer turns), appended a
+    // replayed twin of the partial answer, and the still-armed recently-sent
+    // dedup ate the replayed user message.
+    mockStatus.mockResolvedValue(threadStatus({ latest_turn_index: 0 }));
+    mockReplay.mockImplementation((_tid: string, onEvent: (e: Record<string, unknown>) => void) => {
+      onEvent({ event: 'user_message', turn_index: 0, content: 'earlier question', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 0, role: 'assistant', agent: 'main', content_type: 'text', content: 'earlier answer' });
+      return Promise.resolve();
+    });
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-rb', 'th-rb'));
+    await waitFor(() => expect(mockReplay).toHaveBeenCalledTimes(1));
+    await settleMountEffect();
+
+    // Live send: latches the run id (admission), streams ONE partial chunk,
+    // then hangs until stopWorkflow aborts it — a mid-stream user stop.
+    mockSend.mockImplementation((...args: unknown[]) => {
+      const onEvent = args[5] as (e: Record<string, unknown>) => void;
+      const onRunIdResolved = args[16] as (runId: string, threadId: string | null) => void;
+      const signal = args[17] as AbortSignal | null;
+      onRunIdResolved('run-stopped-1', 'th-rb');
+      onEvent({ event: 'message_chunk', role: 'assistant', agent: 'main', content_type: 'text', content: 'partial answer' });
+      return new Promise((resolve) => {
+        if (signal?.aborted) return resolve({ disconnected: false, aborted: true });
+        signal?.addEventListener('abort', () => resolve({ disconnected: false, aborted: true }));
+      });
+    });
+    let sendPromise: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      sendPromise = result.current.handleSendMessage('stopped question', false);
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(JSON.stringify(result.current.messages)).toContain('partial answer');
+    await act(async () => {
+      await result.current.stopWorkflow();
+      await sendPromise;
+    });
+
+    // The backend persisted the stopped partial turn (turn 1); a report-back
+    // lands as turn 2 and its watermark divergence triggers a corrective
+    // reload whose replay covers the stopped turn too.
+    mockStatus.mockResolvedValue(threadStatus({ latest_turn_index: 2 }));
+    mockReplay.mockImplementation((_tid: string, onEvent: (e: Record<string, unknown>) => void) => {
+      onEvent({ event: 'user_message', turn_index: 0, content: 'earlier question', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 0, role: 'assistant', agent: 'main', content_type: 'text', content: 'earlier answer' });
+      onEvent({ event: 'user_message', turn_index: 1, content: 'stopped question', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 1, role: 'assistant', agent: 'main', content_type: 'text', content: 'partial answer' });
+      onEvent({ event: 'user_message', turn_index: 2, content: 'report back instruction', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 2, role: 'assistant', agent: 'main', content_type: 'text', content: 'late summary' });
+      return Promise.resolve();
+    });
+    await act(async () => {
+      await result.current.reconnectIfStaleRun();
+    });
+    await waitFor(() => expect(mockReplay).toHaveBeenCalledTimes(2));
+    await settleMountEffect();
+
+    // The stopped turn renders exactly once — user bubble not dedup-eaten,
+    // answer not twinned — and in turn order, before the later report-back.
+    const serialized = result.current.messages.map((m) => JSON.stringify(m));
+    expect(result.current.messages.filter((m) => m.role === 'user' && JSON.stringify(m).includes('stopped question'))).toHaveLength(1);
+    expect(serialized.filter((s) => s.includes('partial answer'))).toHaveLength(1);
+    const stoppedIdx = serialized.findIndex((s) => s.includes('stopped question'));
+    const reportBackIdx = serialized.findIndex((s) => s.includes('report back instruction'));
+    expect(stoppedIdx).toBeGreaterThan(-1);
+    expect(stoppedIdx).toBeLessThan(reportBackIdx);
+  });
+
+  it('keeps the bubbles of a PRE-ADMISSION stop across a staleness reload', async () => {
+    // Guard for the other half of the stop fork: a stop BEFORE the run id is
+    // latched has no turn row server-side, so replay cannot reproduce those
+    // bubbles — stopWorkflow must NOT mark them, or a corrective reload
+    // vanishes the typed message and its partial answer.
+    mockStatus.mockResolvedValue(threadStatus({ latest_turn_index: 0 }));
+    mockReplay.mockImplementation((_tid: string, onEvent: (e: Record<string, unknown>) => void) => {
+      onEvent({ event: 'user_message', turn_index: 0, content: 'earlier question', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 0, role: 'assistant', agent: 'main', content_type: 'text', content: 'earlier answer' });
+      return Promise.resolve();
+    });
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-rb', 'th-rb'));
+    await waitFor(() => expect(mockReplay).toHaveBeenCalledTimes(1));
+    await settleMountEffect();
+
+    // Live send that is stopped before admission: streams a chunk but never
+    // resolves a run id (e.g. stopped during sandbox bringup).
+    mockSend.mockImplementation((...args: unknown[]) => {
+      const onEvent = args[5] as (e: Record<string, unknown>) => void;
+      const signal = args[17] as AbortSignal | null;
+      onEvent({ event: 'message_chunk', role: 'assistant', agent: 'main', content_type: 'text', content: 'partial answer' });
+      return new Promise((resolve) => {
+        if (signal?.aborted) return resolve({ disconnected: false, aborted: true });
+        signal?.addEventListener('abort', () => resolve({ disconnected: false, aborted: true }));
+      });
+    });
+    let sendPromise: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      sendPromise = result.current.handleSendMessage('stopped question', false);
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    await act(async () => {
+      await result.current.stopWorkflow();
+      await sendPromise;
+    });
+
+    // TWO report-backs land as turns 1-2; the reload's replay does NOT cover
+    // the never-admitted stopped turn. (Two, because the send optimistically
+    // bumped this view's watermark to 1 — the pre-admission stop leaves it
+    // over-counted, so the server must reach 2 before `!==` sees divergence.)
+    mockStatus.mockResolvedValue(threadStatus({ latest_turn_index: 2 }));
+    mockReplay.mockImplementation((_tid: string, onEvent: (e: Record<string, unknown>) => void) => {
+      onEvent({ event: 'user_message', turn_index: 0, content: 'earlier question', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 0, role: 'assistant', agent: 'main', content_type: 'text', content: 'earlier answer' });
+      onEvent({ event: 'user_message', turn_index: 1, content: 'report back instruction', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 1, role: 'assistant', agent: 'main', content_type: 'text', content: 'late summary' });
+      onEvent({ event: 'user_message', turn_index: 2, content: 'second report back', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 2, role: 'assistant', agent: 'main', content_type: 'text', content: 'second summary' });
+      return Promise.resolve();
+    });
+    await act(async () => {
+      await result.current.reconnectIfStaleRun();
+    });
+    await waitFor(() => expect(mockReplay).toHaveBeenCalledTimes(2));
+    await settleMountEffect();
+
+    // The unpersisted stop survives the reload — not cleared, not twinned.
+    const serialized = result.current.messages.map((m) => JSON.stringify(m));
+    expect(result.current.messages.filter((m) => m.role === 'user' && JSON.stringify(m).includes('stopped question'))).toHaveLength(1);
+    expect(serialized.filter((s) => s.includes('partial answer'))).toHaveLength(1);
+    expect(serialized.filter((s) => s.includes('late summary'))).toHaveLength(1);
+  });
+
   it('discovers a DRAINED report-back via recent_report_back_run_ids when the wake was missed, attaches it, THEN tears down', async () => {
     // BUG B, deterministic for fast tasks: the wake fired with zero /watch
     // subscribers (pub/sub has no replay) and the turn DRAINED before this
