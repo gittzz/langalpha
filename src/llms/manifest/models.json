@@ -523,9 +523,32 @@
     "intelligence": 4,
     "context": 200000,
     "parameters": {
-      "max_tokens": 128000,
+      "max_tokens": 128000
+    },
+    "extra_body": {
       "thinking": {
-        "type": "enabled"
+        "type": "enabled",
+        "clear_thinking": false
+      }
+    },
+    "input_modalities": [
+      "text"
+    ]
+  },
+  "glm-5.2": {
+    "model_id": "glm-5.2",
+    "provider": "z-ai",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 1000000,
+    "parameters": {
+      "max_tokens": 128000
+    },
+    "extra_body": {
+      "thinking": {
+        "type": "enabled",
+        "clear_thinking": false
       }
     },
     "input_modalities": [
@@ -540,9 +563,12 @@
     "intelligence": 3,
     "context": 200000,
     "parameters": {
-      "max_tokens": 128000,
+      "max_tokens": 128000
+    },
+    "extra_body": {
       "thinking": {
-        "type": "enabled"
+        "type": "enabled",
+        "clear_thinking": false
       }
     },
     "input_modalities": [
@@ -559,9 +585,12 @@
     "intelligence": 3,
     "context": 200000,
     "parameters": {
-      "max_tokens": 128000,
+      "max_tokens": 128000
+    },
+    "extra_body": {
       "thinking": {
-        "type": "enabled"
+        "type": "enabled",
+        "clear_thinking": false
       }
     },
     "input_modalities": [
@@ -576,9 +605,12 @@
     "intelligence": 3,
     "context": 200000,
     "parameters": {
-      "max_tokens": 128000,
+      "max_tokens": 128000
+    },
+    "extra_body": {
       "thinking": {
-        "type": "enabled"
+        "type": "enabled",
+        "clear_thinking": false
       }
     },
     "input_modalities": [
@@ -593,9 +625,32 @@
     "intelligence": 4,
     "context": 200000,
     "parameters": {
-      "max_tokens": 128000,
+      "max_tokens": 128000
+    },
+    "extra_body": {
       "thinking": {
-        "type": "enabled"
+        "type": "enabled",
+        "clear_thinking": false
+      }
+    },
+    "input_modalities": [
+      "text"
+    ]
+  },
+  "glm-5.2-cn": {
+    "model_id": "glm-5.2",
+    "provider": "z-ai-cn",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 1000000,
+    "parameters": {
+      "max_tokens": 128000
+    },
+    "extra_body": {
+      "thinking": {
+        "type": "enabled",
+        "clear_thinking": false
       }
     },
     "input_modalities": [
@@ -610,9 +665,12 @@
     "intelligence": 3,
     "context": 200000,
     "parameters": {
-      "max_tokens": 128000,
+      "max_tokens": 128000
+    },
+    "extra_body": {
       "thinking": {
-        "type": "enabled"
+        "type": "enabled",
+        "clear_thinking": false
       }
     },
     "input_modalities": [

@@ -13,7 +13,6 @@ Actions emitted via context_window events (values preserved as wire protocol):
 """
 
 import asyncio
-import uuid
 import warnings
 import logging
 from collections.abc import Awaitable, Callable, Mapping
@@ -41,6 +40,7 @@ from src.llms.token_counter import extract_token_usage
 from ptc_agent.config.agent import CompactionConfig
 from src.llms import get_llm_by_type, maybe_disable_streaming
 
+from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.middleware.compaction.types import (
     CompactionEvent,
     CompactionState,
@@ -53,8 +53,8 @@ from ptc_agent.agent.middleware.compaction.types import (
 )
 from ptc_agent.agent.middleware.compaction.utils import (
     DEFAULT_SUMMARY_PROMPT,
+    build_compaction_event,
     build_summary_message,
-    compute_absolute_cutoff,
     count_tokens_tiktoken,
     get_effective_messages,
     strip_base64_from_messages,
@@ -266,7 +266,7 @@ class CompactionMiddleware(AgentMiddleware):
         cached_output_tokens: int = request.state.get("_cached_output_tokens", 0)
 
         # 2. Reconstruct effective messages
-        self._ensure_message_ids(request.messages)
+        ensure_message_ids(request.messages)
         effective_messages = self._get_effective_messages(
             request.messages, previous_event
         )
@@ -419,15 +419,15 @@ class CompactionMiddleware(AgentMiddleware):
         # Build summary message
         summary_message = self._build_summary_message(summary, file_path)
 
-        # Compute absolute cutoff for chained summarization tracking
-        state_cutoff_index = self._compute_absolute_cutoff(cutoff_index, previous_event)
-
-        # Create summarization event for state
-        new_event: CompactionEvent = {
-            "cutoff_index": state_cutoff_index,
-            "summary_message": summary_message,
-            "file_path": file_path,
-        }
+        # Create summarization event with an id anchor (cutoff grounded in raw list)
+        new_event = build_compaction_event(
+            raw_messages=request.messages,
+            preserved_messages=preserved_messages,
+            summary_message=summary_message,
+            file_path=file_path,
+            effective_cutoff=cutoff_index,
+            previous_event=previous_event,
+        )
 
         # Call handler with summarized messages
         modified_messages = [summary_message, *preserved_messages]
@@ -481,7 +481,7 @@ class CompactionMiddleware(AgentMiddleware):
         cached_input_tokens: int = request.state.get("_cached_input_tokens", 0)
         cached_output_tokens: int = request.state.get("_cached_output_tokens", 0)
 
-        self._ensure_message_ids(request.messages)
+        ensure_message_ids(request.messages)
         effective_messages = self._get_effective_messages(
             request.messages, previous_event
         )
@@ -588,13 +588,15 @@ class CompactionMiddleware(AgentMiddleware):
             messages_to_summarize, original_count=len(truncated_messages)
         )
         summary_message = self._build_summary_message(summary, file_path)
-        state_cutoff_index = self._compute_absolute_cutoff(cutoff_index, previous_event)
 
-        new_event: CompactionEvent = {
-            "cutoff_index": state_cutoff_index,
-            "summary_message": summary_message,
-            "file_path": file_path,
-        }
+        new_event = build_compaction_event(
+            raw_messages=request.messages,
+            preserved_messages=preserved_messages,
+            summary_message=summary_message,
+            file_path=file_path,
+            effective_cutoff=cutoff_index,
+            previous_event=previous_event,
+        )
 
         modified_messages = [summary_message, *preserved_messages]
         response = handler(request.override(messages=modified_messages))
@@ -630,14 +632,6 @@ class CompactionMiddleware(AgentMiddleware):
     ) -> list[AnyMessage]:
         """Delegate to shared utility."""
         return get_effective_messages(messages, event)
-
-    @staticmethod
-    def _compute_absolute_cutoff(
-        effective_cutoff: int,
-        previous_event: CompactionEvent | None,
-    ) -> int:
-        """Delegate to shared utility."""
-        return compute_absolute_cutoff(effective_cutoff, previous_event)
 
     # =========================================================================
     # Token cache management
@@ -1088,12 +1082,6 @@ class CompactionMiddleware(AgentMiddleware):
             "_cached_input_tokens": cached_input_tokens,
             "_cached_output_tokens": cached_output_tokens,
         }
-
-    def _ensure_message_ids(self, messages: list[AnyMessage]) -> None:
-        """Ensure all messages have unique IDs for the add_messages reducer."""
-        for msg in messages:
-            if msg.id is None:
-                msg.id = str(uuid.uuid4())
 
     def _partition_messages(
         self,

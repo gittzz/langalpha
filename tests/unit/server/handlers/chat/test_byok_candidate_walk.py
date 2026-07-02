@@ -197,3 +197,39 @@ async def test_cache_none_value_treated_as_absent_without_requery():
     assert holding is None
     # Everything was cached (as None) → no direct lookup at all.
     direct.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Nested-variant discovery (_candidate_slugs)
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_slugs_include_nested_child_variant():
+    """A two-level variant (child of a non-root provider) is walked from its
+    parent, before the root family."""
+    from src.server.handlers.chat.llm_config import _candidate_slugs
+
+    providers = {
+        "vendor-x": {},
+        "vendor-x-coding": {"parent": "vendor-x"},
+        "vendor-x-cn": {"parent": "vendor-x"},
+        "vendor-x-cn-coding": {"parent": "vendor-x-cn"},
+    }
+    mc = MagicMock()
+    mc.get_parent_provider.side_effect = lambda n: providers.get(n, {}).get("parent")
+    mc.get_child_variants.side_effect = lambda n: [
+        k for k, info in providers.items() if info.get("parent") == n
+    ]
+
+    assert _candidate_slugs("vendor-x-cn", mc) == [
+        "vendor-x-cn",
+        "vendor-x-cn-coding",
+        "vendor-x",
+        "vendor-x-coding",
+    ]
+    # Root providers keep their original walk order
+    assert _candidate_slugs("vendor-x", mc) == [
+        "vendor-x",
+        "vendor-x-coding",
+        "vendor-x-cn",
+    ]

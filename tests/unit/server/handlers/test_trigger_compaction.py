@@ -534,6 +534,80 @@ class TestActiveWorkflowGate:
         assert offload_mock.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_offload_fails_closed_when_tracker_disabled(self, base_config):
+        """Redis outage → tracker.enabled=False → /offload (a non-critical
+        optimization) is SKIPPED with 409 rather than writing into a
+        possibly-active turn. Contrast /compact, which fails open."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.workflow_handler import trigger_offload
+
+        offload_mock = AsyncMock()  # should NEVER be called
+        stub_resolve = _stub_resolve_graph_and_state()
+
+        tracker = MagicMock()
+        tracker.enabled = False
+        tracker.get_status = AsyncMock(
+            side_effect=AssertionError("get_status must not be called when disabled")
+        )
+
+        with (
+            patch("src.server.app.setup.agent_config", base_config),
+            patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
+            patch(
+                "ptc_agent.agent.middleware.compaction.offload_tool_args",
+                new=offload_mock,
+            ),
+            patch(
+                "src.server.services.workflow_tracker.WorkflowTracker.get_instance",
+                return_value=tracker,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await trigger_offload("thread-1")
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["code"] == "workflow_unverifiable"
+        assert exc_info.value.detail["verb"] == "offload"
+        assert offload_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_offload_fails_closed_on_transient_tracker_error(self, base_config):
+        """Redis blip mid-request → get_status raises → /offload fails closed
+        (409) instead of running blind."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.workflow_handler import trigger_offload
+
+        offload_mock = AsyncMock()  # should NEVER be called
+        stub_resolve = _stub_resolve_graph_and_state()
+
+        tracker = MagicMock()
+        tracker.enabled = True
+        tracker.get_status = AsyncMock(
+            side_effect=RuntimeError("redis: connection reset")
+        )
+
+        with (
+            patch("src.server.app.setup.agent_config", base_config),
+            patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
+            patch(
+                "ptc_agent.agent.middleware.compaction.offload_tool_args",
+                new=offload_mock,
+            ),
+            patch(
+                "src.server.services.workflow_tracker.WorkflowTracker.get_instance",
+                return_value=tracker,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await trigger_offload("thread-1")
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["code"] == "workflow_unverifiable"
+        assert offload_mock.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_compact_fails_open_when_tracker_disabled(self, base_config):
         """Redis outage → tracker.enabled=False → gate bypasses so admin
         actions stay usable while chat workflows are already degraded."""

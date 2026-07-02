@@ -327,6 +327,18 @@
         }
       },
       {
+        "id": "glm-5.2",
+        "name": "GLM-5.2",
+        "is_reasoning": true,
+        "description": "Z.AI's flagship GLM-5.2 model with 1M context and extended thinking",
+        "pricing": {
+          "input": 1.4,
+          "cached_input": 0.26,
+          "output": 4.4,
+          "unit": "per_1m_tokens"
+        }
+      },
+      {
         "id": "glm-5v-turbo",
         "name": "GLM-5V-Turbo",
         "is_reasoning": true,
@@ -393,6 +405,18 @@
             }
           ],
           "output_pricing_mode": "input_dependent",
+          "unit": "per_1m_tokens"
+        }
+      },
+      {
+        "id": "glm-5.2",
+        "name": "GLM-5.2",
+        "is_reasoning": true,
+        "description": "Z.AI's flagship GLM-5.2 model with 1M context, flat domestic pricing",
+        "pricing": {
+          "input": 1.14,
+          "cached_input": 0.29,
+          "output": 4.0,
           "unit": "per_1m_tokens"
         }
       },
@@ -1432,22 +1456,31 @@
       }
     },
     "z-ai": {
-      "sdk": "anthropic",
-      "base_url": "https://api.z.ai/api/anthropic",
+      "sdk": "glm",
+      "base_url": "https://api.z.ai/api/paas/v4/",
       "env_key": "ZAI_API_KEY",
       "access_type": "api_key",
       "byok_eligible": true,
       "display_name": "Zhipu AI",
       "variants": {
         "z-ai-cn": {
-          "base_url": "https://open.bigmodel.cn/api/anthropic",
+          "base_url": "https://open.bigmodel.cn/api/paas/v4/",
           "env_key": "ZAI_CN_API_KEY",
           "region": "cn"
         },
         "z-ai-coding": {
+          "sdk": "anthropic",
           "base_url": "https://api.z.ai/api/anthropic",
           "env_key": "ZAI_CODING_API_KEY",
           "access_type": "coding_plan"
+        },
+        "z-ai-cn-coding": {
+          "sdk": "anthropic",
+          "base_url": "https://open.bigmodel.cn/api/anthropic",
+          "env_key": "ZAI_CN_CODING_API_KEY",
+          "access_type": "coding_plan",
+          "region": "cn",
+          "parent_provider": "z-ai-cn"
         }
       }
     },

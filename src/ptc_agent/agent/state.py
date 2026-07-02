@@ -18,6 +18,7 @@ downgrading langgraph below 1.2) cannot read — so keep the `langgraph`/
 
 from __future__ import annotations
 
+import uuid
 from typing import Annotated, Any, cast
 
 from langchain.agents import AgentState
@@ -37,6 +38,23 @@ from typing_extensions import Required
 MESSAGES_SNAPSHOT_FREQUENCY = 50
 
 
+def ensure_message_ids(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Stamp a stable uuid on any id-less message, in place, and return the list.
+
+    langgraph's own ``ensure_message_ids`` runs only inside the normal Pregel
+    execution loop, NOT on the ``graph.aupdate_state`` path. Messages injected
+    via ``aupdate_state`` (orchestrator notifications, steering triggers)
+    therefore persist with ``id=None`` under ``messages_delta_reducer`` — which
+    appends id-less writes verbatim, so a later full-list re-write duplicates
+    them and the compaction id-anchor can never match them. Call this before any
+    ``aupdate_state`` that injects new messages.
+    """
+    for msg in messages:
+        if getattr(msg, "id", None) is None:
+            msg.id = str(uuid.uuid4())
+    return messages
+
+
 def messages_delta_reducer(  # noqa: C901, PLR0912
     state: list[AnyMessage], writes: list[list[AnyMessage]]
 ) -> list[AnyMessage]:
@@ -48,9 +66,12 @@ def messages_delta_reducer(  # noqa: C901, PLR0912
     `ensure_message_ids` (>=1.2.2) stamps id-less writes before they are
     persisted, so by replay time messages already carry stable ids; minting in
     the reducer would re-roll a different uuid on every replay. id-less messages
-    are appended as-is (deterministic). Matches deepagents 0.6.11's batch
-    `_messages_delta_reducer` (the vendoring source), NOT `add_messages` (an
-    unknown-id `RemoveMessage` is silently ignored; chunks are not converted).
+    are appended as-is (deterministic) — note this only holds on the normal
+    Pregel path; the `aupdate_state` path does NOT run `ensure_message_ids`, so
+    injectors there must pre-stamp via `ensure_message_ids` (above) or their
+    writes persist id-less and duplicate on re-write. Matches deepagents 0.6.11's
+    batch `_messages_delta_reducer` (the vendoring source), NOT `add_messages`
+    (an unknown-id `RemoveMessage` is silently ignored; chunks are not converted).
     """
     # Each write is either a list of message-likes or a single message-like
     # (BaseMessage / dict / str / tuple). Only lists flatten; everything

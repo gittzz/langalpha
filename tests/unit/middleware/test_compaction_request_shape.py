@@ -146,6 +146,73 @@ async def test_compact_messages_calls_llm_with_system_message(monkeypatch):
     assert isinstance(sent[-1], HumanMessage)
 
 
+@pytest.mark.asyncio
+async def test_chained_compaction_anchors_and_reconstructs_safely(monkeypatch):
+    """Chained compact_messages must stamp an ``anchor_message_id`` on the new
+    event, ground ``cutoff_index`` at that anchor in the raw list, and never
+    reconstruct a summary immediately followed by an orphaned tool_result."""
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    from ptc_agent.agent.middleware.compaction import compact as compact_module
+    from ptc_agent.agent.middleware.compaction.utils import get_effective_messages
+
+    fake_llm = MagicMock()
+    fake_llm.ainvoke = AsyncMock(
+        return_value=MagicMock(content="summary", additional_kwargs={})
+    )
+    monkeypatch.setattr(compact_module, "get_llm_by_type", lambda model_name: fake_llm)
+
+    async def _passthrough_offload(backend, messages):
+        return messages
+
+    monkeypatch.setattr(compact_module, "aoffload_base64_content", _passthrough_offload)
+
+    async def _noop_offload_to_backend(backend, messages):
+        return None
+
+    monkeypatch.setattr(compact_module, "aoffload_to_backend", _noop_offload_to_backend)
+
+    async def _noop_offload_args(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(compact_module, "aoffload_truncated_args", _noop_offload_args)
+
+    def _turn(i):
+        # Human -> AI -> Tool, so the safe cutoff often lands on a ToolMessage.
+        return [
+            HumanMessage(content=f"q{i}", id=f"h{i}"),
+            AIMessage(content=f"a{i}", id=f"a{i}"),
+            ToolMessage(content="r", id=f"t{i}", tool_call_id=f"tc{i}"),
+        ]
+
+    messages = [m for i in range(6) for m in _turn(i)]
+
+    first = await compact_module.compact_messages(
+        messages=messages, keep_messages=4, model_name="gpt-4o", backend=None
+    )
+    event1 = first["event"]
+    assert event1.get("anchor_message_id") is not None
+    eff1 = get_effective_messages(messages, event1)
+    assert not isinstance(eff1[1], ToolMessage)
+
+    # Chain: append a fresh turn and compact again from the prior event.
+    messages2 = messages + _turn(99)
+    second = await compact_module.compact_messages(
+        messages=messages2,
+        keep_messages=4,
+        model_name="gpt-4o",
+        backend=None,
+        previous_event=event1,
+    )
+    event2 = second["event"]
+    anchor = event2.get("anchor_message_id")
+    assert anchor is not None
+    # cutoff_index is grounded at the anchor message in the raw list.
+    assert messages2[event2["cutoff_index"]].id == anchor
+    eff2 = get_effective_messages(messages2, event2)
+    assert not isinstance(eff2[1], ToolMessage)
+
+
 class TestCompactMessagesErrorPath:
     """Manual /compact must fail loudly, not fabricate fake summary text. A
     silent fallback here corrupted thread state with a bogus "compacted"

@@ -816,8 +816,19 @@ class BackgroundTaskManager:
             if not values:
                 return
 
+            # Exclude `messages` from the re-write. The committed messages are
+            # already in this snapshot and carry forward on the DeltaChannel, so
+            # re-writing the full list only re-applies every message as a delta —
+            # and any still-id-less tail message appends as a duplicate (the
+            # reducer keys dedup on id). The remaining keys (private compaction /
+            # offload state) are last-write-wins, so re-writing them is idempotent.
+            flush_values = {k: v for k, v in values.items() if k != "messages"}
+            if not flush_values:
+                return
+
             await asyncio.wait_for(
-                graph_any.aupdate_state(config, values), timeout=get_checkpoint_flush_timeout()
+                graph_any.aupdate_state(config, flush_values),
+                timeout=get_checkpoint_flush_timeout(),
             )
             logger.info(f"[BackgroundTaskManager] Flushed checkpoint for {thread_id}")
         except asyncio.TimeoutError:
