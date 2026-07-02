@@ -714,6 +714,21 @@ export function useChatMessages(
   // stale-run reactivation of a cached view). Declared before the watch so
   // `requestHistoryReload` below can close over the setter directly.
   const [reloadTrigger, setReloadTrigger] = useState(0);
+  // A finished stream means the server persisted this turn (pair persistence
+  // runs at terminal), so every rendered bubble is now reproducible from
+  // /messages/replay. Mark them isHistory so a later corrective reload
+  // REPLACES them via replay — the history loader only clears isHistory
+  // bubbles, so unmarked live bubbles would survive it and the replay would
+  // render their twins (duplicated transcript). Failed sends never reach a
+  // success finalize, so their (unpersisted) bubbles deliberately stay
+  // unmarked and survive reloads.
+  const markTranscriptPersisted = useCallback(() => {
+    setMessages((prev) =>
+      prev.some((m) => !m.isHistory)
+        ? prev.map((m) => (m.isHistory ? m : { ...m, isHistory: true }))
+        : prev,
+    );
+  }, []);
   const reportBackWatch = useReportBackWatch({
     threadId,
     workspaceId,
@@ -2460,6 +2475,7 @@ export function useChatMessages(
           isStreaming: false,
         }))
       );
+      markTranscriptPersisted();
 
       // Pre-seed subagent cards from history for tasks whose artifact events were
       // cleared from the Redis buffer after the spawning turn persisted to DB.
@@ -4712,6 +4728,7 @@ export function useChatMessages(
             isStreaming: false,
           }))
         );
+        markTranscriptPersisted();
       }
     } catch (err: unknown) {
           // An aborted stream (user hit stop) is intentional, not a failure.
@@ -4930,6 +4947,7 @@ export function useChatMessages(
             isStreaming: false,
           }))
         );
+        markTranscriptPersisted();
       }
     } catch (err: unknown) {
       if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
@@ -5344,6 +5362,7 @@ export function useChatMessages(
           isStreaming: false,
         }))
       );
+      markTranscriptPersisted();
     } catch (err: unknown) {
       if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
         return;

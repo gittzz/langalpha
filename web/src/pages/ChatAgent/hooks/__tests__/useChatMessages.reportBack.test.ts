@@ -158,6 +158,64 @@ describe('useChatMessages — report-back watch (PTC → flash report-back)', ()
     expect(mockReconnect.mock.calls[0][2]).toBeNull();
   });
 
+  it('does NOT duplicate the transcript when a staleness reload follows a live-streamed report-back', async () => {
+    // The flash-thread round-trip repro: report-back turns stream in LIVE,
+    // then the user jumps to the PTC thread and back. The live turns never
+    // advanced the rendered-turn watermark, so reconnectIfStaleRun requests a
+    // corrective reload whose replay covers those same turns. The attach's
+    // success finalize must have marked them isHistory so the loader clears
+    // them — otherwise the replay renders their twins (duplicated transcript).
+    mockStatus.mockResolvedValue(threadStatus({ pending_report_back: true, latest_turn_index: 0 }));
+    mockReplay.mockImplementation((_tid: string, onEvent: (e: Record<string, unknown>) => void) => {
+      onEvent({ event: 'user_message', turn_index: 0, content: 'dispatch instruction', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 0, role: 'assistant', agent: 'main', content_type: 'text', content: 'dispatched both analyses' });
+      return Promise.resolve();
+    });
+    mockReconnect.mockImplementation(streamedReconnect());
+    const watchCalls = captureWatch();
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-rb', 'th-rb'));
+    await waitFor(() => expect(mockWatch).toHaveBeenCalledTimes(1));
+    await settleMountEffect();
+
+    // The wake attaches the report-back run; its stream delivers the summary
+    // live and completes (turn 1 is persisted server-side by construction).
+    await act(async () => {
+      await watchCalls[0].cb({ run_id: 'rb-run-1' });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(mockReconnect).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(result.current.messages)).toContain('summary…');
+
+    // Jump away and back: the report-back turn advanced the server watermark
+    // (turn 1) but not this view's; the drain also finished (idle, recents).
+    mockStatus.mockResolvedValue(threadStatus({
+      latest_turn_index: 1,
+      recent_report_back_run_ids: ['rb-run-1'],
+    }));
+    mockReplay.mockImplementation((_tid: string, onEvent: (e: Record<string, unknown>) => void) => {
+      onEvent({ event: 'user_message', turn_index: 0, content: 'dispatch instruction', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 0, role: 'assistant', agent: 'main', content_type: 'text', content: 'dispatched both analyses' });
+      // The report-back turn's own query row (type='system') replays too.
+      onEvent({ event: 'user_message', turn_index: 1, content: 'report back instruction', role: 'user' });
+      onEvent({ event: 'message_chunk', turn_index: 1, role: 'assistant', agent: 'main', content_type: 'text', content: 'summary…' });
+      return Promise.resolve();
+    });
+
+    await act(async () => {
+      await result.current.reconnectIfStaleRun();
+    });
+    await waitFor(() => expect(mockReplay).toHaveBeenCalledTimes(2));
+    await settleMountEffect();
+
+    // Every turn renders exactly once: the reload REPLACED the live-rendered
+    // bubbles instead of appending replayed twins after them.
+    const serialized = result.current.messages.map((m) => JSON.stringify(m));
+    expect(serialized.filter((s) => s.includes('dispatch instruction'))).toHaveLength(1);
+    expect(serialized.filter((s) => s.includes('dispatched both analyses'))).toHaveLength(1);
+    expect(serialized.filter((s) => s.includes('summary…'))).toHaveLength(1);
+  });
+
   it('discovers a DRAINED report-back via recent_report_back_run_ids when the wake was missed, attaches it, THEN tears down', async () => {
     // BUG B, deterministic for fast tasks: the wake fired with zero /watch
     // subscribers (pub/sub has no replay) and the turn DRAINED before this

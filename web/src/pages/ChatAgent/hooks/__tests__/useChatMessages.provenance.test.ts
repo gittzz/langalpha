@@ -134,7 +134,18 @@ describe('useChatMessages — provenance dispatch (live + history)', () => {
       },
     );
 
+    // Mount with the thread already known (the production shape) so the
+    // history loader records its load key up front. Otherwise the sync mock
+    // stream commits thread_id AFTER the send resolves, the loader fires
+    // post-finalize, and — since finished turns are marked isHistory — it
+    // would clear the live bubbles against this fixture's empty replay.
+    mockGetStoredThreadId.mockReturnValue('thread-prov-live');
     const { result } = renderHookWithProviders(() => useChatMessages('ws-prov-live'));
+
+    // Settle the mount history load before sending — its isHistory-clear must
+    // not land mid-send and remove the finished turn's bubbles.
+    await waitFor(() => expect(mockReplay).toHaveBeenCalled());
+    await act(async () => {});
 
     await act(async () => {
       await result.current.handleSendMessage('research example', false);

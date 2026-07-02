@@ -20,8 +20,13 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('@/lib/supabase', () => ({ supabase: null }));
 
+// Mount with the thread already known (the production shape) so the history
+// loader records its load key up front. Otherwise the sync mock stream commits
+// thread_id AFTER the send resolves, the loader fires post-finalize, and —
+// since finished turns are marked isHistory — it would clear the live bubbles
+// against this fixture's empty replay.
 vi.mock('../utils/threadStorage', () => ({
-  getStoredThreadId: vi.fn().mockReturnValue(null),
+  getStoredThreadId: vi.fn().mockReturnValue('thread-1'),
   setStoredThreadId: vi.fn(),
   removeStoredThreadId: vi.fn(),
 }));
@@ -76,12 +81,23 @@ vi.mock('../../utils/api', () => ({
 import {
   sendChatMessageStream,
   fetchThreadTurns,
+  replayThreadHistory,
 } from '../../utils/api';
 import { useChatMessages } from '../useChatMessages';
 import type { AssistantMessage } from '@/types/chat';
 
 const mockSendStream = sendChatMessageStream as Mock;
 const mockFetchTurns = fetchThreadTurns as Mock;
+const mockReplay = replayThreadHistory as Mock;
+
+/**
+ * Settle the mount history load before sending — its isHistory-clear must not
+ * land mid-send and remove the finished turn's bubbles.
+ */
+async function settleMountLoad() {
+  await waitFor(() => expect(mockReplay).toHaveBeenCalled());
+  await act(async () => {});
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -139,6 +155,7 @@ describe('useChatMessages – turn index with steering messages', () => {
   it('steering_delivered creates assistant messages with isSteering flag', async () => {
     mockTwoTurnsWithSteering(3);
     const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
+    await settleMountLoad();
 
     await act(async () => {
       await result.current.handleSendMessage('hello', false);
@@ -209,6 +226,7 @@ describe('useChatMessages – turn index with steering messages', () => {
   it('handleRegenerate uses correct turnIndex with steering messages present', async () => {
     mockTwoTurnsWithSteering(2);
     const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
+    await settleMountLoad();
 
     // Send two messages: first with steering, second without
     await act(async () => {
