@@ -36,5 +36,12 @@ class TestModelPricingResolution:
         assert intl["input"] == 2.677
         assert cn["input"] != intl["input"]
 
+    def test_sonnet_5_resolves_and_oauth_inherits(self):
+        direct = find_model_pricing("claude-sonnet-5", provider="anthropic")
+        oauth = find_model_pricing("claude-sonnet-5", provider="claude-oauth")
+        assert direct is not None
+        assert direct["input"] > 0 and direct["output"] > 0
+        assert oauth == direct
+
     def test_unknown_model_returns_none(self):
         assert find_model_pricing("does-not-exist", provider="anthropic") is None
