@@ -430,7 +430,8 @@ _SCOPE_CACHE_TTL = 300  # 5 minutes
 
 
 async def _get_user_scopes(user_id: str) -> list[str] | None:
-    """Return the user's scopes from the auth/quota service; 5 min in-process cache.
+    """Return the user's scopes from the auth/quota service; in-process cache
+    (5 min, but only 15 s for a fail-open ``None``).
 
     Returns None when the platform is unreachable or omits ``scopes`` (the
     fail-open signal — callers allow). An explicit list, *including an empty
@@ -447,7 +448,10 @@ async def _get_user_scopes(user_id: str) -> list[str] | None:
     result = await _call_validate_for_user(user_id)
     scopes = result["scopes"] if result and "scopes" in result else None
 
-    _scope_cache[user_id] = (scopes, now + _SCOPE_CACHE_TTL)
+    # Brief negative TTL (mirrors _fetch_platform_membership) so a platform
+    # blip doesn't leave gating disabled for the full 5 minutes.
+    ttl = _SCOPE_CACHE_TTL if scopes is not None else 15
+    _scope_cache[user_id] = (scopes, now + ttl)
     return scopes
 
 
@@ -513,6 +517,9 @@ async def enforce_capacity(user_id: str, check_quota: str) -> None:
 
     if quota.get("allowed") is False:
         current, limit = _extract_capacity(quota)
+        headers = {"X-RateLimit-Remaining": "0"}
+        if limit is not None:
+            headers["X-RateLimit-Limit"] = str(limit)
         # Forward platform's `message` and `limit_type` verbatim; no copy authored here.
         raise HTTPException(
             status_code=429,
@@ -523,10 +530,7 @@ async def enforce_capacity(user_id: str, check_quota: str) -> None:
                 "limit": limit,
                 "remaining": 0,
             },
-            headers={
-                "X-RateLimit-Limit": str(limit if limit is not None else ""),
-                "X-RateLimit-Remaining": "0",
-            },
+            headers=headers,
         )
 
 

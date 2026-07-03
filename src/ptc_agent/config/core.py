@@ -8,11 +8,14 @@ This module defines pure data classes for core configuration:
 - Logging settings
 """
 
+import logging
 import re
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 # Default security lists — used by SecurityConfig defaults and create_default_security_config()
 DEFAULT_ALLOWED_IMPORTS = [
@@ -67,7 +70,7 @@ class DaytonaConfig(BaseModel):
     # Resource tier presets (operator-tunable in agent_config.yaml).
     default_tier: str = "standard"
     resource_tiers: dict[str, ResourceTier] = Field(
-        default_factory=_default_resource_tiers
+        default_factory=_default_resource_tiers, validate_default=True
     )
 
     @field_validator("resource_tiers")
@@ -76,10 +79,15 @@ class DaytonaConfig(BaseModel):
         cls, v: dict[str, ResourceTier]
     ) -> dict[str, ResourceTier]:
         """Clamp every tier to the org ceiling (clamp, never reject)."""
-        for tier in v.values():
-            tier.cpu = min(tier.cpu, RESOURCE_TIER_CEILING["cpu"])
-            tier.memory = min(tier.memory, RESOURCE_TIER_CEILING["memory"])
-            tier.disk = min(tier.disk, RESOURCE_TIER_CEILING["disk"])
+        for name, tier in v.items():
+            for resource, ceiling in RESOURCE_TIER_CEILING.items():
+                value = getattr(tier, resource)
+                if value > ceiling:
+                    logger.warning(
+                        "resource_tiers[%r].%s=%s exceeds the org ceiling %s; clamping",
+                        name, resource, value, ceiling,
+                    )
+                    setattr(tier, resource, ceiling)
         return v
 
     @model_validator(mode="after")

@@ -1125,6 +1125,36 @@ class TestGetUserScopes:
             _scope_cache.pop("user-3", None)
             assert await _get_user_scopes("user-3") == []
 
+    @pytest.mark.asyncio
+    async def test_fail_open_result_gets_short_negative_ttl(self):
+        """None (fail-open) is cached ~15 s; a definitive answer gets the full TTL."""
+        import time
+
+        from src.server.dependencies.usage_limits import (
+            _SCOPE_CACHE_TTL,
+            _get_user_scopes,
+            _scope_cache,
+        )
+
+        with patch(
+            f"{MODULE}._call_validate_for_user",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            _scope_cache.pop("user-4", None)
+            await _get_user_scopes("user-4")
+        assert _scope_cache["user-4"][1] - time.time() <= 15.5
+
+        with patch(
+            f"{MODULE}._call_validate_for_user",
+            new_callable=AsyncMock,
+            return_value={"scopes": ["workspace.spec.performance"]},
+        ):
+            _scope_cache.pop("user-4", None)
+            await _get_user_scopes("user-4")
+        assert _scope_cache["user-4"][1] - time.time() > _SCOPE_CACHE_TTL - 5
+        _scope_cache.pop("user-4", None)
+
 
 # ===================================================================
 # spec_grantable — non-raising form of the full spec gate (scope 403 +
