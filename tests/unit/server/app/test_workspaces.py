@@ -1112,9 +1112,8 @@ async def test_archive_workspace_success(client):
 
 @pytest.mark.asyncio
 async def test_archive_workspace_not_found(client):
-    """Archive endpoint has no `except HTTPException: raise`, so
-    require_workspace_owner's 404 is caught by the generic Exception handler
-    and surfaces as 500."""
+    """Archive re-raises require_workspace_owner's 404 (via the shared
+    _workspace_action_errors context manager), not masked as a 500."""
     with patch(
         "src.server.app.workspaces.db_get_workspace",
         new_callable=AsyncMock,
@@ -1124,14 +1123,12 @@ async def test_archive_workspace_not_found(client):
             f"/api/v1/workspaces/{uuid.uuid4()}/archive"
         )
 
-    # HTTPException from require_workspace_owner falls through to
-    # except Exception -> 500 (no `except HTTPException: raise` in this handler)
-    assert resp.status_code == 500
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
 async def test_archive_workspace_forbidden(client):
-    """Same pattern: missing except-HTTPException-raise -> 500."""
+    """Archive re-raises require_workspace_owner's 403 for a non-owner."""
     ws = _ws(user_id="other-user", status="stopped")
     with patch(
         "src.server.app.workspaces.db_get_workspace",
@@ -1142,7 +1139,7 @@ async def test_archive_workspace_forbidden(client):
             f"/api/v1/workspaces/{ws['workspace_id']}/archive"
         )
 
-    assert resp.status_code == 500
+    assert resp.status_code == 403
 
 
 # ---------------------------------------------------------------------------

@@ -894,6 +894,24 @@ class TestAssertSpecAllowed:
             mock_cap.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_downgrade_skips_count(self):
+        """max → performance is a downgrade: scope checked, no new slot counted."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes",
+                new_callable=AsyncMock,
+                return_value=["workspace:spec:performance"],
+            ),
+            patch(f"{MODULE}.enforce_capacity", new_callable=AsyncMock) as mock_cap,
+        ):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            await assert_spec_allowed("user-1", "performance", current_tier="max")
+            mock_cap.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_max_checks_max_scope_and_count(self):
         """max tier gates on the spec:max scope + spec_max count."""
         with (
@@ -983,4 +1001,341 @@ class TestAssertAlwaysOnAllowed:
 
             await assert_always_on_allowed("user-1")
             mock_scopes.assert_not_awaited()
+            mock_v.assert_not_awaited()
+
+
+# ===================================================================
+# require_workspace_scope — the scope-403 half of the hybrid gate.
+# Fail-open (allow) only on OSS mode or an unreachable/omitted scope
+# response (None); a definitive list — including an empty one — is
+# enforced so a no-scope user can't slip through as if the service were
+# down.
+# ===================================================================
+
+
+class TestRequireWorkspaceScope:
+    @pytest.mark.asyncio
+    async def test_oss_mode_allows(self):
+        """OSS mode: gate inactive → returns without fetching scopes."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "oss"),
+            patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock) as mock_scopes,
+        ):
+            from src.server.dependencies.usage_limits import require_workspace_scope
+
+            await require_workspace_scope("user-1", "workspace:always_on")
+            mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_none_scopes_fails_open(self):
+        """Unreachable platform (None) → fail-open, no 403."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            from src.server.dependencies.usage_limits import require_workspace_scope
+
+            await require_workspace_scope("user-1", "workspace:always_on")  # no raise
+
+    @pytest.mark.asyncio
+    async def test_definitive_empty_list_denies(self):
+        """A platform-confirmed empty list lacks every scope → 403."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock, return_value=[]),
+        ):
+            from src.server.dependencies.usage_limits import require_workspace_scope
+
+            with pytest.raises(HTTPException) as exc:
+                await require_workspace_scope("user-1", "workspace:always_on")
+            assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_present_scope_allows(self):
+        """Definitive list containing the scope → no raise."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes",
+                new_callable=AsyncMock,
+                return_value=["workspace:always_on"],
+            ),
+        ):
+            from src.server.dependencies.usage_limits import require_workspace_scope
+
+            await require_workspace_scope("user-1", "workspace:always_on")  # no raise
+
+
+# ===================================================================
+# _get_user_scopes — None (unreachable/omitted) vs a definitive list.
+# ===================================================================
+
+
+class TestGetUserScopes:
+    @pytest.mark.asyncio
+    async def test_unreachable_returns_none(self):
+        """validate None → None (the fail-open signal), not []."""
+        with patch(
+            f"{MODULE}._call_validate_for_user",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            from src.server.dependencies.usage_limits import (
+                _get_user_scopes,
+                _scope_cache,
+            )
+
+            _scope_cache.pop("user-1", None)
+            assert await _get_user_scopes("user-1") is None
+
+    @pytest.mark.asyncio
+    async def test_omitted_scopes_key_returns_none(self):
+        """A 200 without a scopes key → None (can't confirm), not []."""
+        with patch(
+            f"{MODULE}._call_validate_for_user",
+            new_callable=AsyncMock,
+            return_value={"valid": True},
+        ):
+            from src.server.dependencies.usage_limits import (
+                _get_user_scopes,
+                _scope_cache,
+            )
+
+            _scope_cache.pop("user-2", None)
+            assert await _get_user_scopes("user-2") is None
+
+    @pytest.mark.asyncio
+    async def test_definitive_empty_list_preserved(self):
+        """A 200 with scopes: [] → [] (definitive), distinct from None."""
+        with patch(
+            f"{MODULE}._call_validate_for_user",
+            new_callable=AsyncMock,
+            return_value={"scopes": []},
+        ):
+            from src.server.dependencies.usage_limits import (
+                _get_user_scopes,
+                _scope_cache,
+            )
+
+            _scope_cache.pop("user-3", None)
+            assert await _get_user_scopes("user-3") == []
+
+
+# ===================================================================
+# spec_grantable — non-raising form of the full spec gate (scope 403 +
+# count 429). True unless assert_spec_allowed would reject; fail-open in
+# OSS mode. Confines HTTPException to this dependency layer so service
+# callers can branch on a bool.
+# ===================================================================
+
+
+class TestSpecGrantable:
+    @pytest.mark.asyncio
+    async def test_standard_is_grantable(self):
+        """standard is never gated → True without touching scopes/count."""
+        with patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock) as mock_scopes:
+            from src.server.dependencies.usage_limits import spec_grantable
+
+            assert await spec_grantable("user-1", "standard") is True
+            mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_oss_mode_fails_open_true(self):
+        """OSS mode: gate inactive → grantable, no scope fetch."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "oss"),
+            patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock) as mock_scopes,
+        ):
+            from src.server.dependencies.usage_limits import spec_grantable
+
+            assert await spec_grantable("user-1", "max") is True
+            mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_grantable_when_gate_passes_and_forwards_current_tier(self):
+        """Scope + count satisfied → True; current_tier forwarded verbatim."""
+        with patch(
+            f"{MODULE}.assert_spec_allowed", new_callable=AsyncMock
+        ) as mock_assert:
+            from src.server.dependencies.usage_limits import spec_grantable
+
+            assert (
+                await spec_grantable(
+                    "user-1", "performance", current_tier="standard"
+                )
+                is True
+            )
+            mock_assert.assert_awaited_once_with(
+                "user-1", "performance", current_tier="standard"
+            )
+
+    @pytest.mark.asyncio
+    async def test_not_grantable_on_missing_scope_403(self):
+        """assert raising 403 (missing scope) → False, not propagated."""
+        with patch(
+            f"{MODULE}.assert_spec_allowed",
+            new=AsyncMock(
+                side_effect=HTTPException(status_code=403, detail="not on plan")
+            ),
+        ):
+            from src.server.dependencies.usage_limits import spec_grantable
+
+            assert await spec_grantable("user-1", "max") is False
+
+    @pytest.mark.asyncio
+    async def test_not_grantable_on_count_429(self):
+        """assert raising 429 (over per-tier count) → False.
+
+        This is the count half a scope-only predicate would miss — a duplicate
+        must not carry an elevated tier past the per-tier quota.
+        """
+        with patch(
+            f"{MODULE}.assert_spec_allowed",
+            new=AsyncMock(
+                side_effect=HTTPException(status_code=429, detail="limit reached")
+            ),
+        ):
+            from src.server.dependencies.usage_limits import spec_grantable
+
+            assert (
+                await spec_grantable(
+                    "user-1", "performance", current_tier="standard"
+                )
+                is False
+            )
+
+    @pytest.mark.asyncio
+    async def test_none_scopes_fails_open_true(self):
+        """Unreachable scopes (None) + count no-op → fail-open True (never block)."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes", new_callable=AsyncMock, return_value=None
+            ),
+            patch(f"{MODULE}.enforce_capacity", new_callable=AsyncMock),
+        ):
+            from src.server.dependencies.usage_limits import spec_grantable
+
+            assert (
+                await spec_grantable("user-1", "max", current_tier="standard") is True
+            )
+
+    @pytest.mark.asyncio
+    async def test_definitive_empty_scopes_not_grantable(self):
+        """A platform-confirmed empty scope list is enforced, not treated as
+        fail-open: the scope gate rejects, so spec_grantable is False."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock, return_value=[]),
+            patch(f"{MODULE}.enforce_capacity", new_callable=AsyncMock) as mock_cap,
+        ):
+            from src.server.dependencies.usage_limits import spec_grantable
+
+            assert (
+                await spec_grantable("user-1", "max", current_tier="standard") is False
+            )
+            mock_cap.assert_not_awaited()  # scope gate rejected first
+
+
+# ===================================================================
+# spec_entitlement_lost — lazy spec reclaim's check at (re)provision time.
+# Shares _scope_entitlement_lost's fail-safe semantics: only a definitive
+# "no spec scope" returns True; OSS, unreachable, and ambiguous responses
+# keep the tier (return False). standard/unknown tiers are never reclaimed.
+# ===================================================================
+
+
+class TestSpecEntitlementLost:
+    @pytest.mark.asyncio
+    async def test_oss_mode_keeps_tier(self):
+        """OSS mode never reconciles — returns False without calling validate."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "oss"),
+            patch(f"{MODULE}._call_validate_for_user", new_callable=AsyncMock) as mock_v,
+        ):
+            from src.server.dependencies.usage_limits import spec_entitlement_lost
+
+            assert await spec_entitlement_lost("user-1", "max") is False
+            mock_v.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unreachable_keeps_tier(self):
+        """validate None (platform down / non-200) → fail-safe keep → False.
+        An outage must never mass-reclaim elevated tiers."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._call_validate_for_user", new_callable=AsyncMock, return_value=None),
+        ):
+            from src.server.dependencies.usage_limits import spec_entitlement_lost
+
+            assert await spec_entitlement_lost("user-1", "max") is False
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_response_keeps_tier(self):
+        """200 but scopes missing/None (not a list) → ambiguous → fail-safe keep."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value={"valid": True},
+            ),
+        ):
+            from src.server.dependencies.usage_limits import spec_entitlement_lost
+
+            assert await spec_entitlement_lost("user-1", "performance") is False
+
+    @pytest.mark.asyncio
+    async def test_scope_absent_reports_lost(self):
+        """200 with a real scope list lacking the max scope → tier lost → True."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value={"scopes": ["workspace:spec:performance"]},
+            ),
+        ):
+            from src.server.dependencies.usage_limits import spec_entitlement_lost
+
+            assert await spec_entitlement_lost("user-1", "max") is True
+
+    @pytest.mark.asyncio
+    async def test_scope_present_keeps_tier(self):
+        """200 with the performance scope present → still entitled → False."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value={"scopes": ["workspace:spec:performance", "workspace:always_on"]},
+            ),
+        ):
+            from src.server.dependencies.usage_limits import spec_entitlement_lost
+
+            assert await spec_entitlement_lost("user-1", "performance") is False
+
+    @pytest.mark.asyncio
+    async def test_standard_and_unknown_tiers_never_reclaimed(self):
+        """Ungated tiers short-circuit to False before any platform call."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._call_validate_for_user", new_callable=AsyncMock) as mock_v,
+        ):
+            from src.server.dependencies.usage_limits import spec_entitlement_lost
+
+            assert await spec_entitlement_lost("user-1", "standard") is False
+            assert await spec_entitlement_lost("user-1", "titanium") is False
             mock_v.assert_not_awaited()

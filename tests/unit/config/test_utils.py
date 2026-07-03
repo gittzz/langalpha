@@ -83,6 +83,40 @@ class TestCreateDaytonaConfig:
         assert cfg.python_version == "3.11"
         assert cfg.auto_stop_interval == 1800
 
+    def test_forwards_tier_fields_when_present(self):
+        """default_tier / resource_tiers from yaml reach the config object."""
+        data = {
+            "base_url": "https://test.daytona.io/api",
+            "auto_stop_interval": 1800,
+            "auto_archive_interval": 43200,
+            "auto_delete_interval": 302400,
+            "python_version": "3.11",
+            "default_tier": "performance",
+            "resource_tiers": {
+                "standard": {"cpu": 1, "memory": 1, "disk": 3},
+                "performance": {"cpu": 2, "memory": 4, "disk": 5},
+            },
+        }
+        with patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key"}):
+            cfg = create_daytona_config(data)
+        assert cfg.default_tier == "performance"
+        assert set(cfg.resource_tiers) == {"standard", "performance"}
+        assert cfg.resource_tiers["performance"].memory == 4
+
+    def test_tier_fields_default_when_absent(self):
+        """No tier keys in yaml → the DaytonaConfig defaults apply untouched."""
+        data = {
+            "base_url": "https://test.daytona.io/api",
+            "auto_stop_interval": 1800,
+            "auto_archive_interval": 43200,
+            "auto_delete_interval": 302400,
+            "python_version": "3.11",
+        }
+        with patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key"}):
+            cfg = create_daytona_config(data)
+        assert cfg.default_tier == "standard"
+        assert set(cfg.resource_tiers) == {"standard", "performance", "max"}
+
     def test_missing_env_key_defaults_empty(self):
         """If DAYTONA_API_KEY is not set, api_key defaults to empty string."""
         data = {

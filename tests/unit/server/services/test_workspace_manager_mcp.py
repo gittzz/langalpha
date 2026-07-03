@@ -737,10 +737,10 @@ class TestSetWorkspaceSpecDiskGuard:
         return config
 
     @pytest.mark.asyncio
-    @patch("src.server.services.workspace_manager.get_workspace_total_size", new_callable=AsyncMock)
-    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.get_workspace_total_size", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_set_workspace_resource_tier", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.SessionManager")
-    @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_get_workspace", new_callable=AsyncMock)
     async def test_running_downgrade_rejected_when_files_exceed_disk(
         self, mock_get_ws, mock_session_mgr, mock_set_tier, mock_total_size
     ):
@@ -750,6 +750,7 @@ class TestSetWorkspaceSpecDiskGuard:
             ws_id, status="running", resource_tier="max", sandbox_id="sb-1"
         )
         mock_total_size.return_value = 5 * 1024**3  # 5 GiB; standard usable ~1 GiB
+        wm._sessions[ws_id] = MagicMock(sandbox=MagicMock())
         wm._backup_files_to_db = AsyncMock()
         wm._recover_sandbox = AsyncMock()
 
@@ -765,10 +766,10 @@ class TestSetWorkspaceSpecDiskGuard:
         assert mock_set_tier.await_args_list[-1].args == (ws_id, "max")
 
     @pytest.mark.asyncio
-    @patch("src.server.services.workspace_manager.get_workspace_total_size", new_callable=AsyncMock)
-    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.get_workspace_total_size", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_set_workspace_resource_tier", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.SessionManager")
-    @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_get_workspace", new_callable=AsyncMock)
     async def test_running_downgrade_allowed_when_files_fit(
         self, mock_get_ws, mock_session_mgr, mock_set_tier, mock_total_size
     ):
@@ -779,7 +780,9 @@ class TestSetWorkspaceSpecDiskGuard:
         )
         mock_total_size.return_value = 100 * 1024**2  # 100 MiB — fits standard
         mock_session_mgr.cleanup_session = AsyncMock()
+        wm._sessions[ws_id] = MagicMock(sandbox=MagicMock())
         wm._backup_files_to_db = AsyncMock()
+        wm._destroy_sandbox = AsyncMock()
         wm._recover_sandbox = AsyncMock()
 
         await wm.set_workspace_spec(ws_id, "standard", user_id="user-1")
@@ -789,10 +792,10 @@ class TestSetWorkspaceSpecDiskGuard:
         assert mock_set_tier.await_args_list[-1].args == (ws_id, "standard")
 
     @pytest.mark.asyncio
-    @patch("src.server.services.workspace_manager.get_workspace_total_size", new_callable=AsyncMock)
-    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.get_workspace_total_size", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_set_workspace_resource_tier", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.SessionManager")
-    @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_get_workspace", new_callable=AsyncMock)
     async def test_upgrade_skips_disk_guard(
         self, mock_get_ws, mock_session_mgr, mock_set_tier, mock_total_size
     ):
@@ -802,7 +805,9 @@ class TestSetWorkspaceSpecDiskGuard:
             ws_id, status="running", resource_tier="standard", sandbox_id="sb-1"
         )
         mock_session_mgr.cleanup_session = AsyncMock()
+        wm._sessions[ws_id] = MagicMock(sandbox=MagicMock())
         wm._backup_files_to_db = AsyncMock()
+        wm._destroy_sandbox = AsyncMock()
         wm._recover_sandbox = AsyncMock()
 
         await wm.set_workspace_spec(ws_id, "max", user_id="user-1")
@@ -811,9 +816,9 @@ class TestSetWorkspaceSpecDiskGuard:
         wm._recover_sandbox.assert_awaited_once()
 
     @pytest.mark.asyncio
-    @patch("src.server.services.workspace_manager.get_workspace_total_size", new_callable=AsyncMock)
-    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier", new_callable=AsyncMock)
-    @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.get_workspace_total_size", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_set_workspace_resource_tier", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_get_workspace", new_callable=AsyncMock)
     async def test_stopped_downgrade_rejected_before_destroy(
         self, mock_get_ws, mock_set_tier, mock_total_size
     ):
