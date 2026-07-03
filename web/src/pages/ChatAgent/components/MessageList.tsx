@@ -35,6 +35,7 @@ import UserQuestionCard from './UserQuestionCard';
 import CreateWorkspaceCard from './CreateWorkspaceCard';
 import StartQuestionCard from './StartQuestionCard';
 import PTCAgentCard from './PTCAgentCard';
+import { DispatchStatusProvider } from '../hooks/usePTCDispatchStatus';
 import SecretaryConfirmCard from './SecretaryConfirmCard';
 import SubagentTaskMessageContent from './SubagentTaskMessageContent';
 import TextMessageContent from './TextMessageContent';
@@ -425,8 +426,8 @@ interface MessageListProps {
   onRejectCreateWorkspace?: (proposalData: Record<string, unknown>) => void;
   onApproveStartQuestion?: (proposalData: Record<string, unknown>) => void;
   onRejectStartQuestion?: (proposalData: Record<string, unknown>) => void;
-  onApprovePTCAgent?: (proposalData: Record<string, unknown>, overrides?: { report_back?: boolean }) => void;
-  onRejectPTCAgent?: (proposalData: Record<string, unknown>) => void;
+  onApprovePTCAgent?: (proposalData: Record<string, unknown>, overrides: { report_back?: boolean } | undefined, proposalId: string, interruptId: string) => void;
+  onRejectPTCAgent?: (proposalData: Record<string, unknown>, proposalId: string, interruptId: string) => void;
   onApproveSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onRejectSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onEditMessage?: (messageId: string, content: string) => void;
@@ -487,8 +488,11 @@ function MessageList({ messages, isLoading, isLoadingHistory, hideAvatar, compac
     );
   }
 
-  // Render message list
+  // Render message list. One DispatchStatusProvider for the whole list so every
+  // PTCAgentCard in the turn shares a single batched dispatch-liveness query +
+  // timer instead of each card polling /status on its own.
   return (
+    <DispatchStatusProvider>
     <div className={isMobile ? 'space-y-4' : 'space-y-6'}>
       {messages.map((message) =>
         (message.role as string) === 'notification' ? (
@@ -535,6 +539,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, hideAvatar, compac
         )
       )}
     </div>
+    </DispatchStatusProvider>
   );
 }
 
@@ -562,8 +567,8 @@ interface MessageBubbleProps {
   onRejectCreateWorkspace?: (proposalData: Record<string, unknown>) => void;
   onApproveStartQuestion?: (proposalData: Record<string, unknown>) => void;
   onRejectStartQuestion?: (proposalData: Record<string, unknown>) => void;
-  onApprovePTCAgent?: (proposalData: Record<string, unknown>, overrides?: { report_back?: boolean }) => void;
-  onRejectPTCAgent?: (proposalData: Record<string, unknown>) => void;
+  onApprovePTCAgent?: (proposalData: Record<string, unknown>, overrides: { report_back?: boolean } | undefined, proposalId: string, interruptId: string) => void;
+  onRejectPTCAgent?: (proposalData: Record<string, unknown>, proposalId: string, interruptId: string) => void;
   onApproveSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onRejectSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onEditMessage?: (messageId: string, content: string) => void;
@@ -1096,8 +1101,8 @@ interface MessageContentSegmentsProps {
   onRejectCreateWorkspace?: (proposalData: Record<string, unknown>) => void;
   onApproveStartQuestion?: (proposalData: Record<string, unknown>) => void;
   onRejectStartQuestion?: (proposalData: Record<string, unknown>) => void;
-  onApprovePTCAgent?: (proposalData: Record<string, unknown>, overrides?: { report_back?: boolean }) => void;
-  onRejectPTCAgent?: (proposalData: Record<string, unknown>) => void;
+  onApprovePTCAgent?: (proposalData: Record<string, unknown>, overrides: { report_back?: boolean } | undefined, proposalId: string, interruptId: string) => void;
+  onRejectPTCAgent?: (proposalData: Record<string, unknown>, proposalId: string, interruptId: string) => void;
   onApproveSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onRejectSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   ptcAgentProposals?: Record<string, Record<string, unknown>>;
@@ -1749,8 +1754,8 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
               <PTCAgentCard
                 key={block.key}
                 proposalData={pad as any}
-                onApprove={onApprovePTCAgent ? (overrides?: { report_back?: boolean }) => onApprovePTCAgent(pad, overrides) : undefined}
-                onReject={onRejectPTCAgent ? () => onRejectPTCAgent(pad) : undefined}
+                onApprove={onApprovePTCAgent ? (overrides?: { report_back?: boolean }) => onApprovePTCAgent(pad, overrides, (block as PTCAgentRenderBlock).segment.proposalId!, pad.interruptId as string) : undefined}
+                onReject={onRejectPTCAgent ? () => onRejectPTCAgent(pad, (block as PTCAgentRenderBlock).segment.proposalId!, pad.interruptId as string) : undefined}
                 flashContext={flashContext}
               />
             );
@@ -1912,8 +1917,8 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
               <PTCAgentCard
                 key={`ptc-agent-${segment.proposalId}`}
                 proposalData={pad as any}
-                onApprove={onApprovePTCAgent ? (overrides?: { report_back?: boolean }) => onApprovePTCAgent(pad, overrides) : undefined}
-                onReject={onRejectPTCAgent ? () => onRejectPTCAgent(pad) : undefined}
+                onApprove={onApprovePTCAgent ? (overrides?: { report_back?: boolean }) => onApprovePTCAgent(pad, overrides, segment.proposalId!, pad.interruptId as string) : undefined}
+                onReject={onRejectPTCAgent ? () => onRejectPTCAgent(pad, segment.proposalId!, pad.interruptId as string) : undefined}
                 flashContext={flashContext}
               />
             );

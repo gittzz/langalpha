@@ -6,6 +6,7 @@ completed/cancelled/interrupted, cancel flags, retry counts, and graceful
 degradation when Redis is unavailable.
 """
 
+import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -55,8 +56,8 @@ async def _call_get_workflow_status(status: WorkflowStatus, bg_status: str) -> d
     tracker.delete_status = AsyncMock(return_value=True)
 
     bg_manager = MagicMock()
-    bg_manager.get_workflow_status = AsyncMock(return_value={
-        "status": bg_status,
+    bg_manager.get_live_task_info = AsyncMock(return_value={
+        "live": bg_status != "not_found",
         "active_tasks": [],
     })
 
@@ -493,3 +494,38 @@ class TestWorkflowStatusEnum:
 
     def test_enum_is_str(self):
         assert isinstance(WorkflowStatus.ACTIVE, str)
+
+
+# ---------------------------------------------------------------------------
+# get_statuses — batched MGET behind the liveness endpoint
+# ---------------------------------------------------------------------------
+
+class TestGetStatuses:
+    def teardown_method(self):
+        WorkflowTracker._instance = None
+
+    @pytest.mark.asyncio
+    async def test_batches_one_mget_and_decodes_found_keys(self):
+        tracker, mock_cache = _make_tracker(enabled=True)
+        mock_cache.client.mget = AsyncMock(return_value=[
+            json.dumps({"status": "active", "run_id": "r-1", "user_id": "u-1"}),
+            None,          # missing key -> omitted
+            "not-json",    # undecodable -> omitted
+        ])
+        out = await tracker.get_statuses(["t-1", "t-2", "t-3"])
+        assert out == {"t-1": {"status": "active", "run_id": "r-1", "user_id": "u-1"}}
+        mock_cache.client.mget.assert_awaited_once_with(
+            ["workflow:status:t-1", "workflow:status:t-2", "workflow:status:t-3"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_ids_returns_empty_without_mget(self):
+        tracker, mock_cache = _make_tracker(enabled=True)
+        mock_cache.client.mget = AsyncMock()
+        assert await tracker.get_statuses([]) == {}
+        mock_cache.client.mget.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disabled_returns_empty(self):
+        tracker, _ = _make_tracker(enabled=False)
+        assert await tracker.get_statuses(["t-1"]) == {}

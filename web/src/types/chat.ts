@@ -305,6 +305,7 @@ export interface PTCAgentProposalState {
   thread_id?: string;
   question?: string;
   interruptId?: string;
+  tool_call_id?: string;
   report_back?: boolean;
 }
 
@@ -409,12 +410,4 @@ export interface SubagentTaskRefs {
   currentToolCallIdRef: { current: string | null };
   messages: AssistantMessage[];
   runIndex: number;
-}
-
-// --- History Replay ---
-
-export interface PairState {
-  contentOrderCounter: number;
-  reasoningId: string | null;
-  toolCallId: string | null;
 }

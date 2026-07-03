@@ -180,4 +180,39 @@ describe('useChatMessages — cross-thread navigation reconnect', () => {
     resolveB?.();
     await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
   });
+
+  it('clears the "Reconnecting…" spinner once the live stream delivers events, while the run keeps streaming', async () => {
+    // The PTC-jump bug: clicking a dispatch card lands on a still-streaming PTC
+    // thread. Its reconnect reader stays open for the whole turn (it resolves
+    // only when the run completes), so the spinner must clear as soon as events
+    // arrive — not linger for the entire streaming duration even though tokens
+    // are visibly flowing. isLoading (the stop button) stays on until the run
+    // actually ends.
+    mockStatus.mockResolvedValue({ can_reconnect: true, status: 'running', run_id: 'run-live', active_tasks: [] });
+
+    let resolveStream: (() => void) | undefined;
+    mockReconnect.mockImplementation((...args: unknown[]) => {
+      const onEvent = args[3] as (e: Record<string, unknown>) => void;
+      // Live tokens arrive, then the reader hangs — the turn is still in progress.
+      onEvent({ event: 'metadata', thread_id: 'th-live', run_id: 'run-live' });
+      onEvent({ event: 'message_chunk', role: 'assistant', agent: 'main', content_type: 'text', content: 'streaming…' });
+      return new Promise<{ disconnected: boolean; aborted: boolean }>((res) => {
+        resolveStream = () => res({ disconnected: false, aborted: false });
+      });
+    });
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws', 'th-live'));
+
+    // Reconnect attaches and streams; the first event clears the spinner.
+    await waitFor(() => expect(mockReconnect).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+    // Spinner is already off even though the reader is still open and streaming.
+    expect(result.current.isReconnecting).toBe(false);
+
+    // Let the turn finish; cleanup clears loading without re-stranding the spinner.
+    resolveStream?.();
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+    expect(result.current.isReconnecting).toBe(false);
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+  });
 });

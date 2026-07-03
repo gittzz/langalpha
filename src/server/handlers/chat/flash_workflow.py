@@ -19,7 +19,10 @@ from fastapi import HTTPException
 from langgraph.types import Command
 
 from src.server.app import setup
-from src.server.database.workspace import get_or_create_flash_workspace
+from src.server.database.workspace import (
+    get_flash_workspace_id,
+    get_or_create_flash_workspace,
+)
 from src.server.handlers.streaming_handler import WorkflowStreamHandler
 from src.server.models.chat import (
     ChatRequest,
@@ -104,7 +107,7 @@ async def _maybe_clear_report_back(request: ChatRequest, flash_thread_id: str) -
         return
 
     from src.utils.cache.redis_cache import get_cache_client
-    from src.server.handlers.chat.ptc_workflow import clear_flash_report_back
+    from src.server.handlers.chat.report_back import clear_flash_report_back
 
     cache = get_cache_client()
     if not (cache.enabled and cache.client):
@@ -117,6 +120,20 @@ async def _maybe_clear_report_back(request: ChatRequest, flash_thread_id: str) -
 # ---------------------------------------------------------------------------
 
 
+def _reusable_flash_workspace(flash_workspace: dict | None, user_id: str) -> bool:
+    """True when a pre-resolved row is the caller's canonical flash workspace.
+
+    The route may hand in the flash workspace it already upserted so the
+    workflow can skip a duplicate upsert. Trust it only when its id matches the
+    deterministic UUID v5 for this user — defends against an unrelated workspace
+    ever being threaded in.
+    """
+    return bool(
+        flash_workspace
+        and str(flash_workspace.get("workspace_id")) == get_flash_workspace_id(user_id)
+    )
+
+
 async def astream_flash_workflow(
     request: ChatRequest,
     thread_id: str,
@@ -126,6 +143,7 @@ async def astream_flash_workflow(
     is_byok: bool = False,
     config=None,
     dispatched: bool = False,
+    flash_workspace: dict | None = None,
 ):
     """Async generator that streams Flash agent workflow events.
 
@@ -209,7 +227,13 @@ async def astream_flash_workflow(
         # Database Persistence Setup
         # =================================================================
 
-        flash_ws = await get_or_create_flash_workspace(user_id)
+        # Reuse the flash workspace the route already upserted this request
+        # (see ``_reusable_flash_workspace``); safe only because the route's
+        # upsert already applied the touch side effects (updated_at/is_pinned).
+        if _reusable_flash_workspace(flash_workspace, user_id):
+            flash_ws = flash_workspace
+        else:
+            flash_ws = await get_or_create_flash_workspace(user_id)
         workspace_id = str(flash_ws["workspace_id"])
 
         await ensure_thread(

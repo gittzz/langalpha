@@ -157,7 +157,7 @@ _ROUTE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 # Literal (non-UUID) path segments that are valid endpoints, not ids.
-_ROUTE_ID_ALLOWLIST = frozenset({"messages", "flash", "reorder"})
+_ROUTE_ID_ALLOWLIST = frozenset({"messages", "flash", "reorder", "dispatches"})
 _WS_PATH_RE = re.compile(r"^/api/v1/workspaces/([^/]+)")
 _THREAD_PATH_RE = re.compile(r"^/api/v1/threads/([^/]+)")
 
@@ -168,7 +168,7 @@ def find_malformed_route_ids(
     """Return (slot, value) pairs where a workspace/thread id isn't a UUID.
 
     Inspects the workspaces/threads path segment and the ``workspace_id`` query
-    param; allowlisted literal segments (messages/flash/reorder) are ignored.
+    param; allowlisted literal segments (messages/flash/reorder/dispatches) are ignored.
     """
     findings: list[tuple[str, str]] = []
 

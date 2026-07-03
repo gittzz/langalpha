@@ -14,7 +14,6 @@ import contextlib
 import json
 import time
 from datetime import datetime
-from typing import Coroutine
 
 from fastapi import HTTPException
 from langgraph.types import Command
@@ -89,211 +88,7 @@ from src.config.settings import get_ptc_recursion_limit
 from .llm_config import resolve_llm_config
 from .steering import backfill_steering_queries, drain_steering_return_event
 from .stream_from_log import stream_from_log
-
-# Strong references to fire-and-forget tasks so the event loop doesn't GC them.
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _fire_and_forget(coro: Coroutine, *, name: str = "") -> None:
-    """Schedule a coroutine as a fire-and-forget background task.
-
-    Exceptions are logged at DEBUG and suppressed, so they never surface
-    as 'Task exception was never retrieved'.
-    """
-    async def _safe():
-        try:
-            await coro
-        except Exception:
-            logger.debug(f"[PTC_CHAT] Fire-and-forget task failed: {name}", exc_info=True)
-        finally:
-            _background_tasks.discard(t)
-    t = asyncio.create_task(_safe(), name=name or None)
-    _background_tasks.add(t)
-
-
-# Bounded retry schedule for the report-back POST: 3 attempts total, with
-# ~0.5s then ~2s backoff between them. Retry on transient failures (network
-# error, 5xx, or 409 from a momentarily-busy flash thread); give up
-# immediately on any other 4xx.
-_REPORT_BACK_BACKOFFS = (0.5, 2.0)
-
-# TTL for the report-back run pointer; matches the watch SET's TTL.
-_FLASH_RB_RUN_TTL = 86400
-
-
-def flash_rb_run_key(flash_thread_id: str) -> str:
-    """Redis key holding the latest report-back flash run_id for a flash thread."""
-    return f"flash_rb_run:{flash_thread_id}"
-
-
-async def clear_flash_report_back(
-    cache, ptc_thread_id: str, flash_thread_id: str | None
-) -> None:
-    """Clear durable flash report-back watch state for one PTC thread.
-
-    Deletes ``ptc_origin:{ptc_thread_id}`` and removes ``ptc_thread_id`` from
-    the ``flash_watch:{flash_thread_id}`` SET, deleting the SET (and the
-    report-back run pointer) once it empties. Does not swallow Redis errors —
-    callers wrap it in their own try/except so each call site keeps its existing
-    failure semantics.
-    """
-    await cache.delete(f"ptc_origin:{ptc_thread_id}")
-    if flash_thread_id and cache.client:
-        watch_key = f"flash_watch:{flash_thread_id}"
-        await cache.client.srem(watch_key, ptc_thread_id)
-        remaining = await cache.client.scard(watch_key)
-        if remaining == 0:
-            await cache.client.delete(watch_key)
-            await cache.delete(flash_rb_run_key(flash_thread_id))
-
-
-async def _flash_report_back(ptc_thread_id: str, workspace_id: str | None) -> None:
-    """Notify the originating flash thread when its dispatched PTC run completes.
-
-    Checks Redis for origin metadata stored by the ptc_agent secretary tool.
-    If ``report_back`` is enabled, POSTs a synthetic user message to the flash
-    thread (with a bounded retry), triggering flash to call ``agent_output``
-    and summarize results, then publishes a wake notification.
-
-    The wake payload and a durable ``flash_rb_run`` pointer both carry the
-    report-back run_id so a client attaches to the exact run instead of
-    inferring it: an in-session client uses the wake's run_id directly, a
-    reloading client reads the pointer via ``/status``.
-
-    This does NOT clear ``ptc_origin`` / ``flash_watch`` — the durable watch is
-    cleared only when the report-back flash run reaches a terminal state (its
-    summary is persisted on success), so a client that missed the live wake
-    still sees the pending report-back on reload. On exhausted failure it
-    neither wakes nor clears; the keys' TTL is the only GC.
-    """
-    import os
-
-    import aiohttp
-
-    from src.utils.cache.redis_cache import get_cache_client
-
-    cache = get_cache_client()
-    origin = await cache.get(f"ptc_origin:{ptc_thread_id}")
-    if not origin or origin.get("origin") != "flash" or not origin.get("report_back"):
-        return
-
-    flash_thread_id = origin.get("flash_thread_id")
-    flash_workspace_id = origin.get("flash_workspace_id")
-    user_id = origin.get("user_id")
-    if not flash_thread_id or not user_id:
-        return
-
-    self_base_url = os.environ.get("GINLIXFLOW_BASE_URL", "http://localhost:8000")
-    service_token = os.environ.get("INTERNAL_SERVICE_TOKEN", "")
-
-    ws_label = workspace_id or "an auto-created workspace"
-    message = (
-        "<system>\n"
-        f"The analysis you dispatched (thread {ptc_thread_id} in workspace "
-        f"{ws_label}) has completed. Use agent_output to retrieve and "
-        f"summarize the results for the user.\n"
-        "</system>"
-    )
-    payload = {
-        "messages": [{"role": "user", "content": message}],
-        "agent_mode": "flash",
-        "workspace_id": flash_workspace_id,
-        "query_type": "system",
-        # Lets the report-back flash run identify which watch member to clear
-        # on its own completion.
-        "report_back_ptc_thread_id": ptc_thread_id,
-    }
-    headers = {
-        "X-Service-Token": service_token,
-        "X-User-Id": user_id,
-        "X-Dispatch": "background",
-    }
-    url = f"{self_base_url}/api/v1/threads/{flash_thread_id}/messages"
-
-    dispatched = False
-    rb_run_id = None
-    for attempt in range(len(_REPORT_BACK_BACKOFFS) + 1):
-        retryable = False
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(connect=10, sock_read=30),
-                ) as resp:
-                    if resp.status < 400:
-                        dispatched = True
-                        try:
-                            rb_run_id = (await resp.json()).get("run_id")
-                        except Exception:
-                            rb_run_id = None
-                        logger.info(
-                            f"[FLASH_REPORT_BACK] Sent completion to flash thread "
-                            f"{flash_thread_id} for PTC thread {ptc_thread_id} "
-                            f"(attempt {attempt + 1})"
-                        )
-                        break
-                    body = await resp.text()
-                    if resp.status == 409 or resp.status >= 500:
-                        retryable = True
-                        logger.warning(
-                            f"[FLASH_REPORT_BACK] Retryable {resp.status} POSTing to "
-                            f"flash thread {flash_thread_id} (attempt {attempt + 1}): "
-                            f"{body[:200]}"
-                        )
-                    else:
-                        # Any other 4xx is a permanent rejection — give up
-                        # immediately without waking or clearing.
-                        logger.warning(
-                            f"[FLASH_REPORT_BACK] Non-retryable {resp.status} POSTing "
-                            f"to flash thread {flash_thread_id}: {body[:200]}; "
-                            f"giving up"
-                        )
-                        return
-        except Exception as e:
-            # Network error / timeout — retryable.
-            retryable = True
-            logger.warning(
-                f"[FLASH_REPORT_BACK] HTTP error POSTing to flash thread "
-                f"{flash_thread_id} (attempt {attempt + 1}): {e}"
-            )
-
-        if retryable and attempt < len(_REPORT_BACK_BACKOFFS):
-            await asyncio.sleep(_REPORT_BACK_BACKOFFS[attempt])
-
-    if not dispatched:
-        logger.warning(
-            f"[FLASH_REPORT_BACK] Exhausted retries POSTing to flash thread "
-            f"{flash_thread_id} for PTC thread {ptc_thread_id}; leaving watch "
-            f"state intact for reload recovery"
-        )
-        return
-
-    # Persist the report-back run pointer so a reloading client can read it from
-    # /status and attach to the exact run. Best-effort: if it fails, the client
-    # falls back to history replay on reload.
-    if rb_run_id:
-        try:
-            await cache.set(
-                flash_rb_run_key(flash_thread_id),
-                {"run_id": rb_run_id},
-                ttl=_FLASH_RB_RUN_TTL,
-            )
-        except Exception:
-            pass
-
-    # Publish the wake on success only, carrying the run_id so an in-session
-    # client attaches directly without a /status round-trip. Do NOT clear
-    # ptc_origin / flash_watch here — the watch is consumed (cleared) when the
-    # report-back flash run reaches a terminal state.
-    try:
-        await cache.client.publish(
-            f"thread:wake:{flash_thread_id}",
-            json.dumps({"thread_id": flash_thread_id, "run_id": rb_run_id}),
-        )
-    except Exception:
-        pass  # Best-effort; frontend will fall back to reconnect on page load
+from .tasks import fire_and_forget as _fire_and_forget
 
 
 async def astream_ptc_workflow(
@@ -1002,7 +797,8 @@ async def astream_ptc_workflow(
                 # flash agent with report_back=True, send a message to the
                 # flash thread so it can summarize the results.
                 try:
-                    await _flash_report_back(thread_id, request.workspace_id)
+                    from src.server.handlers.chat.report_back import _flash_report_back
+                    await _flash_report_back(thread_id)
                 except Exception as e:
                     logger.warning(
                         f"[PTC_COMPLETE] Flash report-back failed for {thread_id}: {e}"

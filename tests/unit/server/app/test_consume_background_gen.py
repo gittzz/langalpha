@@ -41,7 +41,7 @@ def _patched(cache, clear):
             "src.utils.cache.redis_cache.get_cache_client", return_value=cache
         ),
         patch(
-            "src.server.handlers.chat.ptc_workflow.clear_flash_report_back", clear
+            "src.server.handlers.chat.report_back.clear_flash_report_back", clear
         ),
     )
 
@@ -60,9 +60,12 @@ async def test_report_back_crash_clears_watch_via_ptc_thread_id():
             "flash-1",
             "run-1",
             report_back_ptc_thread_id="ptc-1",
+            user_id="user-1",
         )
     assert ok is False
-    clear.assert_awaited_once_with(cache, "ptc-1", "flash-1")
+    # The known owner is threaded through so the per-user cap slot is released
+    # even when ptc_origin carries no user_id (would TTL-leak otherwise).
+    clear.assert_awaited_once_with(cache, "ptc-1", "flash-1", user_id="user-1")
     cache.client.publish.assert_awaited_once()
     assert cache.client.publish.call_args[0][0] == "thread:wake:flash-1"
 
@@ -91,8 +94,42 @@ async def test_ptc_dispatch_crash_clears_via_thread_id():
     p1, p2 = _patched(cache, clear)
     with p1, p2:
         ok = await _consume_background_gen(
-            _crashing_gen(), "PTC_DISPATCH", "ptc-9", "run-9"
+            _crashing_gen(), "PTC_DISPATCH", "ptc-9", "run-9", user_id="user-9"
         )
     assert ok is False
-    clear.assert_awaited_once_with(cache, "ptc-9", "flash-9")
+    clear.assert_awaited_once_with(cache, "ptc-9", "flash-9", user_id="user-9")
     assert cache.client.publish.call_args[0][0] == "thread:wake:flash-9"
+
+
+@pytest.mark.asyncio
+async def test_crash_path_appends_stream_end_sentinel_after_error_event():
+    """The dispatch-failure path writes the terminal ``error`` SSE and THEN the
+    stream-end sentinel, so an attached consumer closes immediately instead of
+    dwelling on the empty-XREAD handshake."""
+    from src.server.services.background_task_manager import BackgroundTaskManager
+
+    cache = _FakeCache({})
+    order = []
+    cache.client.xadd.side_effect = lambda *a, **kw: order.append("error_xadd")
+
+    fake_manager = AsyncMock()
+    fake_manager.append_stream_end_sentinel.side_effect = (
+        lambda *a, **kw: order.append("sentinel")
+    )
+
+    clear = AsyncMock()
+    p1, p2 = _patched(cache, clear)
+    with p1, p2, patch.object(
+        BackgroundTaskManager,
+        "get_instance",
+        classmethod(lambda cls: fake_manager),
+    ):
+        ok = await _consume_background_gen(
+            _crashing_gen(), "PTC_DISPATCH", "ptc-1", "run-1"
+        )
+
+    assert ok is False
+    assert order == ["error_xadd", "sentinel"]
+    fake_manager.append_stream_end_sentinel.assert_awaited_once_with(
+        "ptc-1", "run-1"
+    )

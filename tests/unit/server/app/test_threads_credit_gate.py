@@ -126,6 +126,13 @@ async def test_credit_gate_byok_arg(
             "src.server.database.conversation.get_thread_by_id",
             new=AsyncMock(return_value={"workspace_id": "ws-placeholder"}),
         ),
+        # Workspace IDOR guard reads the owner; stub it as the caller's own.
+        patch(
+            "src.server.database.workspace.get_workspace",
+            new=AsyncMock(
+                return_value={"user_id": "usr-placeholder-001", "status": "running"}
+            ),
+        ),
         patch(
             "src.server.services.workspace_manager.WorkspaceManager.get_instance",
             return_value=wm_singleton,

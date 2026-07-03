@@ -70,6 +70,12 @@ def stream_meta_key(thread_id: str, run_id: str) -> str:
     return f"workflow:events:meta:{thread_id}:{run_id}"
 
 
+# Terminal sentinel written to the per-run workflow Stream when the run's
+# event forwarding ends (mirrors SUBAGENT_STREAM_END_EVENT). Consumers close
+# on sight instead of waiting out the empty-XREAD terminal handshake.
+WORKFLOW_STREAM_END_EVENT = "workflow_stream_end"
+
+
 # ========== Shared Helpers (DRY) ==========
 
 
@@ -265,14 +271,11 @@ class BackgroundTaskManager:
         # those events are what eventually clear this flag).
         #
         # SINGLE-PROCESS ASSUMPTION: this guard is in-process only (like
-        # task_lock / admission_lock). For the AUTO path the in-flight turn is
-        # also tracked cross-process via WorkflowTracker (Redis), but the MANUAL
-        # /compact|/offload checkpoint race is closed SOLELY by this in-memory
-        # guard. server.py runs a single uvicorn worker today; under
-        # ``uvicorn --workers N`` (or multiple replicas) a message POST routed
-        # to another worker would not see this guard and could race the manual
-        # checkpoint write. Scaling out requires a Redis-backed guard (mirror
-        # WorkflowTracker) before bumping the worker count.
+        # task_lock / admission_lock). The AUTO path is also tracked cross-process
+        # via WorkflowTracker (Redis), but the MANUAL /compact|/offload checkpoint
+        # race is closed SOLELY by this in-memory guard — so it holds only under a
+        # single uvicorn worker (see server.py's single-worker rationale). Scaling
+        # out requires a Redis-backed guard (mirror WorkflowTracker).
         self._compacting: Dict[str, asyncio.Event] = {}
 
         # Per-thread MANUAL compaction task registry. A manual /compact|/offload
@@ -703,6 +706,12 @@ class BackgroundTaskManager:
 
             await inner_task
 
+            # Sentinel must precede _mark_completed: its persistence callback
+            # may DEL the stream, and an append after that would recreate the
+            # key. Covers interrupted turns too (an interrupt ends the
+            # generator normally; _mark_completed classifies it).
+            await self.append_stream_end_sentinel(thread_id, run_id)
+
             await self._mark_completed(thread_id, run_id)
 
         # =====================================================================
@@ -734,6 +743,14 @@ class BackgroundTaskManager:
                 # asyncio.shield wrappers, not suppress, are what let these awaits
                 # finish across that re-cancel. Don't drop a shield assuming
                 # suppress already covers the cancellation case.
+                #
+                # Sentinel first: inner_task is settled so no more real events
+                # can land; attached consumers close now rather than waiting
+                # out the terminal handshake while teardown runs.
+                with suppress(Exception):
+                    await asyncio.shield(
+                        self.append_stream_end_sentinel(thread_id, run_id)
+                    )
                 if explicit:
                     # 1. Flush the LangGraph checkpoint so the next message
                     #    resumes from the last committed boundary. Gated on
@@ -769,6 +786,9 @@ class BackgroundTaskManager:
                 f"[BackgroundTaskManager] Workflow {key} failed: {e}",
                 exc_info=True
             )
+            # Sentinel before _mark_failed for the same DEL-ordering reason
+            # as the completed path.
+            await self.append_stream_end_sentinel(thread_id, run_id)
             await self._mark_failed(thread_id, run_id, str(e))
 
     async def _flush_checkpoint(self, thread_id: str, run_id: str) -> None:
@@ -1029,6 +1049,42 @@ class BackgroundTaskManager:
                 f"[EventBuffer] Buffer near capacity for {key}: "
                 f"{seq}/{self.max_stored_messages} events. "
                 "Oldest events will be dropped (FIFO)."
+            )
+
+    async def append_stream_end_sentinel(self, thread_id: str, run_id: str):
+        """Write a ``WORKFLOW_STREAM_END_EVENT`` sentinel to the per-run Stream.
+
+        Raw auto-ID XADD, not ``_buffer_event_redis`` — the sentinel is a
+        transport-level signal with no ``id: N`` prefix or seq slot, and the
+        auto ID (ms timestamp) always sorts after the explicit ``seq-0`` IDs
+        real events use. Best-effort: on failure the consumer's two-empty-round
+        terminal handshake still closes the stream, just slower.
+        """
+        if self.event_storage_backend != "redis":
+            return
+        try:
+            cache = get_cache_client()
+            if not cache.enabled or not cache.client:
+                return
+            stream_k = stream_key(thread_id, run_id)
+            payload = json.dumps(
+                {"event": WORKFLOW_STREAM_END_EVENT}, ensure_ascii=False
+            ).encode("utf-8")
+            async with cache.client.pipeline(transaction=False) as pipe:
+                pipe.xadd(
+                    stream_k,
+                    {b"event": payload},
+                    maxlen=self.max_stored_messages,
+                    approximate=True,
+                )
+                # Refresh TTL so a sentinel landing on an expired/cleared key
+                # can't recreate it without an expiry.
+                pipe.expire(stream_k, self.redis_event_ttl)
+                await pipe.execute()
+        except Exception as exc:
+            logger.debug(
+                f"[EventBuffer] Stream-end sentinel append failed for "
+                f"({thread_id}, {run_id}): {exc}"
             )
 
     # ========== Subagent collection ==========
@@ -1613,21 +1669,41 @@ class BackgroundTaskManager:
     async def _clear_report_back_watch(self, thread_id: str, metadata: dict) -> None:
         """Best-effort clear of the flash report-back watch on a terminal run.
 
-        A report-back flash run carries ``report_back_ptc_thread_id`` in its
-        metadata; when it fails or is cancelled the watch is never consumed by
-        the success-only completion hook, so clear it here to stop ``/status``
-        reporting the report-back as pending until the keys' 24h TTL.
+        Resolves the PTC thread via ``report_back_ptc_thread_id`` (a report-back
+        flash run) else ``thread_id`` (a cancelled/failed dispatched PTC run).
+        Needed because cancellation ends the consumer generator normally — the
+        crash-clear never fires and the watch membership + per-user cap slot
+        would leak. An ordinary flash turn (no origin keyed on the id) is a no-op.
         """
-        ptc_thread_id = (metadata or {}).get("report_back_ptc_thread_id")
-        if not ptc_thread_id:
-            return
+        metadata = metadata or {}
+        ptc_thread_id = metadata.get("report_back_ptc_thread_id") or thread_id
         try:
-            from src.server.handlers.chat.ptc_workflow import clear_flash_report_back
+            from src.server.handlers.chat.report_back import (
+                clear_flash_report_back,
+                publish_wake,
+            )
+            from src.server.handlers.chat.report_back_keys import ptc_origin_key
             from src.utils.cache.redis_cache import get_cache_client
 
             cache = get_cache_client()
-            if cache.enabled and cache.client:
-                await clear_flash_report_back(cache, ptc_thread_id, thread_id)
+            if not (cache.enabled and cache.client):
+                return
+            origin = await cache.get(ptc_origin_key(ptc_thread_id))
+            if not origin:
+                return
+            flash_tid = origin.get("flash_thread_id")
+            # Pass the known owner so the per-user cap slot is released even if
+            # ptc_origin TTL-expired before this terminal clear.
+            await clear_flash_report_back(
+                cache, ptc_thread_id, flash_tid,
+                user_id=metadata.get("user_id") or origin.get("user_id"),
+            )
+            if flash_tid:
+                # Wake watching clients so a cancelled/failed dispatch's card
+                # reconciles instead of spinning until TTL.
+                await publish_wake(
+                    cache, flash_tid, error="background_workflow_failed"
+                )
         except Exception as e:
             logger.warning(
                 f"[BackgroundTaskManager] report-back watch clear failed for "
@@ -2156,24 +2232,23 @@ class BackgroundTaskManager:
                 )
         return True
 
-    async def get_workflow_status(self, thread_id: str) -> Dict[str, Any]:
-        """Get detailed status for the latest run on a thread."""
+    async def get_live_task_info(self, thread_id: str) -> Dict[str, Any]:
+        """Liveness snapshot ``{"live", "run_id", "active_tasks"}`` for a thread's latest run.
+
+        ``live`` is True when the in-process manager still holds a task record —
+        the single-worker authority for whether a Redis ACTIVE blob is a real run
+        vs a restart orphan (``crosscheck_btm_liveness`` heals the latter).
+        Exposes no status string: a task record's lifecycle state is not a
+        workflow status.
+        """
         async with self.task_lock:
             task_info = self._find_latest_for_thread(thread_id)
             if not task_info:
-                return {
-                    "status": "not_found",
-                    "thread_id": thread_id,
-                }
-            # Snapshot under the lock, then release it BEFORE the registry/Redis
+                return {"live": False, "run_id": None, "active_tasks": []}
+            # Snapshot run_id under the lock, then release it BEFORE the registry
             # lookup below. Holding task_lock across that await would let a slow
             # registry path block /cancel from acquiring the lock to signal a stop.
-            status = task_info.status.value
             run_id = task_info.run_id
-            created_at = task_info.created_at
-            started_at = task_info.started_at
-            completed_at = task_info.completed_at
-            active_connections = task_info.active_connections
 
         active_tasks: list[str] = []
         try:
@@ -2186,16 +2261,7 @@ class BackgroundTaskManager:
         except Exception:
             pass
 
-        return {
-            "status": status,
-            "thread_id": thread_id,
-            "run_id": run_id,
-            "active_tasks": active_tasks,
-            "created_at": created_at.isoformat() if created_at else None,
-            "started_at": started_at.isoformat() if started_at else None,
-            "completed_at": completed_at.isoformat() if completed_at else None,
-            "active_connections": active_connections,
-        }
+        return {"live": True, "run_id": run_id, "active_tasks": active_tasks}
 
     # ---------- compaction admission guard ----------
 

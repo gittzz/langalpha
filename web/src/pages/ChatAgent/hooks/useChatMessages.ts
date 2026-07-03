@@ -10,7 +10,12 @@ import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useUser } from '@/hooks/useUser';
-import { sendChatMessageStream, replayThreadHistory, getWorkflowStatus, reconnectToWorkflowStream, sendHitlResponse, streamSubagentTaskEvents, fetchThreadTurns, submitFeedback, removeFeedback, getThreadFeedback, watchThread, cancelWorkflow } from '../utils/api';
+import { sendChatMessageStream, replayThreadHistory, getWorkflowStatus, getReportBackStatus, reconnectToWorkflowStream, sendHitlResponse, streamSubagentTaskEvents, fetchThreadTurns, submitFeedback, removeFeedback, getThreadFeedback, cancelWorkflow } from '../utils/api';
+import type { WorkflowStatusResponse, ReportBackStatusResponse } from '../utils/api';
+// Imported from the dependency-free signal module (not `../utils/api`) so this
+// keeps decoding wire status even in the hook tests that fully mock `../utils/api`.
+import { decodeReportBackSignal, shouldArmReportBack } from '../utils/reportBackSignal';
+import { useReportBackWatch, REPORT_BACK_IDLE_MAX_REARMS } from './useReportBackWatch';
 import { toast } from '@/components/ui/use-toast';
 import { buildRateLimitError, isUpstreamHint, type StructuredError } from '@/utils/rateLimitError';
 import { getStoredThreadId, setStoredThreadId } from './utils/threadStorage';
@@ -97,13 +102,6 @@ const PROPOSAL_DATA_KEY_MAP: Record<string, string> = {
 /** Secretary action interrupt types (for type guard in handlers). */
 const SECRETARY_ACTION_TYPES = new Set(['delete_workspace', 'stop_workspace', 'delete_thread']);
 
-/**
- * Stop polling `/status` for a PTC report-back after this many ~3s ticks (~3min)
- * so a report-back that never arrives (e.g. PTC dispatch failed, flash_watch
- * never cleared) doesn't poll forever.
- */
-const REPORT_BACK_MAX_POLLS = 60;
-
 /** Pending HITL interrupt state. */
 interface PendingInterrupt {
   type?: string;
@@ -166,18 +164,6 @@ interface SSEEvent {
   can_reconnect?: boolean;
   is_shared?: boolean;
   run_id?: string;
-  [key: string]: unknown;
-}
-
-/** Workflow status response. */
-interface WorkflowStatusResponse {
-  can_reconnect: boolean;
-  status: string;
-  active_tasks?: string[];
-  is_shared?: boolean;
-  pending_report_back?: boolean;
-  report_back_run_id?: string | null;
-  run_id?: string | null;
   [key: string]: unknown;
 }
 
@@ -691,28 +677,6 @@ export function useChatMessages(
   // Maps tool_call_id → proposalId for exact matching (safe under concurrent dispatches).
   const pendingPTCBackfillRef = useRef<Map<string, string>>(new Map());
 
-  // Report-back watch: after PTC dispatch, watch for the flash report-back workflow via SSE
-  const awaitingReportBackRef = useRef(false);
-  const reportBackWatchAbortRef = useRef<AbortController | null>(null);
-  const reportBackPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // The flash thread the active report-back watch belongs to. The watch is keyed
-  // to this thread, NOT the visible thread, so it survives navigation into the
-  // dispatched PTC thread and only renders when this flash thread is back on
-  // screen. This is what lets the flash report-back and a live PTC stream coexist
-  // instead of fighting over the single visible-thread slot. Null when no watch.
-  const reportBackWatchThreadIdRef = useRef<string | null>(null);
-  // The report-back run id once the backend names it (wake payload or /status).
-  // Captured even while the user is away on the PTC thread, so the report-back
-  // still streams when they return to the flash thread. Cleared on attach/stop.
-  const reportBackRunIdRef = useRef<string | null>(null);
-  // Generation token for the report-back watch. Bumped whenever a watch is torn
-  // down (consume, hard-stop, re-arm for a DIFFERENT flash thread, unmount). An
-  // in-flight wake/poll callback captures its generation and bails if it no
-  // longer matches. (Can't key off threadIdRef: it has two writers — the
-  // prop-sync effect and the stream metadata handler — that disagree transiently
-  // on a fresh thread, which would bail even the in-session case.)
-  const reportBackWatchEpochRef = useRef(0);
-
   // Track the last received SSE event ID for reconnection
   const lastEventIdRef = useRef<number | string | null>(null);
   // Track the active run_id for this thread. Populated from the SSE
@@ -721,14 +685,77 @@ export function useChatMessages(
   // steering handler can detect when a POST was routed as a new turn
   // (race: status flipped terminal between isLoading check and POST land).
   const currentRunIdRef = useRef<string | null>(null);
+  // Highest turn_index this view has RENDERED, compared against
+  // /status.latest_turn_index by the reactivation staleness check (a run that
+  // finished while this cached view was hidden is terminal — can_reconnect is
+  // false and there is no run_id to compare, so the turn counter is the only
+  // staleness signal). null = no successful history load yet (treated as
+  // not-stale); -1 = loaded, zero turns. Authoritatively assigned by each
+  // history replay (replay emits every persisted turn's turn_index), bumped by
+  // in-view sends, and pinned to the fork turn on edit/regenerate (the backend
+  // truncates turns > fork). Deliberately a LOWER bound elsewhere (e.g. a
+  // report-back turn attached in-view doesn't bump it): under-counting only
+  // over-triggers one corrective reload, while over-counting would suppress a
+  // genuinely-needed one.
+  const lastRenderedTurnIndexRef = useRef<number | null>(null);
   // Ref-based thread ID for use inside closures (avoids stale React state in callbacks)
   const threadIdRef = useRef(threadId);
+
+  // Report-back watch subsystem (owns its dedicated refs, constants + lifecycle).
+  // The host injects the shared stream primitives; `reconnectToStream` is passed
+  // via a ref because it's defined later in this body and forms a runtime cycle
+  // with the watch (watch → reconnectToStream → cleanupAfterStreamEnd →
+  // watch.onStreamEnd). The ref starts as a no-op and is assigned the real reader
+  // right after its definition — before any async watch callback can fire.
+  const reconnectToStreamRef = useRef<
+    (opts?: { activeTasks?: string[]; runId?: string | null; resetCursor?: boolean; idleAbortMs?: number }) => Promise<void>
+  >(async () => {});
+  // Counter to re-trigger loadAndMaybeReconnect (failed reconnection, or a
+  // stale-run reactivation of a cached view). Declared before the watch so
+  // `requestHistoryReload` below can close over the setter directly.
+  const [reloadTrigger, setReloadTrigger] = useState(0);
+  // A finished stream means the server persisted this turn (pair persistence
+  // runs at terminal), so every rendered bubble is now reproducible from
+  // /messages/replay. Mark them isHistory so a later corrective reload
+  // REPLACES them via replay — the history loader only clears isHistory
+  // bubbles, so unmarked live bubbles would survive it and the replay would
+  // render their twins (duplicated transcript). Failed sends never reach a
+  // success finalize, so their (unpersisted) bubbles deliberately stay
+  // unmarked and survive reloads.
+  const markTranscriptPersisted = useCallback(() => {
+    setMessages((prev) =>
+      prev.some((m) => !m.isHistory)
+        ? prev.map((m) => (m.isHistory ? m : { ...m, isHistory: true }))
+        : prev,
+    );
+    // The recently-sent dedup exists to keep a replay from twinning an
+    // optimistic user bubble that is still on screen. The bubbles just became
+    // clearable-by-reload, so replay is now their only source — keeping the
+    // tracker armed would make the reload's replay SKIP the user message
+    // whose optimistic bubble it just cleared (vanished user bubble).
+    recentlySentTrackerRef.current.clear();
+  }, []);
+  const reportBackWatch = useReportBackWatch({
+    threadId,
+    workspaceId,
+    threadIdRef,
+    isStreamingRef,
+    currentRunIdRef,
+    lastRenderedTurnIndexRef,
+    historyLoadedKeyRef,
+    historyLoadingRef,
+    reconnectToStream: (opts) => reconnectToStreamRef.current(opts),
+    requestHistoryReload: () => setReloadTrigger((n) => n + 1),
+  });
+  // `arm` is identity-stable (facade over a latest-impl ref), so callbacks that
+  // dispatch through it can dep on it without churning per render — the whole
+  // reportBackWatch object would change identity on awaitingReportBack flips.
+  const { awaitingReportBack, arm: armReportBackWatch } = reportBackWatch;
+
   // Batch back-to-back offload events into a single notification
   const offloadBatchRef = useRef<OffloadBatch>({ args: 0, reads: 0, timer: null });
   // Track reconnection state for UI indicator
   const [isReconnecting, setIsReconnecting] = useState(false);
-  // Counter to re-trigger loadAndMaybeReconnect after failed reconnection
-  const [reloadTrigger, setReloadTrigger] = useState(0);
 
   // Track if this is a new conversation (for todo list card management)
   const isNewConversationRef = useRef(false);
@@ -866,6 +893,8 @@ export function useChatMessages(
         newMessagesStartIndexRef.current = 0;
         recentlySentTrackerRef.current.clear();
         turnCheckpointsRef.current = null;
+        // The rendered-turn watermark belongs to the thread we're leaving.
+        lastRenderedTurnIndexRef.current = null;
       }
     }
   }, [workspaceId, initialThreadId]);
@@ -916,6 +945,12 @@ export function useChatMessages(
       let currentActivePairIndex: number | null = null;
       let currentActivePairState: PairState | null | undefined = null;
 
+      // Highest turn_index this replay delivered (every persisted turn emits at
+      // least its user_message with turn_index). Assigned — not maxed — into
+      // lastRenderedTurnIndexRef after the replay, so a post-fork re-replay can
+      // lower the watermark. -1 = replay delivered zero turns.
+      let maxReplayedTurnIndex = -1;
+
       // Track pending HITL interrupts from history to resolve status on next user_message
       const pendingHistoryInterrupts: HistoryInterruptInfo[] = [];
 
@@ -960,6 +995,7 @@ export function useChatMessages(
           const pairIndex = event.turn_index!;
           currentActivePairIndex = pairIndex;
           currentActivePairState = pairStateByPair.get(pairIndex);
+          if (pairIndex > maxReplayedTurnIndex) maxReplayedTurnIndex = pairIndex;
         }
 
         // Handle context_window events from history (token_usage, summarize, offload)
@@ -1720,6 +1756,7 @@ export function useChatMessages(
                         question: proposalData.question,
                         report_back: proposalData.report_back ?? true,
                         interruptId: event.interrupt_id,
+                        tool_call_id: proposalData.tool_call_id,
                         status: 'pending',
                       },
                     },
@@ -2099,6 +2136,10 @@ export function useChatMessages(
         }
       }
 
+      // Replay settled (a 404 counts: brand-new thread, zero turns) — record
+      // the watermark the reactivation staleness check compares against.
+      lastRenderedTurnIndexRef.current = maxReplayedTurnIndex;
+
       // NOTE: markAllSubagentTasksCompleted() is NOT called here because
       // loadAndMaybeReconnect will call it after determining whether the
       // workflow is still active (reconnect case) or truly completed.
@@ -2157,7 +2198,7 @@ export function useChatMessages(
    * Reconnects to an in-progress workflow stream after page refresh.
    * Creates an assistant message placeholder and processes live SSE events.
    */
-  const reconnectToStream = async ({ activeTasks = [], runId, resetCursor = false }: { activeTasks?: string[]; runId?: string | null; resetCursor?: boolean } = {}) => {
+  const reconnectToStream = async ({ activeTasks = [], runId, resetCursor = false, idleAbortMs }: { activeTasks?: string[]; runId?: string | null; resetCursor?: boolean; idleAbortMs?: number } = {}) => {
     // Reconnect targets the LATCHED thread, not the threadId prop. A brand-new
     // chat keeps the prop at '__default__' until the first SSE event updates the
     // route, but Content-Location already latched the real id into threadIdRef.
@@ -2309,7 +2350,7 @@ export function useChatMessages(
     };
 
     const wasInterruptedRef = { current: false };
-    const processEvent = createStreamEventProcessor(assistantMessageId, refs, getTaskIdFromEvent, wasInterruptedRef);
+    const baseProcessEvent = createStreamEventProcessor(assistantMessageId, refs, getTaskIdFromEvent, wasInterruptedRef);
 
     // Register the reconnect reader on mainStreamAbortRef so a user stop aborts
     // it. Without this, stopWorkflow's abort is a no-op during a reconnect: the
@@ -2320,6 +2361,94 @@ export function useChatMessages(
     mainStreamAbortRef.current = abortController;
     // This reconnect now owns the spinner set above (setIsReconnecting(true)).
     isReconnectingOwnerRef.current = abortController;
+
+    // Idle watchdog (report-back catch-up only — gated on idleAbortMs). The
+    // per-run stream has no terminal sentinel (~8s handshake after the summary,
+    // forever for a wedged run), so a reader that never resolves would strand
+    // the spinner + isStreamingRef unrecoverably. A quiet window is NOT proof of
+    // terminality, though: when it elapses, PROBE /status and finalize only if
+    // the queue drained or a newer head run superseded us — a blind finalize
+    // would dismiss a slow-but-live run #1 in favor of run #2. Otherwise re-arm,
+    // bounded, so a genuinely wedged run still force-releases.
+    let idleClosed = false;
+    // Whether ANY event arrived. A latched run that never streamed must release
+    // currentRunIdRef in the finally, or attach() dedups on the stale id and the
+    // still-pending summary only surfaces on reload.
+    let receivedEvent = false;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    // The run this reconnect attached to, captured stably so the gate can tell
+    // "still our run, just slow" from "superseded" via /status.report_back_run_id.
+    const attachedRunId = runId ?? currentRunIdRef.current;
+    let idleRearms = 0;
+    // Mark a clean idle-close and abort: the finally then finalizes the bubble
+    // and runs teardown (release isStreamingRef, poke the watch) instead of bailing.
+    const finalizeIdleClose = () => {
+      idleClosed = true;
+      abortController.abort();
+    };
+    const bumpIdle = idleAbortMs
+      ? () => {
+          if (abortController.signal.aborted) return;
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            // Terminality gate: probe the run's real status before finalizing.
+            void (async () => {
+              let status: ReportBackStatusResponse | null = null;
+              try {
+                status = await getReportBackStatus(tid);
+              } catch {
+                status = null; // probe blip → unknown; never finalize on it
+              }
+              // Re-check ownership after the await: a newer reconnect or a real
+              // finalize/stop may have taken over while the probe was in flight.
+              if (mainStreamAbortRef.current !== abortController || abortController.signal.aborted) return;
+
+              const signal = status ? decodeReportBackSignal(status.pending_report_back) : 'unknown';
+              const rearmOrRelease = () => {
+                if (idleRearms++ < REPORT_BACK_IDLE_MAX_REARMS) bumpIdle?.();
+                else finalizeIdleClose();
+              };
+              if (status === null || signal === 'unknown') {
+                // The whole /status read is suspect — checked FIRST so a stale
+                // report_back_run_id under a failed read can't trip the finalize.
+                rearmOrRelease();
+              } else if (
+                (status.report_back_run_id && status.report_back_run_id !== attachedRunId) ||
+                signal === 'idle'
+              ) {
+                // A newer head run is current, or the queue drained — genuinely done.
+                finalizeIdleClose();
+              } else {
+                // Still our turn (pending/none, same-or-no run id) — slow, not terminal.
+                rearmOrRelease();
+              }
+            })();
+          }, idleAbortMs);
+        }
+      : null;
+    // Clear the "Reconnecting…" spinner the moment content flows: a LIVE run's
+    // reader stays open for the whole turn, so the spinner would otherwise
+    // linger while tokens visibly arrive. isLoading (the stop button) stays on.
+    // Ownership-guarded so a superseded stream can't clear a newer reconnect's
+    // spinner; nulling the owner makes it idempotent.
+    const markReconnected = () => {
+      if (isReconnectingOwnerRef.current === abortController) {
+        setIsReconnecting(false);
+        isReconnectingOwnerRef.current = null;
+      }
+    };
+    const processEvent = (event: SSEEvent) => {
+      receivedEvent = true;
+      // Progress resets the re-arm budget: a healthy run with an occasional
+      // >idleAbortMs gap must never accrue toward the wedged-run cap.
+      idleRearms = 0;
+      baseProcessEvent(event);
+      markReconnected();
+      bumpIdle?.();
+    };
+    // Arm before the first read so an un-started run (no events at all) still
+    // trips the watchdog instead of hanging forever.
+    bumpIdle?.();
 
     try {
       // Replay buffered events first — this processes artifact{task,spawned} events
@@ -2335,7 +2464,9 @@ export function useChatMessages(
       // User stop aborted the reader — stopWorkflow owns teardown; bail.
       // Exception: a foreground handler aborted this stream because the tab
       // resumed (background abort, not a user stop) — re-kick the reconnect.
-      if (result?.aborted || wasStoppedRef.current) {
+      // A report-back idle-close (idleClosed) is NOT a bail: fall through so the
+      // summary bubble is finalized and the normal completion teardown runs.
+      if ((result?.aborted && !idleClosed) || wasStoppedRef.current) {
         if (backgroundReconnectRef.current && !wasStoppedRef.current) {
           backgroundReconnectRef.current = false;
           attemptReconnectAfterDisconnect(currentMessageRef.current || assistantMessageId);
@@ -2353,6 +2484,7 @@ export function useChatMessages(
           isStreaming: false,
         }))
       );
+      markTranscriptPersisted();
 
       // Pre-seed subagent cards from history for tasks whose artifact events were
       // cleared from the Redis buffer after the spawning turn persisted to DB.
@@ -2405,6 +2537,8 @@ export function useChatMessages(
         setMessageError((err as Error).message || 'Failed to reconnect to stream');
       }
     } finally {
+      // Stop the idle watchdog (no-op when it already fired or was never armed).
+      if (idleTimer) clearTimeout(idleTimer);
       // Clean up empty reconnect messages (no content segments = nothing was
       // streamed). Skip on a user stop: finalizeStreamingMessage just stamped
       // this bubble `stopped: true` (with the "⏹ Stopped" chip) but left it
@@ -2424,18 +2558,31 @@ export function useChatMessages(
       // cleanup here would then reset isStreamingRef / re-arm watches and clobber
       // the new thread's stream. The owner that superseded us manages that state.
       const stillActive = mainStreamAbortRef.current === abortController;
+      // ANY zero-content stream end (idle-close before the first event, a
+      // 404/410 the catch discarded, a thrown fetch) releases the run-id latch —
+      // otherwise the next reconcile's attach() dedups against the stale id and
+      // the still-pending summary only appears on reload. The watch's attach()
+      // reads this null as "never rendered" and un-records the run for a bounded
+      // retry. Guarded on stillActive so a stream that superseded us (which
+      // already latched its own run id) is never clobbered.
+      if (!receivedEvent && stillActive) {
+        currentRunIdRef.current = null;
+      }
       // Skip cleanup on a user stop too — stopWorkflow already cleared isLoading /
       // hasActiveSubagents and ran finalize; re-running it here would re-toggle
       // loading and re-open the report-back watch after the stop. Also skip when
       // this reconnect's own stream was aborted (a foreground re-kick on tab
       // resume): the re-kicked reconnect, suspended at its getWorkflowStatus
       // await, still owns mainStreamAbortRef, so cleaning up here would null the
-      // spinner mid-resume. The per-stream abort signal is the reliable guard.
+      // spinner mid-resume. EXCEPTION: a report-back idle-close aborts
+      // deliberately and MUST run cleanup (release isStreamingRef, clear
+      // isLoading, poke the watch) — stranding those is what the watchdog exists
+      // to prevent.
       if (
         stillActive &&
         !wasInterruptedRef.current &&
         !wasStoppedRef.current &&
-        !abortController.signal.aborted
+        (!abortController.signal.aborted || idleClosed)
       ) {
         cleanupAfterStreamEnd(assistantMessageId);
       }
@@ -2448,11 +2595,21 @@ export function useChatMessages(
         setIsReconnecting(false);
         isReconnectingOwnerRef.current = null;
       }
-      if (stillActive) {
+      // Null the abort ref only under a LIVE re-check, never the stillActive
+      // snapshot above: cleanupAfterStreamEnd → onStreamEnd can SYNCHRONOUSLY
+      // chain-attach the next queued report-back run, which registers a fresh
+      // AbortController here before its first await — the stale snapshot would
+      // null that NEW registration, orphaning the stream (un-stoppable, cleanup
+      // skipped, isLoading + isStreamingRef wedged true forever).
+      if (mainStreamAbortRef.current === abortController) {
         mainStreamAbortRef.current = null;
       }
     }
   };
+
+  // Expose the latest reader to the report-back watch (wired via a ref up top to
+  // break the render-time cycle described at the useReportBackWatch call site).
+  reconnectToStreamRef.current = reconnectToStream;
 
   /**
    * Attempts to auto-reconnect after a mid-stream network disconnect.
@@ -2502,146 +2659,6 @@ export function useChatMessages(
     setReloadTrigger((n) => n + 1);
   };
 
-  // --- Report-back watch helpers ---
-  // After PTC agent dispatch, the backend fires a report-back flash workflow
-  // once the PTC analysis completes. We open a lightweight SSE watch connection
-  // that receives a push notification (via Redis pub/sub) when this happens.
-
-  const stopReportBackWatch = () => {
-    // Invalidate the current watch generation so any in-flight wake/poll callback
-    // bails instead of attaching after teardown.
-    reportBackWatchEpochRef.current += 1;
-    reportBackWatchThreadIdRef.current = null;
-    reportBackRunIdRef.current = null;
-    if (reportBackWatchAbortRef.current) {
-      reportBackWatchAbortRef.current.abort();
-      reportBackWatchAbortRef.current = null;
-    }
-    if (reportBackPollRef.current) {
-      clearInterval(reportBackPollRef.current);
-      reportBackPollRef.current = null;
-    }
-  };
-
-  // Drive the flash thread to the PTC report-back turn once the PTC completes.
-  //
-  // The watch is KEYED to the flash thread (`flashThreadId`), not the visible
-  // thread, and persists across navigation. When the user jumps into the
-  // dispatched PTC thread, the watch keeps running but does NOT render — it only
-  // attaches when its flash thread is the one on screen and idle. That is how the
-  // flash report-back and a live PTC stream coexist: the watch holds the named
-  // run id (captured from a wake even while away) and streams it the moment the
-  // user returns to the flash thread.
-  //
-  // The backend names the report-back run explicitly — no inference from run_id
-  // changes. It signals readiness via a fire-and-forget Redis pub/sub wake
-  // (`thread:wake:{tid}`) carrying the run_id, and durably records that run_id so
-  // it's also readable from `/status` (`report_back_run_id`). An in-session
-  // client attaches straight from the wake's run_id; a client that missed the
-  // wake (slow connect or a full reload) discovers the run via a `/status` poll.
-  const startReportBackWatch = (flashThreadId?: string | null) => {
-    const tid = flashThreadId ?? threadIdRef.current;
-    if (!tid || tid === '__default__') return;
-
-    // Idempotent: a watch for this flash thread is already running. It survives
-    // navigation, so re-arming on return (loadAndMaybeReconnect / stream-end)
-    // must NOT tear it down — that would drop the run id it has already captured.
-    if (reportBackWatchAbortRef.current && reportBackWatchThreadIdRef.current === tid) return;
-
-    stopReportBackWatch();
-    reportBackWatchThreadIdRef.current = tid;
-
-    // This watch generation. If a teardown bumps the epoch (consume, hard-stop,
-    // re-arm for a different flash thread, unmount), a wake/poll callback captured
-    // here is stale and must not attach.
-    const epoch = reportBackWatchEpochRef.current;
-
-    let consumed = false;
-    let inFlight = false;
-    let polls = 0;
-
-    // Attach to the named report-back run's per-run stream — which still replays
-    // its buffered events even after completion — so the summary streams into a
-    // fresh bubble naturally, with no jarring full-history reload (a reload also
-    // duplicates the live dispatch card, since history replay re-adds it next to
-    // the surviving live bubble). Skip if the named run is the one already on
-    // screen (the dispatch turn, or a report-back run we already attached to).
-    const attach = async (runId: string | null, activeTasks: string[]) => {
-      if (!runId || runId === currentRunIdRef.current) return false;
-      consumed = true;
-      awaitingReportBackRef.current = false;
-      reportBackRunIdRef.current = null;
-      stopReportBackWatch();
-      await reconnectToStream({ activeTasks, runId, resetCursor: true });
-      return true;
-    };
-
-    const reconcile = async (source: string, wakeRunId?: string | null) => {
-      // Stale generation (re-armed for another thread / hard-stopped / unmounted).
-      if (reportBackWatchEpochRef.current !== epoch) return;
-      if (consumed) return;
-
-      // Remember the named run as soon as we learn it — even if the flash thread
-      // is NOT the one on screen right now. A wake fires once, when the PTC run
-      // finishes; if the user is away on the PTC thread at that instant we still
-      // capture the id so the report-back streams on return.
-      if (wakeRunId) reportBackRunIdRef.current = wakeRunId;
-
-      // Render gate: only attach when this flash thread is the visible thread and
-      // no other stream owns the slot. Off-thread (e.g. the user jumped into the
-      // PTC thread) we just hold the run id and leave the PTC stream untouched.
-      if (threadIdRef.current !== tid || isStreamingRef.current || inFlight) return;
-
-      // On the flash thread and idle. Attach a known run id immediately (no
-      // /status round-trip needed — the wake or a prior poll already named it).
-      if (reportBackRunIdRef.current) {
-        await attach(reportBackRunIdRef.current, []);
-        return;
-      }
-
-      inFlight = true;
-      let status: WorkflowStatusResponse;
-      try {
-        status = await getWorkflowStatus(tid);
-      } catch {
-        inFlight = false;
-        return;
-      }
-      inFlight = false;
-      // Re-check generation/visibility after the await: the watch may have been
-      // torn down, or the user may have navigated away, while /status was in flight.
-      if (consumed || reportBackWatchEpochRef.current !== epoch) return;
-      if (threadIdRef.current !== tid || isStreamingRef.current) return;
-
-      if (status.report_back_run_id) reportBackRunIdRef.current = status.report_back_run_id;
-      if (await attach(reportBackRunIdRef.current, status.active_tasks || [])) return;
-
-      // No report-back run named yet (still pending) or none is coming (the PTC
-      // dispatch failed). Keep polling, but give up after a bounded window so a
-      // never-arriving report-back doesn't poll forever.
-      if (source === 'poll' && ++polls >= REPORT_BACK_MAX_POLLS) {
-        consumed = true;
-        awaitingReportBackRef.current = false;
-        stopReportBackWatch();
-      }
-    };
-
-    const { abort } = watchThread(tid, async (payload) => {
-      const wakeRunId = payload?.run_id ?? null;
-      if (wakeRunId) {
-        await reconcile('wake', wakeRunId);
-        return;
-      }
-      // Payload-less wake (older backend / malformed): fall back to a /status
-      // reconcile. A short delay lets the report-back run register so
-      // report_back_run_id is populated.
-      await new Promise((r) => setTimeout(r, 500));
-      await reconcile('wake');
-    });
-    reportBackWatchAbortRef.current = abort;
-    reportBackPollRef.current = setInterval(() => reconcile('poll'), 3000);
-  };
-
   // Load history when workspace or threadId changes, then check for reconnection
   useEffect(() => {
     // A reconnect stream is live on a DIFFERENT thread than the one we're now
@@ -2655,9 +2672,8 @@ export function useChatMessages(
     //
     // We do NOT stop the report-back watch here. Superseding the visible flash
     // reader (so the PTC thread can take the slot) must not erase the independent
-    // pending report-back: the keyed watch persists, holds its run id, and renders
-    // again when the user returns to the flash thread. Its render gate
-    // (threadIdRef === its flash thread) keeps it off the PTC thread meanwhile.
+    // pending report-back: the keyed watch persists, holds its run ids, and
+    // renders again when the user returns to the flash thread.
     const supersedeOtherThreadStream =
       isStreamingRef.current &&
       streamingThreadIdRef.current !== null &&
@@ -2723,25 +2739,27 @@ export function useChatMessages(
       // eventual real load that supersedes it.
       if (loadOk) {
         historyLoadedKeyRef.current = loadKey;
+        // The replay rendered every persisted turn, so this load's recents slice
+        // is now ON SCREEN. Record it BEFORE arming the watch below, or the
+        // recent-runs catch-up would re-attach each run as a duplicate turn.
+        reportBackWatch.markRunsRendered(status.recent_report_back_run_ids);
       }
 
-      // A pending PTC report-back is caught by the watch — the reliable mechanism
-      // that attaches to the run /status names (report_back_run_id) or a wake
-      // carries. Arm it here, BEFORE the reconnect branch below, so it runs
-      // regardless of whether this load also reconnects to an active run. On a
-      // refresh right as the report-back becomes due, /status can report
-      // can_reconnect=true AND pending_report_back=true; reconnecting to
-      // status.run_id alone can miss the report-back run (stale/drained run, or a
-      // short summary that finishes before attach), and without the watch it would
-      // only surface on a later history-replay refresh. The watch stays dormant
-      // while a reconnect stream is live (its reconcile bails on isStreamingRef),
-      // and attach() skips the run already on screen — so this never double-streams.
-      if (status.pending_report_back) {
+      // Arm the report-back watch BEFORE the reconnect branch below, so it runs
+      // even when this load also reconnects to an active run (a refresh right as
+      // the report-back becomes due can report both; reconnecting to
+      // status.run_id alone can miss the report-back run). The watch stays
+      // dormant while a reconnect stream is live and attach() skips the run
+      // already on screen, so this never double-streams. Arms on `pending` OR
+      // `unknown` (draining is only ever an explicit `false`).
+      if (shouldArmReportBack(decodeReportBackSignal(status.pending_report_back))) {
         if (import.meta.env.DEV) console.log('[ReportBack] Pending report-back detected on load, opening watch');
-        awaitingReportBackRef.current = true;
-        // Key the watch to THIS thread (the flash thread — pending_report_back is
-        // a flash-thread property). Idempotent if a watch for it already persists.
-        startReportBackWatch(threadId);
+        // Key the watch to THIS thread (pending_report_back is a flash-thread
+        // property) and seed the run /status already named. Poke a catch-up
+        // reconcile ONLY when the thread isn't also active — poking would race
+        // the reconnect branch's attach of status.run_id (double-attach); the
+        // seeded id is picked up once that active stream ends.
+        reportBackWatch.arm(threadId, status.report_back_run_id, status.can_reconnect ? null : 'load');
       }
 
       if (historyHasUnresolvedInterruptRef.current && status.can_reconnect) {
@@ -2888,14 +2906,8 @@ export function useChatMessages(
   }, [workspaceId, threadId, reloadTrigger]);
 
   // The report-back watch survives thread navigation (so a flash report-back and a
-  // live PTC stream coexist), so the thread-load effect above can't own its
-  // teardown. Stop it only when the chat hook itself unmounts.
-  useEffect(() => {
-    return () => {
-      stopReportBackWatch();
-      awaitingReportBackRef.current = false;
-    };
-  }, []);
+  // live PTC stream coexist); useReportBackWatch owns its own unmount-time
+  // teardown, so the thread-load effect above deliberately doesn't touch it.
 
   /**
    * Marks all subagentTasks in messages as 'completed'.
@@ -3027,17 +3039,10 @@ export function useChatMessages(
     if (finalizePendingTodos) finalizePendingTodos();
     setMessages((prev) => finalizeTodoListProcessesInMessages(prev, assistantMessageId));
 
-    // Open watch connection for report-back if a PTC agent was dispatched with
-    // report_back enabled. The watch attaches to the run the backend names (wake
-    // payload or /status's report_back_run_id), skipping the run currently on
-    // screen (this just-finished "Dispatched." turn). Key it to the flash thread
-    // that dispatched: an already-running watch names it (re-arm is then a no-op);
-    // otherwise this is the initial in-session arm, where the visible thread IS
-    // the flash thread. Without the key, a stream-end while the user is on the
-    // dispatched PTC thread would wrongly re-point the watch at the PTC thread.
-    if (awaitingReportBackRef.current) {
-      startReportBackWatch(reportBackWatchThreadIdRef.current ?? threadIdRef.current);
-    }
+    // Re-arm the keyed report-back watch and poke a catch-up reconcile (no-op
+    // when not awaiting): this turn's stream just ended, and the next ordered
+    // report-back may already be queued.
+    reportBackWatch.onStreamEnd();
   };
 
   /**
@@ -3215,11 +3220,24 @@ export function useChatMessages(
     releaseStreamOwnership();
     currentMessageRef.current = null;
 
-    // (c) Abort per-task subagent streams + the report-back watch so no
-    // background work lingers on the client after the stop.
+    // An ADMITTED stop (run id latched) is persisted server-side as a
+    // user-cancelled "Stopped" turn (_mark_cancelled folds the partial events
+    // into sse_events), so its bubbles are replay-reproducible — mark them
+    // isHistory and release the recently-sent dedup, same as a success
+    // finalize. Otherwise a later corrective reload appends a replayed twin of
+    // the answer under a dedup-eaten user message, ordered after newer turns.
+    // A PRE-ADMISSION stop has no turn row: replay can't reproduce those
+    // bubbles, so they must stay unmarked to survive reloads.
+    if (stoppedRunId) {
+      markTranscriptPersisted();
+    }
+
+    // (c) Abort per-task subagent streams (they belong to THIS turn). Leave the
+    // report-back watch running: this flash-thread cancel does not stop the
+    // background PTC analyses on their own threads, so their summaries should
+    // still surface live. The aborted reader's finally clears isStreamingRef, so
+    // the watch's next reconcile can attach the next head run or drain.
     closeAllSubagentStreams();
-    stopReportBackWatch();
-    awaitingReportBackRef.current = false;
 
     // (d) Tell the backend to hard-cancel: one retry, then a visible error
     // toast so a failed cancel doesn't silently diverge UI from backend.
@@ -4173,6 +4191,10 @@ export function useChatMessages(
                   question: proposalData.question,
                   report_back: proposalData.report_back ?? true,
                   interruptId: event.interrupt_id,
+                  // Persist tool_call_id ON the proposal so the clicked card
+                  // self-identifies for backfill — never read from
+                  // `pendingInterrupt`, which N parallel dispatches overwrite.
+                  tool_call_id: proposalData.tool_call_id,
                   status: 'pending',
                 },
               },
@@ -4617,6 +4639,10 @@ export function useChatMessages(
     // Clear the stopped guard so a fresh send can finalize again on stop.
     wasStoppedRef.current = false;
     backgroundReconnectRef.current = false;
+    // This send opens a NEW backend turn rendered in-view; advance the
+    // watermark so the next reactivation's staleness check doesn't mistake
+    // this turn for one missed while hidden (spurious full reload).
+    lastRenderedTurnIndexRef.current = (lastRenderedTurnIndexRef.current ?? -1) + 1;
     // Mark streaming as in progress (prevents history loading during streaming)
     // AND claim ownership for this thread, so navigating to another thread mid-send
     // supersedes this stream rather than leaving it orphaned (the load guard would
@@ -4723,6 +4749,7 @@ export function useChatMessages(
             isStreaming: false,
           }))
         );
+        markTranscriptPersisted();
       }
     } catch (err: unknown) {
           // An aborted stream (user hit stop) is intentional, not a failure.
@@ -4941,6 +4968,7 @@ export function useChatMessages(
             isStreaming: false,
           }))
         );
+        markTranscriptPersisted();
       }
     } catch (err: unknown) {
       if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
@@ -5017,6 +5045,25 @@ export function useChatMessages(
     setPendingInterrupt(null);
   }, [pendingInterrupt]);
 
+  // Shared HITL collect-then-batch-resume. Parallel interrupts must be answered
+  // together (one batched resume), so each handler records its own interrupt_id's
+  // decision here, and we resume only once EVERY pending interrupt has a collected
+  // response. Reading pendingInterrupt (a single slot N dispatches overwrite)
+  // instead would answer the wrong interrupt and leave the others to re-interrupt.
+  // planMode defaults to false; question handlers pass currentPlanModeRef.current.
+  const collectHitlResponseAndMaybeResume = useCallback((
+    interruptId: string,
+    response: { decisions: Array<{ type: string; message?: string }> },
+    planMode: boolean = false,
+  ) => {
+    collectedHitlResponsesRef.current[interruptId] = response;
+    const pending = pendingInterruptIdsRef.current;
+    const collected = collectedHitlResponsesRef.current;
+    if (pending.size > 0 && [...pending].every((id) => collected[id])) {
+      resumeWithHitlResponse({ ...collected }, planMode);
+    }
+  }, [resumeWithHitlResponse]);
+
   const handleAnswerQuestion = useCallback((answer: string, questionId: string, interruptId: string) => {
     if (!questionId || !interruptId) return;
 
@@ -5041,16 +5088,12 @@ export function useChatMessages(
     );
 
     // Collect this response for batching (parallel interrupts need all responses at once)
-    collectedHitlResponsesRef.current[interruptId] = { decisions: [{ type: 'approve', message: answer }] };
-
-    // Check if all pending interrupts have been responded to
-    const pending = pendingInterruptIdsRef.current;
-    const collected = collectedHitlResponsesRef.current;
-    if (pending.size > 0 && [...pending].every((id) => collected[id])) {
-      const batchedResponse = { ...collected };
-      resumeWithHitlResponse(batchedResponse, currentPlanModeRef.current);
-    }
-  }, [resumeWithHitlResponse]);
+    collectHitlResponseAndMaybeResume(
+      interruptId,
+      { decisions: [{ type: 'approve', message: answer }] },
+      currentPlanModeRef.current,
+    );
+  }, [collectHitlResponseAndMaybeResume]);
 
   const handleSkipQuestion = useCallback((questionId: string, interruptId: string) => {
     if (!questionId || !interruptId) return;
@@ -5075,16 +5118,12 @@ export function useChatMessages(
     );
 
     // Collect this response for batching (parallel interrupts need all responses at once)
-    collectedHitlResponsesRef.current[interruptId] = { decisions: [{ type: 'reject' }] };
-
-    // Check if all pending interrupts have been responded to
-    const pending = pendingInterruptIdsRef.current;
-    const collected = collectedHitlResponsesRef.current;
-    if (pending.size > 0 && [...pending].every((id) => collected[id])) {
-      const batchedResponse = { ...collected };
-      resumeWithHitlResponse(batchedResponse, currentPlanModeRef.current);
-    }
-  }, [resumeWithHitlResponse]);
+    collectHitlResponseAndMaybeResume(
+      interruptId,
+      { decisions: [{ type: 'reject' }] },
+      currentPlanModeRef.current,
+    );
+  }, [collectHitlResponseAndMaybeResume]);
 
   // Shared helper: update a proposal's status within an AssistantMessage.
   // Used by all HITL approve/reject handlers below.
@@ -5125,35 +5164,56 @@ export function useChatMessages(
   }, [pendingInterrupt, resumeWithHitlResponse, resolveProposal]);
 
   // --- PTC Agent approve/reject ---
-  const handleApprovePTCAgent = useCallback((_pad?: Record<string, unknown>, overrides?: { report_back?: boolean }) => {
-    if (!pendingInterrupt || pendingInterrupt.type !== 'ptc_agent') return;
-    const pid = pendingInterrupt.proposalId!;
+  // The clicked card supplies its OWN proposalId + interruptId, collected then
+  // batch-resumed — `pendingInterrupt` is single-slot state that N parallel
+  // dispatches overwrite, so reading it would answer the wrong interrupt.
+  const handleApprovePTCAgent = useCallback((
+    pad?: Record<string, unknown>,
+    overrides?: { report_back?: boolean },
+    proposalId?: string,
+    interruptId?: string,
+  ) => {
+    if (!proposalId || !interruptId) return;
 
-    // Track this proposal for thread_id backfill from the resumed stream's tool_call_result.
-    // Maps tool_call_id → proposalId for exact matching when the result arrives.
-    if (pendingInterrupt.toolCallId) {
-      pendingPTCBackfillRef.current.set(pendingInterrupt.toolCallId, pid);
+    // Track this proposal for thread_id backfill from the resumed stream's
+    // tool_call_result. tool_call_id comes from the clicked card's own proposal
+    // data, NOT pendingInterrupt, so it's right under N parallel dispatches.
+    const toolCallId = pad?.tool_call_id as string | undefined;
+    if (toolCallId) {
+      pendingPTCBackfillRef.current.set(toolCallId, proposalId);
     }
 
-    // Enable report-back polling if report_back is not explicitly disabled
+    // Arm the report-back watch AT DISPATCH, not at the dispatch turn's stream
+    // end: the wake is pub/sub with no replay, so a fast PTC finishing mid-turn
+    // would hit zero subscribers and lose the report-back. Subscribing now
+    // latches such a wake (enqueued before the reconcile's isStreamingRef bail)
+    // to attach at stream end. No named run exists yet (approval is what
+    // dispatches), so no seed and no poke.
     if (overrides?.report_back !== false) {
-      awaitingReportBackRef.current = true;
+      armReportBackWatch(threadIdRef.current, null, null);
     }
 
-    resolveProposal('ptcAgentProposals', pid, 'approved');
+    resolveProposal('ptcAgentProposals', proposalId, 'approved');
 
     const decision: { type: string; message?: string; overrides?: { report_back?: boolean } } = { type: 'approve' };
     if (overrides) {
       decision.overrides = overrides;
     }
-    resumeWithHitlResponse({ [pendingInterrupt.interruptId!]: { decisions: [decision] } }, false);
-  }, [pendingInterrupt, resumeWithHitlResponse, resolveProposal]);
 
-  const handleRejectPTCAgent = useCallback(() => {
-    if (!pendingInterrupt || pendingInterrupt.type !== 'ptc_agent') return;
-    resolveProposal('ptcAgentProposals', pendingInterrupt.proposalId!, 'rejected');
-    resumeWithHitlResponse({ [pendingInterrupt.interruptId!]: { decisions: [{ type: 'reject' }] } }, false);
-  }, [pendingInterrupt, resumeWithHitlResponse, resolveProposal]);
+    // Collect-then-batch: hold each card's decision keyed by its interrupt_id and
+    // resume only when ALL pending interrupts have a decision.
+    collectHitlResponseAndMaybeResume(interruptId, { decisions: [decision] });
+  }, [collectHitlResponseAndMaybeResume, resolveProposal, armReportBackWatch]);
+
+  const handleRejectPTCAgent = useCallback((
+    _pad?: Record<string, unknown>,
+    proposalId?: string,
+    interruptId?: string,
+  ) => {
+    if (!proposalId || !interruptId) return;
+    resolveProposal('ptcAgentProposals', proposalId, 'rejected');
+    collectHitlResponseAndMaybeResume(interruptId, { decisions: [{ type: 'reject' }] });
+  }, [collectHitlResponseAndMaybeResume, resolveProposal]);
 
   // --- Secretary action approve/reject (delete_workspace, stop_workspace, delete_thread) ---
   const handleApproveSecretaryAction = useCallback(() => {
@@ -5226,6 +5286,13 @@ export function useChatMessages(
     // Edit/regenerate opens a fresh backend run; clear the prior run_id so
     // the new metadata frame becomes the source of truth.
     currentRunIdRef.current = null;
+    // A fork truncates persisted turns > forkFromTurn server-side; pin the
+    // rendered-turn watermark to the fork turn so the reactivation staleness
+    // check compares against the post-truncation reality (a stale-high
+    // watermark would suppress a genuinely-needed reload later).
+    if (forkFromTurn !== null) {
+      lastRenderedTurnIndexRef.current = forkFromTurn;
+    }
     // Fresh AbortController so stopWorkflow can abort this stream's reader.
     const abortController = new AbortController();
     mainStreamAbortRef.current = abortController;
@@ -5316,6 +5383,7 @@ export function useChatMessages(
           isStreaming: false,
         }))
       );
+      markTranscriptPersisted();
     } catch (err: unknown) {
       if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
         return;
@@ -5509,12 +5577,14 @@ export function useChatMessages(
     lastThreadModel,
     isLoading,
     hasActiveSubagents,
+    awaitingReportBack,
     workspaceStarting,
     isCompacting,
     setIsCompacting,
     queuedSend,
     isLoadingHistory,
     isReconnecting,
+    reconnectIfStaleRun: reportBackWatch.reconnectIfStaleRun,
     messageError,
     returnedSteering,
     clearReturnedSteering: () => setReturnedSteering(null),

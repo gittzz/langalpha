@@ -7,7 +7,6 @@ thread sharing, and pagination logic.
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -255,6 +254,47 @@ async def test_get_queries_for_thread(mock_db_connection, mock_cursor):
     assert len(queries) == 2
 
 
+@pytest.mark.asyncio
+async def test_get_latest_turn_index(mock_db_connection, mock_cursor):
+    """get_latest_turn_index returns MAX(turn_index) for the thread."""
+    from src.server.database.conversation import get_latest_turn_index
+
+    mock_cursor.fetchone.return_value = {"latest_turn_index": 4}
+
+    assert await get_latest_turn_index("11111111-1111-1111-1111-111111111111") == 4
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "MAX(turn_index)" in sql
+
+
+@pytest.mark.asyncio
+async def test_get_latest_turn_index_no_turns_is_none(mock_db_connection, mock_cursor):
+    """A thread with no persisted turns yields None (SQL MAX over zero rows)."""
+    from src.server.database.conversation import get_latest_turn_index
+
+    mock_cursor.fetchone.return_value = {"latest_turn_index": None}
+
+    assert await get_latest_turn_index("11111111-1111-1111-1111-111111111111") is None
+
+
+@pytest.mark.asyncio
+async def test_get_latest_turn_index_non_uuid_is_none(mock_db_connection, mock_cursor):
+    """A non-UUID id is rejected before the query (same guard as siblings)."""
+    from src.server.database.conversation import get_latest_turn_index
+
+    assert await get_latest_turn_index("not-a-uuid") is None
+    mock_cursor.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_latest_turn_index_read_failure_is_none(mock_db_connection, mock_cursor):
+    """A DB error degrades to None (no signal) instead of raising."""
+    from src.server.database.conversation import get_latest_turn_index
+
+    mock_cursor.execute.side_effect = RuntimeError("connection lost")
+
+    assert await get_latest_turn_index("t-1") is None
+
+
 # ===========================================================================
 # Response Tests
 # ===========================================================================
@@ -293,6 +333,42 @@ async def test_get_responses_for_thread(mock_db_connection, mock_cursor):
 
     assert total == 1
     assert len(responses) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_recent_responses_for_thread_limit(mock_db_connection, mock_cursor):
+    """Selects newest-first via DESC + LIMIT, returns chronological order."""
+    from src.server.database.conversation import get_recent_responses_for_thread
+
+    # DB returns newest-first (turn_index DESC).
+    mock_cursor.fetchall.return_value = [
+        _response_row(turn_index=5),
+        _response_row(turn_index=4),
+    ]
+
+    result = await get_recent_responses_for_thread("t-1", limit=2)
+
+    # Reversed to chronological (oldest -> newest).
+    assert [r["turn_index"] for r in result] == [4, 5]
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "ORDER BY turn_index DESC" in sql
+    assert "LIMIT" in sql
+    # limit binds as a parameter
+    assert 2 in mock_cursor.execute.call_args[0][1]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_responses_for_thread_no_limit(mock_db_connection, mock_cursor):
+    """limit=None omits LIMIT (full history)."""
+    from src.server.database.conversation import get_recent_responses_for_thread
+
+    mock_cursor.fetchall.return_value = [_response_row(turn_index=0)]
+
+    result = await get_recent_responses_for_thread("t-1")
+
+    assert len(result) == 1
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "LIMIT" not in sql
 
 
 # ===========================================================================
@@ -448,3 +524,20 @@ async def test_get_thread_owner_id_normalizes_noncanonical_uuid(
         await get_thread_owner_id(variant)
         params = mock_cursor.execute.call_args[0][1]
         assert params == (canonical,), f"{variant!r} bound {params!r}, not canonical"
+
+
+@pytest.mark.asyncio
+async def test_get_thread_owner_id_returns_user_id_from_auth_meta(
+    mock_db_connection, mock_cursor
+):
+    """get_thread_owner_id delegates to get_thread_auth_meta and returns user_id.
+
+    The delegation issues the superset (user_id + is_shared) query but preserves
+    the scalar return contract: just the owning user_id (or None).
+    """
+    from src.server.database.conversation import get_thread_owner_id
+
+    canonical = "12345678-1234-5678-1234-567812345678"
+    mock_cursor.fetchone.return_value = {"user_id": "owner-42", "is_shared": True}
+
+    assert await get_thread_owner_id(canonical) == "owner-42"
