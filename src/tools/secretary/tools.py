@@ -109,6 +109,19 @@ async def _verify_workspace_owner(
     return None
 
 
+async def _cleanup_auto_created_workspace(workspace_id: str) -> None:
+    """Best-effort delete of a just-created, provably-unused workspace."""
+    try:
+        from src.server.services.workspace_manager import WorkspaceManager
+
+        await WorkspaceManager.get_instance().delete_workspace(workspace_id)
+    except Exception as cleanup_err:
+        logger.warning(
+            f"Failed to delete auto-created workspace {workspace_id} "
+            f"after failed dispatch: {cleanup_err}"
+        )
+
+
 async def _resolve_workspace_name(
     workspace_id: str | None, user_id: str
 ) -> str | None:
@@ -512,15 +525,7 @@ async def ptc_agent(
             # unused — delete it rather than leak its sandbox (the pre-check
             # narrows this to the pre-check/reserve race).
             if auto_created_workspace:
-                try:
-                    from src.server.services.workspace_manager import WorkspaceManager
-
-                    await WorkspaceManager.get_instance().delete_workspace(workspace_id)
-                except Exception as cleanup_err:
-                    logger.warning(
-                        f"Failed to delete auto-created workspace {workspace_id} "
-                        f"after rejected dispatch: {cleanup_err}"
-                    )
+                await _cleanup_auto_created_workspace(workspace_id)
             return _error_command(slot.error, tool_call_id)
         try:
             async with aiohttp.ClientSession() as session:
@@ -539,6 +544,13 @@ async def ptc_agent(
                     timeout=aiohttp.ClientTimeout(connect=10, sock_read=30),
                 ) as resp:
                     if resp.status >= 400:
+                        # An error status proves the endpoint exited before
+                        # scheduling the run (every raise path precedes its
+                        # create_task), so an auto-created workspace is still
+                        # provably unused. The timeout/connection/body branches
+                        # below deliberately keep it: the run may have started.
+                        if auto_created_workspace:
+                            await _cleanup_auto_created_workspace(workspace_id)
                         return _error_command("dispatch_failed", tool_call_id)
                     body = await resp.json()
                     if not body.get("status") == "dispatched":

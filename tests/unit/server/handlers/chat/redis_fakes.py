@@ -150,8 +150,11 @@ class FakeCache:
     async def get(self, key):
         return self.kv.get(key)
 
-    async def set(self, key, value, ttl=None) -> None:
+    async def set(self, key, value, ttl=None) -> bool:
+        # Mirror RedisCache.set's True-on-success: reserve()'s fail-closed
+        # origin write treats a falsy return as a dispatch failure.
         self.kv[key] = value
+        return True
 
     async def delete(self, key) -> None:
         self.kv.pop(key, None)

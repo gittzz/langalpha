@@ -1,11 +1,14 @@
-"""Auto-created workspace lifecycle around dispatch cap rejection.
+"""Auto-created workspace lifecycle around failed dispatches.
 
 Dispatch without a ``workspace_id`` provisions a workspace (real sandbox,
-~8-10s) before ``reserve()`` admits the dispatch. A cap-rejected dispatch must
-not leak that sandbox: a deterministic cap hit is pre-checked BEFORE
-provisioning (``check_dispatch_capacity``), and the residual pre-check/reserve
-race deletes the just-created workspace on ``slot.error`` — the dispatch HTTP
-was never sent, so the workspace is provably unused.
+~8-10s) before ``reserve()`` admits the dispatch. A failed dispatch must not
+leak that sandbox when the failure proves the run never started: a
+deterministic cap hit is pre-checked BEFORE provisioning
+(``check_dispatch_capacity``), the residual pre-check/reserve race deletes the
+just-created workspace on ``slot.error`` (no HTTP was sent), and a >=400
+dispatch response does too (the endpoint's error paths all precede its
+create_task). Timeout/connection failures deliberately KEEP the workspace —
+the run may have started server-side.
 """
 
 from __future__ import annotations
@@ -55,6 +58,40 @@ def _fill_flash_cap(cache) -> None:
     cache.client.sets[rb.flash_watch_key(FLASH_THREAD_ID)] = {
         f"p{i}" for i in range(rb.MAX_DISPATCH_PER_FLASH)
     }
+
+
+class _FakeResp:
+    def __init__(self, status: int = 200, body: dict | None = None) -> None:
+        self.status = status
+        self._body = body if body is not None else {"status": "dispatched"}
+
+    async def __aenter__(self) -> "_FakeResp":
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        return False
+
+    async def json(self) -> dict:
+        return self._body
+
+
+class _FakeSession:
+    def __init__(
+        self, resp: _FakeResp | None = None, post_exc: Exception | None = None
+    ) -> None:
+        self._resp = resp
+        self._post_exc = post_exc
+
+    async def __aenter__(self) -> "_FakeSession":
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        return False
+
+    def post(self, *_args, **_kwargs) -> _FakeResp:
+        if self._post_exc is not None:
+            raise self._post_exc
+        return self._resp
 
 
 @pytest.mark.asyncio
@@ -137,3 +174,52 @@ async def test_cleanup_failure_still_returns_the_cap_error(cache):
     assert payload["success"] is False
     assert "too many concurrent analyses" in payload["error"]
     mgr.delete_workspace.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_error_status_deletes_auto_created_workspace(cache):
+    """A >=400 dispatch response (e.g. the credit gate) proves the run never
+    started — the endpoint's error paths all precede its create_task — so the
+    just-created workspace is deleted, not leaked."""
+    mgr = _manager()
+    with patch(
+        "src.tools.secretary.tools._hitl_confirm", return_value=(True, {})
+    ), patch(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        return_value=mgr,
+    ), patch(
+        "aiohttp.ClientSession", return_value=_FakeSession(_FakeResp(status=402))
+    ):
+        result = await ptc_agent.ainvoke(
+            _tool_call({"question": "analyze this"}), config=_config()
+        )
+
+    payload = _payload(result)
+    assert payload["success"] is False
+    assert payload["error"] == "dispatch_failed"
+    mgr.create_workspace.assert_awaited_once()
+    mgr.delete_workspace.assert_awaited_once_with(NEW_WORKSPACE_ID)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_timeout_keeps_auto_created_workspace(cache):
+    """A timed-out dispatch may have started the run server-side — the
+    workspace must NOT be deleted out from under it."""
+    mgr = _manager()
+    with patch(
+        "src.tools.secretary.tools._hitl_confirm", return_value=(True, {})
+    ), patch(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        return_value=mgr,
+    ), patch(
+        "aiohttp.ClientSession", return_value=_FakeSession(post_exc=TimeoutError())
+    ):
+        result = await ptc_agent.ainvoke(
+            _tool_call({"question": "analyze this"}), config=_config()
+        )
+
+    payload = _payload(result)
+    assert payload["success"] is False
+    assert payload["error"] == "dispatch_timeout"
+    mgr.create_workspace.assert_awaited_once()
+    mgr.delete_workspace.assert_not_awaited()
