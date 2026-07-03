@@ -15,6 +15,7 @@ Endpoints:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -25,6 +26,8 @@ from fastapi.responses import Response, StreamingResponse
 
 from src.server.utils.api import CurrentUserId, require_workspace_owner
 from src.server.dependencies.usage_limits import (
+    ALWAYS_ON_QUOTA,
+    SPEC_QUOTAS,
     WorkspaceLimitCheck,
     assert_always_on_allowed,
     assert_spec_allowed,
@@ -55,6 +58,27 @@ from src.server.services.workspace_status_pubsub import subscribe_to_status
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["Workspaces"])
+
+
+@contextlib.asynccontextmanager
+async def _workspace_action_errors(action: str, workspace_id: str):
+    """Shared error mapping for workspace action routes.
+
+    Re-raises HTTPException so ``require_workspace_owner``'s 403/404 pass
+    through, maps ValueError→404 and RuntimeError→400, and turns anything
+    else into a logged 500.
+    """
+    try:
+        yield
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Error {action} workspace {workspace_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to {action} workspace")
 
 
 def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
@@ -212,9 +236,9 @@ async def get_workspace_quota(x_user_id: CurrentUserId):
     back null rather than erroring the whole call.
     """
     performance, maximum, always_on = await asyncio.gather(
-        get_capacity_status(x_user_id, "spec_performance"),
-        get_capacity_status(x_user_id, "spec_max"),
-        get_capacity_status(x_user_id, "always_on"),
+        get_capacity_status(x_user_id, SPEC_QUOTAS["performance"]),
+        get_capacity_status(x_user_id, SPEC_QUOTAS["max"]),
+        get_capacity_status(x_user_id, ALWAYS_ON_QUOTA),
     )
     return WorkspaceQuotaResponse(
         performance=performance,
@@ -535,7 +559,7 @@ async def start_workspace(
     Returns:
         Action result
     """
-    try:
+    async with _workspace_action_errors("start", workspace_id):
         manager = WorkspaceManager.get_instance()
 
         # Get workspace to check status
@@ -592,16 +616,6 @@ async def start_workspace(
             message="Workspace started successfully",
         )
 
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception(f"Error starting workspace {workspace_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to start workspace")
-
 
 @router.post("/{workspace_id}/stop", response_model=WorkspaceActionResponse)
 async def stop_workspace(workspace_id: str, x_user_id: CurrentUserId):
@@ -618,7 +632,7 @@ async def stop_workspace(workspace_id: str, x_user_id: CurrentUserId):
     Returns:
         Action result
     """
-    try:
+    async with _workspace_action_errors("stop", workspace_id):
         workspace = await db_get_workspace(workspace_id)
         require_workspace_owner(workspace, user_id=x_user_id)
 
@@ -631,16 +645,6 @@ async def stop_workspace(workspace_id: str, x_user_id: CurrentUserId):
             status="stopped",
             message="Workspace stopped successfully",
         )
-
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception(f"Error stopping workspace {workspace_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to stop workspace")
 
 
 @router.post("/{workspace_id}/archive", response_model=WorkspaceActionResponse)
@@ -660,7 +664,7 @@ async def archive_workspace(
     Returns:
         Action result
     """
-    try:
+    async with _workspace_action_errors("archive", workspace_id):
         workspace = await db_get_workspace(workspace_id)
         require_workspace_owner(workspace, user_id=x_user_id)
 
@@ -673,14 +677,6 @@ async def archive_workspace(
             status="stopped",
             message="Workspace archived successfully",
         )
-
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception(f"Error archiving workspace {workspace_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to archive workspace")
 
 
 @router.post("/{workspace_id}/spec", response_model=WorkspaceResponse)
@@ -706,7 +702,7 @@ async def set_workspace_spec(
     Returns:
         Updated workspace details
     """
-    try:
+    async with _workspace_action_errors("set spec for", workspace_id):
         workspace = await db_get_workspace(workspace_id)
         require_workspace_owner(workspace, user_id=x_user_id)
 
@@ -723,16 +719,6 @@ async def set_workspace_spec(
         )
         return _workspace_to_response(updated)
 
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception(f"Error setting workspace {workspace_id} spec: {e}")
-        raise HTTPException(status_code=500, detail="Failed to set workspace spec")
-
 
 @router.post("/{workspace_id}/always-on", response_model=WorkspaceResponse)
 async def set_workspace_always_on(
@@ -745,7 +731,9 @@ async def set_workspace_always_on(
 
     Enabling is gated by the platform entitlement layer (403 if always-on is
     not on the user's plan, 429 if the count quota is exhausted); both are
-    no-ops in OSS mode. Disabling is never gated.
+    no-ops in OSS mode. Disabling is never gated, and re-enabling a workspace
+    that is already always-on consumes no new slot so it skips the gate (an
+    idempotent retry at the quota limit must not 429).
 
     Args:
         workspace_id: Workspace UUID
@@ -755,11 +743,11 @@ async def set_workspace_always_on(
     Returns:
         Updated workspace details
     """
-    try:
+    async with _workspace_action_errors("set always-on for", workspace_id):
         workspace = await db_get_workspace(workspace_id)
         require_workspace_owner(workspace, user_id=x_user_id)
 
-        if request.enabled:
+        if request.enabled and not workspace.get("is_always_on"):
             await assert_always_on_allowed(x_user_id)
 
         manager = WorkspaceManager.get_instance()
@@ -788,16 +776,6 @@ async def set_workspace_always_on(
         )
         return _workspace_to_response(updated)
 
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception(f"Error setting workspace {workspace_id} always-on: {e}")
-        raise HTTPException(status_code=500, detail="Failed to set workspace always-on")
-
 
 @router.post(
     "/{workspace_id}/duplicate", response_model=WorkspaceResponse, status_code=201
@@ -820,7 +798,7 @@ async def duplicate_workspace(
     Returns:
         The newly created workspace
     """
-    try:
+    async with _workspace_action_errors("duplicate", workspace_id):
         manager = WorkspaceManager.get_instance()
         new_workspace = await manager.duplicate_workspace(workspace_id, x_user_id)
 
@@ -829,16 +807,6 @@ async def duplicate_workspace(
             f"{new_workspace['workspace_id']} for user {x_user_id}"
         )
         return _workspace_to_response(new_workspace)
-
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception(f"Error duplicating workspace {workspace_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to duplicate workspace")
 
 
 @router.post("/{workspace_id}/refresh", response_model=WorkspaceRefreshResponse)

@@ -20,16 +20,16 @@ depends_on = None
 def upgrade() -> None:
     op.execute("""
         ALTER TABLE workspaces
-            ADD COLUMN resource_tier VARCHAR(32) NOT NULL DEFAULT 'standard'
+            ADD COLUMN IF NOT EXISTS resource_tier VARCHAR(32) NOT NULL DEFAULT 'standard'
     """)
     op.execute("""
         ALTER TABLE workspaces
-            ADD COLUMN is_always_on BOOLEAN NOT NULL DEFAULT FALSE
+            ADD COLUMN IF NOT EXISTS is_always_on BOOLEAN NOT NULL DEFAULT FALSE
     """)
     # Partial index: the platform's always-on quota count scans per user over
     # the small set of always-on rows.
     op.execute("""
-        CREATE INDEX idx_workspaces_always_on_by_user
+        CREATE INDEX IF NOT EXISTS idx_workspaces_always_on_by_user
         ON workspaces (user_id)
         WHERE is_always_on
     """)

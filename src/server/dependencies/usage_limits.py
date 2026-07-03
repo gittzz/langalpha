@@ -51,6 +51,11 @@ async def close_http_client() -> None:
             _http_client = None
 
 
+def _platform_gating_active() -> bool:
+    """True when platform scope/quota gates should run (not OSS and an auth URL set)."""
+    return HOST_MODE != "oss" and bool(AUTH_SERVICE_URL)
+
+
 @dataclass
 class ChatAuthResult:
     """Auth + tier data collected by enforce_chat_limit for downstream gates."""
@@ -179,7 +184,7 @@ async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
     slowly — only on platform fallback completion).
     Platform path: uncached real-time daily-credit check.
     """
-    if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+    if not _platform_gating_active():
         return
 
     # BYOK fast path: cached negative-balance check (Redis, 60 s TTL).
@@ -293,7 +298,7 @@ async def _call_validate_for_user(
     byok: bool = False,
 ) -> Optional[dict]:
     """POST to the auth/quota service at /api/auth/validate. Returns None in OSS mode or on failure."""
-    if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+    if not _platform_gating_active():
         return None
 
     client = await _get_http_client()
@@ -330,7 +335,7 @@ async def enforce_workspace_limit(
     user_id: str = Depends(get_current_user_id),
 ) -> str:
     """FastAPI dependency: enforce active workspace limit via the auth/quota service. No-op in OSS mode."""
-    if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+    if not _platform_gating_active():
         return user_id
 
     result = await _call_validate_for_user(user_id, check_quota="workspace")
@@ -381,7 +386,7 @@ async def _fetch_platform_membership(user_id: str) -> dict:
     ``plan_display_name`` is ``None`` when the user has no active subscription.
     Cached in Redis for 5 minutes. No-op in OSS mode.
     """
-    if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+    if not _platform_gating_active():
         return {"access_tier": -1, "plan_display_name": None}
 
     from src.utils.cache.redis_cache import get_cache_client
@@ -417,12 +422,21 @@ async def _fetch_platform_tier(user_id: str) -> int:
 # Scope-based feature gating
 # ---------------------------------------------------------------------------
 
-_scope_cache: dict[str, tuple[list[str], float]] = {}  # {user_id: (scopes, expiry_ts)}
+# {user_id: (scopes, expiry_ts)}; scopes is None when the platform is
+# unreachable / omits them (fail-open), an explicit list (possibly empty) when
+# it answered definitively.
+_scope_cache: dict[str, tuple[list[str] | None, float]] = {}
 _SCOPE_CACHE_TTL = 300  # 5 minutes
 
 
-async def _get_user_scopes(user_id: str) -> list[str]:
-    """Return user's scopes from the auth/quota service; in-process cache with 5 min TTL."""
+async def _get_user_scopes(user_id: str) -> list[str] | None:
+    """Return the user's scopes from the auth/quota service; 5 min in-process cache.
+
+    Returns None when the platform is unreachable or omits ``scopes`` (the
+    fail-open signal — callers allow). An explicit list, *including an empty
+    one*, is the platform's definitive answer and is enforced, so a user the
+    platform grants no scopes can't slip through as if the service were down.
+    """
     import time
 
     now = time.time()
@@ -431,10 +445,7 @@ async def _get_user_scopes(user_id: str) -> list[str]:
         return cached[0]
 
     result = await _call_validate_for_user(user_id)
-    if result and "scopes" in result:
-        scopes = result["scopes"]
-    else:
-        scopes = []  # Fail-open: no scopes restriction
+    scopes = result["scopes"] if result and "scopes" in result else None
 
     _scope_cache[user_id] = (scopes, now + _SCOPE_CACHE_TTL)
     return scopes
@@ -443,10 +454,10 @@ async def _get_user_scopes(user_id: str) -> list[str]:
 def require_scope(scope: str):
     """FastAPI dependency factory — checks user has scope. No-op in OSS mode."""
     async def check(user_id: str = Depends(get_current_user_id)):
-        if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+        if not _platform_gating_active():
             return user_id  # OSS mode: everything allowed
         scopes = await _get_user_scopes(user_id)
-        if scopes and scope not in scopes:
+        if scopes is not None and scope not in scopes:
             raise HTTPException(403, detail=f"Requires scope: {scope}")
         return user_id
     return Depends(check)
@@ -457,15 +468,29 @@ def require_scope(scope: str):
 # ---------------------------------------------------------------------------
 
 async def require_workspace_scope(user_id: str, scope: str) -> None:
-    """Raise 403 if the user's scope list is non-empty and lacks ``scope``.
+    """Raise 403 when the platform's definitive scope list lacks ``scope``.
 
-    Fail-open in OSS mode and when the scope list is empty (unreachable platform).
+    Fail-open (allow) only in OSS mode or when the platform is unreachable /
+    omits scopes (``_get_user_scopes`` returns None). A definitive list —
+    including an empty one — is enforced.
     """
-    if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+    if not _platform_gating_active():
         return
     scopes = await _get_user_scopes(user_id)
-    if scopes and scope not in scopes:
+    if scopes is not None and scope not in scopes:
         raise HTTPException(403, detail=f"Requires scope: {scope}")
+
+
+def _extract_capacity(quota: dict) -> tuple[int | None, int | None]:
+    """Extract ``(used, limit)`` counts from a platform quota object.
+
+    Prefers the ``capacity_used``/``capacity_limit`` names (see ginlix-platform
+    QuotaInfo), falling back to the legacy ``active``/``limit`` and
+    ``active_workspaces``/``workspace_limit`` aliases.
+    """
+    used = quota.get("capacity_used", quota.get("active", quota.get("active_workspaces")))
+    limit = quota.get("capacity_limit", quota.get("limit", quota.get("workspace_limit")))
+    return used, limit
 
 
 async def enforce_capacity(user_id: str, check_quota: str) -> None:
@@ -475,7 +500,7 @@ async def enforce_capacity(user_id: str, check_quota: str) -> None:
     ``spec_performance``, ``spec_max``). No-op in OSS mode and fail-open when the
     platform is unreachable or omits the quota object.
     """
-    if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+    if not _platform_gating_active():
         return
 
     result = await _call_validate_for_user(user_id, check_quota=check_quota)
@@ -487,10 +512,7 @@ async def enforce_capacity(user_id: str, check_quota: str) -> None:
         return
 
     if quota.get("allowed") is False:
-        # Platform emits these count quotas as ``capacity_used``/``capacity_limit``
-        # (see ginlix-platform QuotaInfo); fall back to legacy field names.
-        current = quota.get("capacity_used", quota.get("active", quota.get("active_workspaces")))
-        limit = quota.get("capacity_limit", quota.get("limit", quota.get("workspace_limit")))
+        current, limit = _extract_capacity(quota)
         # Forward platform's `message` and `limit_type` verbatim; no copy authored here.
         raise HTTPException(
             status_code=429,
@@ -515,7 +537,7 @@ async def get_capacity_status(user_id: str, check_quota: str) -> Optional[dict]:
     unreachable, or when it reports no counts for ``check_quota``. Never raises — this
     backs a UI hint, not a gate.
     """
-    if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+    if not _platform_gating_active():
         return None
 
     result = await _call_validate_for_user(user_id, check_quota=check_quota)
@@ -526,8 +548,7 @@ async def get_capacity_status(user_id: str, check_quota: str) -> Optional[dict]:
     if not quota:
         return None
 
-    used = quota.get("capacity_used", quota.get("active", quota.get("active_workspaces")))
-    limit = quota.get("capacity_limit", quota.get("limit", quota.get("workspace_limit")))
+    used, limit = _extract_capacity(quota)
     if limit is None:
         return None
     # Unlimited tiers report limit == -1 and omit the count, so don't require it.
@@ -538,42 +559,91 @@ async def get_capacity_status(user_id: str, check_quota: str) -> Optional[dict]:
     return {"used": int(used), "limit": int(limit)}
 
 
+# Always-on entitlement identifiers — single source for the gate, the
+# reconciler probe, and the quota route.
+ALWAYS_ON_SCOPE = "workspace:always_on"
+ALWAYS_ON_QUOTA = "always_on"
+
+# spec tier -> (required scope, count-quota name). Absent tiers (standard,
+# unknown) are ungated.
+_SPEC_ENTITLEMENTS: dict[str, tuple[str, str]] = {
+    "performance": ("workspace:spec:performance", "spec_performance"),
+    "max": ("workspace:spec:max", "spec_max"),
+}
+
+# tier -> count-quota name, for callers that only need the quota identifier
+# (e.g. the /workspaces/quota route).
+SPEC_QUOTAS: dict[str, str] = {
+    tier: quota for tier, (_scope, quota) in _SPEC_ENTITLEMENTS.items()
+}
+
+# Ordering for upgrade-vs-downgrade decisions. Unknown tiers rank lowest so a
+# move from one is treated as an upgrade (counted).
+_TIER_RANK: dict[str, int] = {"standard": 0, "performance": 1, "max": 2}
+
+
+async def _assert_hybrid_gate(
+    user_id: str, scope: str, check_quota: str, *, count: bool = True
+) -> None:
+    """Shared workspace-entitlement gate: scope 403 then optional count 429."""
+    await require_workspace_scope(user_id, scope)
+    if count:
+        await enforce_capacity(user_id, check_quota)
+
+
 async def assert_spec_allowed(
     user_id: str, tier: str, *, current_tier: Optional[str] = None
 ) -> None:
     """Gate an upgrade to ``tier`` (scope 403 + count 429). Standard is never gated.
 
-    The count quota is skipped when ``current_tier == tier`` since no new slot is
-    consumed. No-op in OSS mode.
+    The count quota is skipped when ``current_tier == tier`` (no new slot) and on
+    downgrades — a user must always be able to step down-tier, even if that
+    briefly reads over the target tier's count (the freed higher slot
+    compensates, and new allocations stay gated). No-op in OSS mode.
     """
-    if tier == "standard":
-        return
-    if tier == "performance":
-        await require_workspace_scope(user_id, "workspace:spec:performance")
-        if current_tier != tier:
-            await enforce_capacity(user_id, "spec_performance")
-    elif tier == "max":
-        await require_workspace_scope(user_id, "workspace:spec:max")
-        if current_tier != tier:
-            await enforce_capacity(user_id, "spec_max")
+    entitlement = _SPEC_ENTITLEMENTS.get(tier)
+    if entitlement is None:
+        return  # standard / unknown tiers are ungated
+    scope, check_quota = entitlement
+    # Same-tier and downward moves never count; equal ranks make the former a
+    # non-upgrade automatically.
+    is_upgrade = _TIER_RANK.get(tier, -1) > _TIER_RANK.get(current_tier or "", -1)
+    await _assert_hybrid_gate(user_id, scope, check_quota, count=is_upgrade)
 
 
 async def assert_always_on_allowed(user_id: str) -> None:
     """Gate enabling always-on (scope 403 + count 429). No-op in OSS mode."""
-    await require_workspace_scope(user_id, "workspace:always_on")
-    await enforce_capacity(user_id, "always_on")
+    await _assert_hybrid_gate(user_id, ALWAYS_ON_SCOPE, ALWAYS_ON_QUOTA)
 
 
-async def always_on_entitlement_lost(user_id: str) -> bool:
-    """True only when the platform confirms the user no longer holds always-on.
+async def spec_grantable(
+    user_id: str, tier: str, *, current_tier: Optional[str] = None
+) -> bool:
+    """Non-raising form of :func:`assert_spec_allowed` (full scope 403 + count 429
+    gate) for service-layer callers that must not import/catch ``HTTPException``.
 
-    Fail-safe for the unattended idle-cleanup reconciler: returns False (keep
-    always-on) in OSS mode, on any validate failure/unreachable, and on an
-    ambiguous response, so an outage can never mass-disable always-on. Uses the
-    raw validate call so a failed fetch is distinguishable from a 200 that
-    simply lacks the scope (``_get_user_scopes`` collapses both to ``[]``).
+    Returns True when the user may hold a workspace at ``tier`` and False when the
+    gate would reject (missing scope or exhausted per-tier count). ``standard``/
+    unknown tiers and OSS mode fail open to True. Confines HTTP semantics to this
+    dependency layer.
     """
-    if HOST_MODE == "oss" or not AUTH_SERVICE_URL:
+    try:
+        await assert_spec_allowed(user_id, tier, current_tier=current_tier)
+        return True
+    except HTTPException:
+        return False
+
+
+async def _scope_entitlement_lost(user_id: str, scope: str) -> bool:
+    """True only when the platform confirms ``scope`` is no longer granted.
+
+    Fail-safe for unattended reconciliation: returns False (keep the
+    entitlement) in OSS mode, on any validate failure/unreachable, and on an
+    ambiguous response, so an outage can never mass-revoke. Uses the raw
+    validate call directly (not the cached ``_get_user_scopes``) so a failed
+    fetch is distinguishable from a 200 that simply lacks the scope.
+    """
+    if not _platform_gating_active():
         return False
     result = await _call_validate_for_user(user_id)
     if result is None:
@@ -581,7 +651,30 @@ async def always_on_entitlement_lost(user_id: str) -> bool:
     scopes = result.get("scopes")
     if not isinstance(scopes, list):
         return False  # ambiguous response → keep
-    return "workspace:always_on" not in scopes
+    return scope not in scopes
+
+
+async def always_on_entitlement_lost(user_id: str) -> bool:
+    """True only when the platform confirms the user no longer holds always-on.
+
+    Drives the idle-cleanup reconciler; fail-safe semantics per
+    :func:`_scope_entitlement_lost`.
+    """
+    return await _scope_entitlement_lost(user_id, ALWAYS_ON_SCOPE)
+
+
+async def spec_entitlement_lost(user_id: str, tier: str) -> bool:
+    """True only when the platform confirms the user no longer holds ``tier``'s scope.
+
+    Drives lazy spec reclaim at sandbox (re)provision time. Standard/unknown
+    tiers are never reclaimed; fail-safe semantics per
+    :func:`_scope_entitlement_lost`, deliberately uncached so a stale scope
+    snapshot can't trigger a wrong rebuild.
+    """
+    entitlement = _SPEC_ENTITLEMENTS.get(tier)
+    if entitlement is None:
+        return False
+    return await _scope_entitlement_lost(user_id, entitlement[0])
 
 
 # Annotated types for cleaner endpoint signatures
