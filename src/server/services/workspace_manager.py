@@ -40,9 +40,15 @@ from src.server.database.workspace import (
     delete_workspace as db_delete_workspace,
     get_workspace as db_get_workspace,
     get_workspaces_by_status,
+    set_workspace_always_on as db_set_workspace_always_on,
+    set_workspace_resource_tier as db_set_workspace_resource_tier,
     try_claim_workspace_for_start,
     update_workspace_activity,
     update_workspace_status,
+)
+from src.server.database.workspace_file import (
+    copy_workspace_files,
+    get_workspace_total_size,
 )
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.workspace_status_pubsub import (
@@ -51,6 +57,13 @@ from src.server.services.workspace_status_pubsub import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Disk reserved for the OS, Python venv, and MCP wrapper packages baked into
+# every snapshot. Subtracted from a tier's disk to estimate space usable for
+# restored user files when guarding a downgrade. ~2 GiB matches the standard
+# tier's 3 GiB disk leaving ~1 GiB for files (the existing soft per-workspace cap).
+_DISK_SYSTEM_RESERVE_BYTES = 2 * 1024**3
+_GIB = 1024**3
 
 
 class WorkspaceManager:
@@ -677,36 +690,46 @@ class WorkspaceManager:
     ) -> Session:
         """Create a fresh sandbox after the old one was deleted, restore files from DB.
 
+        Sizes the new sandbox to the workspace's persisted ``resource_tier`` and
+        re-applies always-on (auto-stop disabled) at create time, so every
+        recovery/recreate self-heals to the entitled spec — hosted Daytona can't
+        resize a snapshot sandbox, so sizing must happen at creation.
+
         Returns the new session (already cached and DB-updated).
         """
+        workspace = await db_get_workspace(workspace_id)
+        tier = (workspace or {}).get("resource_tier") or "standard"
+        always_on = bool((workspace or {}).get("is_always_on"))
+        auto_stop_minutes = 0 if always_on else None
+
         sandbox_tokens = await self._mint_sandbox_tokens(user_id or "", workspace_id)
         session = SessionManager.get_session(workspace_id, core_config)
-        await session.initialize(
-            sandbox_tokens=sandbox_tokens,
-            user_id=user_id,
-            workspace_id=workspace_id,
-        )
-        new_sandbox_id = getattr(session.sandbox, "sandbox_id", None)
-
-        # Install the per-workspace composite before asset sync so user-server
-        # wrappers are regenerated for the fresh sandbox. ws_version=None forces
-        # a resolve (the session is brand new). Discovery kicked in background.
-        resolved_mcp = await self._apply_session_mcp(
-            workspace_id, user_id, session, ws_version=None
-        )
-
-        await self._sync_sandbox_assets(
-            workspace_id, user_id, session.sandbox, reusing_sandbox=False
-        )
-
-        # Cache the session BEFORE kicking discovery: the background task's
-        # liveness gate (``self._sessions.get(workspace_id) is session``) would
-        # otherwise see no cached session and exit permanently. Any later step
-        # that raises must NOT leave this broken session cached — the old code
-        # only cached after every step succeeded — so unwind on failure.
-        self._sessions[workspace_id] = session
-
         try:
+            await session.initialize(
+                sandbox_tokens=sandbox_tokens,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                tier=tier,
+                auto_stop_minutes=auto_stop_minutes,
+            )
+            new_sandbox_id = getattr(session.sandbox, "sandbox_id", None)
+
+            # Install the per-workspace composite before asset sync so user-server
+            # wrappers are regenerated for the fresh sandbox. ws_version=None forces
+            # a resolve (the session is brand new). Discovery kicked in background.
+            resolved_mcp = await self._apply_session_mcp(
+                workspace_id, user_id, session, ws_version=None
+            )
+
+            await self._sync_sandbox_assets(
+                workspace_id, user_id, session.sandbox, reusing_sandbox=False
+            )
+
+            # Cache the session BEFORE kicking discovery: the background task's
+            # liveness gate (``self._sessions.get(workspace_id) is session``)
+            # would otherwise see no cached session and exit permanently.
+            self._sessions[workspace_id] = session
+
             if resolved_mcp is not None:
                 self._kick_mcp_discovery(
                     workspace_id,
@@ -725,9 +748,20 @@ class WorkspaceManager:
                 sandbox_id=new_sandbox_id,
             )
         except Exception:
+            # Unwind a half-built recovery: cancel discovery, drop the broken
+            # cached session, and destroy the Daytona sandbox created before the
+            # failure (cleanup_session runs runtime.delete) so a partial recreate
+            # never leaves an orphaned, still-billed sandbox.
             self._cancel_mcp_discovery(workspace_id)
             if self._sessions.get(workspace_id) is session:
                 self._sessions.pop(workspace_id, None)
+            try:
+                await SessionManager.cleanup_session(workspace_id)
+            except Exception as cleanup_err:
+                logger.warning(
+                    f"Failed to destroy orphaned sandbox during recovery "
+                    f"unwind for {workspace_id}: {cleanup_err}"
+                )
             raise
 
         self._record_sync(workspace_id)
@@ -753,9 +787,21 @@ class WorkspaceManager:
             result = await FilePersistenceService.restore_to_sandbox(
                 workspace_id, sandbox
             )
-            logger.info(
-                f"Restored {result['restored']} files to sandbox for {workspace_id}"
-            )
+            errors = result.get("errors", 0) if isinstance(result, dict) else 0
+            if errors:
+                # Restore is per-file best-effort and never raises, so files that
+                # don't land (e.g. they overflow a downgraded disk) would vanish
+                # silently. Surface the count so a tier downgrade that loses data
+                # is at least visible in the logs.
+                logger.warning(
+                    f"Restored {result['restored']} files to sandbox for "
+                    f"{workspace_id}, but {errors} failed to restore "
+                    f"(possible data loss after a disk downgrade)"
+                )
+            else:
+                logger.info(
+                    f"Restored {result['restored']} files to sandbox for {workspace_id}"
+                )
         except Exception as e:
             logger.warning(f"File restore failed for {workspace_id}: {e}")
 
@@ -1023,6 +1069,17 @@ class WorkspaceManager:
                 logger.error(
                     f"Failed to create sandbox for workspace {workspace_id}: {e}"
                 )
+                self._sessions.pop(workspace_id, None)
+                # Destroy the Daytona sandbox created before the failure
+                # (cleanup_session runs runtime.delete) so a half-built create
+                # doesn't leave an orphaned, still-billed sandbox.
+                try:
+                    await SessionManager.cleanup_session(workspace_id)
+                except Exception as cleanup_err:
+                    logger.warning(
+                        f"Failed to destroy orphaned sandbox for workspace "
+                        f"{workspace_id}: {cleanup_err}"
+                    )
                 await update_workspace_status(
                     workspace_id=workspace_id,
                     status="error",
@@ -1130,8 +1187,13 @@ class WorkspaceManager:
         on_state_observed: Callable[[str], None] | None = None,
         _attempt: int = 0,
     ) -> Session:
-        """
-        Get or restart session for workspace.
+        """Get or restart a session for a workspace.
+
+        Sandbox sizing and always-on are applied at create/restart time — a
+        recreated sandbox is built from the workspace's tier snapshot with
+        auto-stop set in ``_recover_sandbox``, a reconnected always-on sandbox
+        has its auto-stop re-asserted in ``_restart_workspace``, and a plain
+        reconnect keeps its existing spec — so no post-start re-ensure is needed.
 
         Args:
             workspace_id: Workspace UUID
@@ -1145,7 +1207,7 @@ class WorkspaceManager:
                 fresh sandbox (no pre-existing state to observe).
 
         Returns:
-            Initialized Session instance
+            Initialized Session instance.
 
         Raises:
             ValueError: If workspace not found
@@ -1199,13 +1261,15 @@ class WorkspaceManager:
 
                         if isinstance(init_err, SandboxGoneError):
                             core_config = self.config.to_core_config()
-                            return await self._recover_sandbox(
+                            recovered = await self._recover_sandbox(
                                 workspace_id, workspace_user_id, core_config
                             )
+                            return recovered
                         # Non-sandbox-gone error: fall through to status-based handling
                         session = None
                     else:
-                        # Sandbox still initializing (lazy init in progress)
+                        # Sandbox still initializing (lazy init in progress) — warm
+                        # fast path, no recreation, so no tier re-check needed.
                         logger.info(
                             f"Sandbox still initializing for {workspace_id}, "
                             f"skipping sync"
@@ -1219,7 +1283,8 @@ class WorkspaceManager:
                         not self._sync_cooldown_ok(workspace_id) or needs_deferred_sync
                     )
                     if not needs_sync:
-                        # Cooldown active, skip expensive Daytona calls
+                        # Cooldown active, skip expensive Daytona calls — warm fast
+                        # path, no recreation, so no tier re-check needed.
                         safe_add(session_path_counter, 1, {"path": "warm_cooldown"})
                         return session
 
@@ -1401,9 +1466,10 @@ class WorkspaceManager:
                                 )
                                 core_config = self.config.to_core_config()
                                 await self._clear_session(workspace_id)
-                                return await self._recover_sandbox(
+                                recovered = await self._recover_sandbox(
                                     workspace_id, workspace_user_id, core_config
                                 )
+                                return recovered
                             except Exception as e:
                                 logger.error(
                                     "Failed to check actual sandbox state for %s: %s",
@@ -1447,7 +1513,10 @@ class WorkspaceManager:
         # slow archived cold-start (60-300s) doesn't head-of-line block other
         # ops on this workspace behind the 60s lock-acquire ceiling.
         if pending_start_wait:
-            return await self._await_in_flight_start(
+            # May attach a now-running session or recurse into the public
+            # get_session_for_workspace. Either path applies sizing/always-on at
+            # create/restart time, so no post-attach re-ensure is needed.
+            attached = await self._await_in_flight_start(
                 workspace_id,
                 user_id=user_id,
                 workspace_user_id=workspace_user_id,
@@ -1455,6 +1524,7 @@ class WorkspaceManager:
                 mark=_mark,
                 attempt=_attempt,
             )
+            return attached
 
         # ── Phase 2: expensive sync OUTSIDE the lock (idempotent / self-guarded).
         # Coalesces same-worker callers on the dedupe gate, promotes a lazy start
@@ -1497,6 +1567,10 @@ class WorkspaceManager:
                     {"phase": _phase, "session_path": session_path},
                 )
 
+        # Reached only via _complete_phase2_sync — a real cold-start / restart /
+        # recovery (or a periodic warm re-sync). Sizing/always-on are applied at
+        # create/restart time (see _recover_sandbox / _restart_workspace), so the
+        # session is returned ready with no post-start re-ensure.
         return session
 
     async def _await_in_flight_start(
@@ -2150,9 +2224,43 @@ class WorkspaceManager:
                     f"{workspace_id} ({e}). Creating fresh sandbox."
                 )
 
-            # Sandbox was deleted — recover with fresh one
+            # Sandbox was deleted — recover with fresh one (_recover_sandbox
+            # re-applies always-on at create time, so no extra handling here).
             if sandbox_gone:
                 return await self._recover_sandbox(workspace_id, user_id, core_config)
+
+            # Reconnected to the existing sandbox. Auto-stop is a persisted
+            # Daytona property that a plain reconnect does NOT re-assert, so the
+            # live interval drifts from the always-on flag whenever the flag was
+            # toggled while the sandbox was stopped: an enable would keep the old
+            # auto-stopping interval (Daytona stops it anyway), and a disable
+            # would keep interval 0 (never stops). Reseed from the current flag
+            # in both directions on every restart so the live interval always
+            # matches the flag; best-effort so an autostop hiccup never blocks
+            # the restart.
+            if sandbox_id:
+                # Reuse the just-connected runtime on the non-lazy path so the
+                # reseed doesn't spin up a throwaway provider + extra metadata
+                # round-trip on the user-visible cold start. The lazy path hasn't
+                # connected its runtime yet (Phase 2 runs in the background), so
+                # ``runtime`` is None there and the apply falls back to a by-id
+                # provider lookup.
+                live_runtime = (
+                    getattr(session.sandbox, "runtime", None)
+                    if session.sandbox
+                    else None
+                )
+                try:
+                    await self._apply_autostop_for_always_on(
+                        sandbox_id,
+                        enabled=bool(workspace.get("is_always_on")),
+                        runtime=live_runtime,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to re-assert auto-stop interval for "
+                        f"{workspace_id}: {e}"
+                    )
 
             # Existing sandbox reconnected successfully — sync assets
             if not lazy_init:
@@ -2317,6 +2425,417 @@ class WorkspaceManager:
             logger.info(f"Workspace {workspace_id} archived successfully")
             return workspace
 
+    async def _destroy_sandbox(self, sandbox_id: str) -> None:
+        """Delete a sandbox by id via the provider, reaching it like archive_workspace.
+
+        Used to retire a stopped workspace's sandbox so its next start recreates
+        it from the (possibly new) tier snapshot. Always closes the provider.
+        """
+        from ptc_agent.core.sandbox.providers import create_provider
+
+        provider = create_provider(self.config.to_core_config())
+        try:
+            runtime = await provider.get(sandbox_id)
+            await runtime.delete()
+        finally:
+            await provider.close()
+
+    async def _assert_disk_fits(self, workspace_id: str, target_disk_gib: int) -> None:
+        """Reject a downgrade whose backed-up files won't fit the target disk.
+
+        File restore is per-file best-effort, so a sandbox recreated on a smaller
+        disk silently drops whatever overflows. The summed ``file_size`` is a
+        lower bound (tracked workspace files only, excluding caches/venv), so this
+        catches gross overflow rather than every byte. Call *before* teardown.
+
+        Raises:
+            RuntimeError: Backed-up files exceed the target disk's usable space.
+        """
+        usable = max(0, target_disk_gib * _GIB - _DISK_SYSTEM_RESERVE_BYTES)
+        total = await get_workspace_total_size(workspace_id)
+        if total > usable:
+            raise RuntimeError(
+                f"Cannot downgrade: workspace files ({total / _GIB:.1f} GiB) "
+                f"exceed the {target_disk_gib} GiB tier's usable space "
+                f"(~{usable / _GIB:.1f} GiB). Free up space first."
+            )
+
+    async def set_workspace_spec(
+        self,
+        workspace_id: str,
+        tier: str,
+        *,
+        user_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Change a workspace's resource tier by recreating its sandbox.
+
+        Hosted Daytona can't resize a snapshot sandbox or override its resources,
+        so sizing lives in per-tier snapshots and a spec change means recreate,
+        not resize:
+
+        - **running** — back files up to the DB, tear the live sandbox down, and
+          recreate from the target tier's snapshot (``_recover_sandbox`` restores
+          the files and applies always-on);
+        - **stopped** — destroy the sandbox so the next start recreates it at the
+          new tier (files were backed up to the DB on stop);
+        - **never-started** — just persist the tier.
+
+        The persisted tier is reverted if the recreate fails. A downgrade whose
+        backed-up files won't fit the smaller disk is rejected before teardown.
+
+        Raises:
+            ValueError: Workspace not found or ``tier`` is unknown.
+            RuntimeError: Downgrade rejected — files exceed the target disk.
+        """
+        tiers = self.config.sandbox.daytona.resource_tiers
+        if tier not in tiers:
+            raise ValueError(f"Unknown resource tier: {tier}")
+
+        workspace = await db_get_workspace(workspace_id)
+        if not workspace:
+            raise ValueError(f"Workspace {workspace_id} not found")
+
+        current_tier_name = workspace.get("resource_tier") or "standard"
+        sandbox_id = workspace.get("sandbox_id")
+
+        if tier == current_tier_name and sandbox_id:
+            # Already at this tier with a live sandbox — nothing to do.
+            return workspace
+
+        # A disk shrink risks silently dropping files that don't fit the smaller
+        # sandbox (restore is best-effort). Guard those before any teardown.
+        # Treat an unknown current tier as a possible downgrade (data-safe).
+        target_disk = tiers[tier].disk
+        current_tier = tiers.get(current_tier_name)
+        is_downgrade = current_tier is None or target_disk < current_tier.disk
+
+        # Persist the new tier first so the create/recover paths (which read it
+        # from the DB) build the sandbox at the right size; reverted if recreate
+        # fails so DB and platform billing never claim an unreached upgrade.
+        await db_set_workspace_resource_tier(workspace_id, tier)
+
+        if not sandbox_id:
+            # Never started — tier applies when the sandbox is created/started.
+            logger.info(
+                f"Workspace {workspace_id} has no sandbox; persisted tier {tier!r} only"
+            )
+            return await db_get_workspace(workspace_id) or workspace
+
+        try:
+            async with self._observed_lock(workspace_id, "workspace.spec"):
+                # Re-read under the lock — status/sandbox_id may have moved since
+                # the pre-lock read (a concurrent start/stop/cleanup). Branching
+                # on the locked status keeps the teardown from racing a
+                # lifecycle op that owns the sandbox.
+                locked = await db_get_workspace(workspace_id) or workspace
+                locked_status = locked.get("status")
+                locked_sandbox_id = locked.get("sandbox_id")
+
+                if not locked_sandbox_id:
+                    # Sandbox went away while we waited — the tier is persisted,
+                    # so the next start builds it at the new size.
+                    logger.info(
+                        f"Workspace {workspace_id} lost its sandbox before the "
+                        f"spec change; persisted tier {tier!r} only"
+                    )
+                elif locked_status == "running":
+                    # Don't yank the sandbox out from under a live agent turn:
+                    # execute_code keeps running in the sandbox after
+                    # get_session_for_workspace returns without holding this
+                    # lock, so recreating here would abort it with
+                    # SandboxGoneError. Mirror the idle reaper's guard and refuse
+                    # (the outer except reverts the persisted tier; maps to 400).
+                    if await BackgroundTaskManager.get_instance().has_active_tasks_for_workspace(
+                        workspace_id
+                    ):
+                        raise RuntimeError(
+                            "Cannot change spec while an agent turn is running; "
+                            "wait for the current turn to finish"
+                        )
+                    # Recreate in place — mirrors the sandbox-migration path.
+                    logger.info(f"Recreating workspace {workspace_id} at tier {tier!r}")
+                    await self._backup_files_to_db(workspace_id)
+                    if is_downgrade:
+                        # Checked post-backup (fresh DB sizes), pre-teardown — the
+                        # live sandbox is untouched, so a failure aborts cleanly.
+                        await self._assert_disk_fits(workspace_id, target_disk)
+                    self._sessions.pop(workspace_id, None)
+                    try:
+                        await SessionManager.cleanup_session(workspace_id)
+                    except Exception as e:
+                        SessionManager.remove_session(workspace_id)
+                        logger.warning(
+                            f"Old sandbox cleanup failed for {workspace_id}: {e}"
+                        )
+                    try:
+                        await self._recover_sandbox(
+                            workspace_id, user_id, self.config.to_core_config()
+                        )
+                    except Exception:
+                        # Old sandbox is already torn down; mark the row so it
+                        # stops claiming 'running' on a dead sandbox (it self-heals
+                        # via SandboxGone on next access, but the status must not
+                        # lie meanwhile). The outer except still reverts the tier.
+                        await update_workspace_status(
+                            workspace_id=workspace_id, status="error"
+                        )
+                        raise
+                elif locked_status == "stopped":
+                    # Destroy the stopped sandbox so the next start recreates it
+                    # from the tier snapshot (files were backed up to the DB on
+                    # stop).
+                    if is_downgrade:
+                        await self._assert_disk_fits(workspace_id, target_disk)
+                    logger.info(
+                        f"Destroying stopped sandbox for {workspace_id}; "
+                        f"will recreate at tier {tier!r} on next start"
+                    )
+                    await self._destroy_sandbox(locked_sandbox_id)
+                else:
+                    # Transient state (creating/starting/stopping/error) may have
+                    # an in-flight op holding the sandbox — refuse rather than tear
+                    # it down underneath that op (maps to 400 at the route).
+                    raise RuntimeError(
+                        f"Cannot change spec while workspace is {locked_status!r}; "
+                        "wait for the current operation to finish"
+                    )
+        except Exception:
+            await db_set_workspace_resource_tier(workspace_id, current_tier_name)
+            raise
+
+        return await db_get_workspace(workspace_id) or workspace
+
+    async def _apply_autostop_for_always_on(
+        self, sandbox_id: str, *, enabled: bool, runtime: Any = None
+    ) -> None:
+        """Sync a live sandbox's auto-stop interval to the always-on flag.
+
+        Interval 0 (never auto-stop) when enabled, else the configured default.
+        Reuses ``runtime`` when the caller already holds a connected one (the
+        reconnect path) to avoid a throwaway provider + extra round-trip; else
+        reaches the sandbox via a throwaway provider. No-ops if the runtime lacks
+        the ``autostop`` capability.
+        """
+        minutes = (
+            0 if enabled else self.config.sandbox.daytona.auto_stop_interval // 60
+        )
+
+        if runtime is not None:
+            if "autostop" in runtime.capabilities:
+                await runtime.set_autostop_interval(minutes)
+            return
+
+        from ptc_agent.core.sandbox.providers import create_provider
+
+        provider = create_provider(self.config.to_core_config())
+        try:
+            runtime = await provider.get(sandbox_id)
+            if "autostop" in runtime.capabilities:
+                await runtime.set_autostop_interval(minutes)
+        finally:
+            await provider.close()
+
+    async def set_workspace_always_on(
+        self,
+        workspace_id: str,
+        enabled: bool,
+        *,
+        user_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Toggle a workspace's always-on flag, syncing the live auto-stop interval.
+
+        Persists the flag, then — if the sandbox is running and the provider
+        supports it — disables auto-stop when enabling (interval 0) or restores
+        the configured auto-stop interval when disabling. Auto-stop is a
+        persisted Daytona property that a plain reconnect does not re-assert, so
+        toggling either direction on a non-running workspace is re-applied on
+        its next restart (see ``_restart_workspace``).
+
+        Raises:
+            ValueError: Workspace not found.
+        """
+        workspace = await db_get_workspace(workspace_id)
+        if not workspace:
+            raise ValueError(f"Workspace {workspace_id} not found")
+
+        await db_set_workspace_always_on(workspace_id, enabled)
+
+        sandbox_id = workspace.get("sandbox_id")
+        if workspace["status"] == "running" and sandbox_id:
+            # Best-effort: the flag is already persisted and _restart_workspace
+            # re-asserts auto-stop on the next start, so a transient sandbox
+            # hiccup (e.g. it stopped between the read and here) must not 500
+            # the toggle.
+            try:
+                await self._apply_autostop_for_always_on(
+                    sandbox_id, enabled=enabled
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to apply always-on auto-stop for {workspace_id}: {e}"
+                )
+
+        return await db_get_workspace(workspace_id) or workspace
+
+    async def duplicate_workspace(
+        self,
+        source_id: str,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """Copy a workspace (files + tier) into a fresh "<name> (copy)" workspace.
+
+        Files are persisted to the DB first when the source is running, copied to
+        the new row, then a fresh sandbox is created eagerly and the files
+        restored. The resource tier is carried over; always-on is forced off so
+        the user re-checks the entitlement before re-enabling it.
+
+        Raises:
+            ValueError: Source missing, not owned by ``user_id``, or a flash
+                workspace.
+        """
+        source = await db_get_workspace(source_id)
+        if not source or source.get("user_id") != user_id:
+            raise ValueError(f"Workspace {source_id} not found")
+        if source["status"] == "flash":
+            raise ValueError("Cannot duplicate a flash workspace")
+
+        # Files only persist to the DB on stop/delete, so flush a running source
+        # before the copy or the new workspace would miss in-sandbox changes.
+        if source["status"] == "running":
+            await self._backup_files_to_db(source_id)
+
+        source_tier = source.get("resource_tier") or "standard"
+
+        # A duplicate is a NEW allocation, so re-check the spec entitlement
+        # (scope + per-tier count) for the carried tier. Without this a user
+        # could clone a performance/max workspace past their quota and get a
+        # free elevated sandbox. If they aren't entitled, copy at standard
+        # instead of failing. No-op in OSS mode (the gate fails open).
+        if source_tier != "standard":
+            from fastapi import HTTPException
+
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            try:
+                await assert_spec_allowed(
+                    user_id, source_tier, current_tier="standard"
+                )
+            except HTTPException as e:
+                logger.info(
+                    "Duplicate of %s: user %s not entitled to tier %r (%s); "
+                    "creating copy at standard instead",
+                    source_id,
+                    user_id,
+                    source_tier,
+                    getattr(e, "detail", e),
+                )
+                source_tier = "standard"
+
+        # Carry over the source config minus the sandbox-identity stamps — those
+        # belong to the source's sandbox and are re-stamped after the new one is
+        # created (see create_workspace).
+        source_config = dict(source.get("config") or {})
+        for stamp_key in (
+            "sandbox_config_hash",
+            "sandbox_provider",
+            "sandbox_working_dir",
+        ):
+            source_config.pop(stamp_key, None)
+
+        # 1. Create the new DB row (status='creating') so the file copy has a
+        #    destination, then carry over the tier (db_create_workspace does not
+        #    take resource_tier — it defaults to 'standard').
+        new_workspace = await db_create_workspace(
+            user_id=user_id,
+            name=f"{source['name']} (copy)",
+            description=source.get("description"),
+            config=source_config or None,
+        )
+        new_id = str(new_workspace["workspace_id"])
+        if source_tier != "standard":
+            await db_set_workspace_resource_tier(new_id, source_tier)
+
+        # 2. Copy files (dest row now exists).
+        await copy_workspace_files(source_id, new_id)
+
+        logger.info(
+            f"Duplicating workspace {source_id} -> {new_id} for user {user_id}"
+        )
+
+        async with self._observed_lock(
+            new_id, "workspace.duplicate", user_id=_obs_hash_id(user_id)
+        ):
+            try:
+                # 3. Create the sandbox eagerly (mirror create_workspace). Eager
+                #    is mandatory — a NULL sandbox_id would make _restart_workspace
+                #    raise on the next start.
+                sandbox_tokens = await self._mint_sandbox_tokens(user_id, new_id)
+                core_config = self.config.to_core_config()
+                session = SessionManager.get_session(new_id, core_config)
+                # Create the copy at the carried tier directly — hosted Daytona
+                # can't resize after the fact, so size is baked in at creation
+                # via the tier snapshot. The copy is not always-on (new rows
+                # default to auto-stop enabled), so no auto_stop override.
+                await session.initialize(
+                    sandbox_tokens=sandbox_tokens,
+                    user_id=user_id,
+                    workspace_id=new_id,
+                    tier=source_tier,
+                )
+
+                await self._apply_session_mcp(new_id, user_id, session, ws_version=0)
+                await self._sync_sandbox_assets(
+                    new_id, user_id, session.sandbox, reusing_sandbox=False
+                )
+
+                # Restore the copied files (overwrites the seeded agent.md —
+                # intended; the copy should reflect the source's content).
+                if session.sandbox:
+                    await self._restore_files(new_id, session.sandbox)
+
+                self._sessions[new_id] = session
+
+                sandbox_id = (
+                    getattr(session.sandbox, "sandbox_id", None)
+                    if session.sandbox
+                    else None
+                )
+                new_workspace = await update_workspace_status(
+                    workspace_id=new_id,
+                    status="running",
+                    sandbox_id=sandbox_id,
+                )
+
+                self._record_sync(new_id)
+                await self._update_workspace_config_fields(
+                    new_id, self._sandbox_config_stamp()
+                )
+
+                logger.info(
+                    f"Workspace {new_id} duplicated with sandbox {sandbox_id}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to create sandbox for duplicated workspace {new_id}: {e}"
+                )
+                self._sessions.pop(new_id, None)
+                # Destroy the Daytona sandbox created before the failure
+                # (cleanup_session runs runtime.delete) so a half-built duplicate
+                # doesn't leave an orphaned, still-billed sandbox.
+                try:
+                    await SessionManager.cleanup_session(new_id)
+                except Exception as cleanup_err:
+                    logger.warning(
+                        f"Failed to destroy orphaned sandbox for duplicated "
+                        f"workspace {new_id}: {cleanup_err}"
+                    )
+                await update_workspace_status(workspace_id=new_id, status="error")
+                raise
+
+        # The carried tier was baked into the sandbox at creation (above), so no
+        # post-create resize is needed.
+        return new_workspace
+
     async def delete_workspace(
         self,
         workspace_id: str,
@@ -2379,6 +2898,8 @@ class WorkspaceManager:
         Returns:
             Number of workspaces stopped
         """
+        from src.server.dependencies.usage_limits import always_on_entitlement_lost
+
         now = datetime.now(timezone.utc)
         stopped_count = 0
 
@@ -2387,7 +2908,40 @@ class WorkspaceManager:
 
         task_mgr = BackgroundTaskManager.get_instance()
 
+        # Per-cycle memo so a user with several always-on workspaces triggers one
+        # platform validate, not one per workspace.
+        entitlement_lost: dict[str, bool] = {}
+
         for workspace in running_workspaces:
+            if workspace.get("is_always_on"):
+                # This is the only periodic loop already walking always-on rows,
+                # so it doubles as the entitlement reconciler. Still entitled —
+                # or the platform can't confirm otherwise (fail-safe) — keeps the
+                # workspace exempt from idle reaping, as before.
+                user_id = str(workspace["user_id"])
+                if user_id not in entitlement_lost:
+                    entitlement_lost[user_id] = await always_on_entitlement_lost(
+                        user_id
+                    )
+                if not entitlement_lost[user_id]:
+                    continue
+                # Entitlement gone (e.g. plan downgraded): clear the flag — which
+                # also retires the live Daytona auto-stop — then fall through so a
+                # now-idle sandbox is reaped this tick and an in-use one stops when
+                # it next goes idle (no mid-use yank).
+                workspace_id = str(workspace["workspace_id"])
+                logger.info(
+                    f"Always-on entitlement lost for workspace {workspace_id} "
+                    f"(user {user_id}); disabling always-on"
+                )
+                try:
+                    await self.set_workspace_always_on(workspace_id, False)
+                except Exception as e:
+                    logger.error(
+                        f"Error disabling always-on for {workspace_id}: {e}"
+                    )
+                    continue
+
             last_activity = workspace.get("last_activity_at")
             if not last_activity:
                 # Never used, skip

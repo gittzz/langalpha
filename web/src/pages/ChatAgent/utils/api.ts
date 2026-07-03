@@ -4,6 +4,7 @@
  */
 import { api } from '@/api/client';
 import { supabase } from '@/lib/supabase';
+import type { WorkspaceQuota } from '@/types/api';
 
 const baseURL = api.defaults.baseURL;
 
@@ -59,6 +60,13 @@ export function formatApiErrorDetail(err: unknown): string {
   return typeof message === 'string' && message ? message : 'Request failed';
 }
 
+/** Extract the HTTP status code from an axios error, or null if absent. */
+export function apiErrorStatus(err: unknown): number | null {
+  const status = (err as { response?: { status?: unknown }; status?: unknown })?.response?.status
+    ?? (err as { status?: unknown })?.status;
+  return typeof status === 'number' ? status : null;
+}
+
 // --- Workspaces ---
 
 export async function getWorkspaces(limit: number = 20, offset: number = 0, sortBy: string = 'custom', includeFlash: boolean = false) {
@@ -105,6 +113,57 @@ export async function updateWorkspace(workspaceId: string, updates: Record<strin
 export async function reorderWorkspaces(items: Array<{ workspace_id: string; sort_order: number }>) {
   if (!items?.length) throw new Error('Reorder items are required');
   await api.post('/api/v1/workspaces/reorder', { items });
+}
+
+/**
+ * Rename a workspace. Thin wrapper over the existing update endpoint
+ * (PUT /api/v1/workspaces/{id} with { name }).
+ */
+export async function renameWorkspace(workspaceId: string, name: string) {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.put(`/api/v1/workspaces/${workspaceId}`, { name });
+  return data;
+}
+
+/**
+ * Change a workspace's sandbox resource tier (standard / performance / max).
+ * In platform mode the backend gates elevated tiers: 403 (not on plan) or
+ * 429 (workspace count limit reached). OSS mode is ungated.
+ */
+export async function setWorkspaceSpec(workspaceId: string, tier: string) {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/spec`, { tier });
+  return data;
+}
+
+/**
+ * Toggle always-on (keep the sandbox running, disable idle auto-stop).
+ * In platform mode enabling is gated (403 not on plan / 429 limit reached);
+ * disabling is always allowed. OSS mode is ungated.
+ */
+export async function setWorkspaceAlwaysOn(workspaceId: string, enabled: boolean) {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/always-on`, { enabled });
+  return data;
+}
+
+/**
+ * Duplicate a workspace (copies persisted files; always-on is reset to off on
+ * the copy so it re-checks entitlement). Returns the new workspace record.
+ */
+export async function duplicateWorkspace(workspaceId: string) {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/duplicate`);
+  return data;
+}
+
+/**
+ * Fetch per-tier workspace count quotas. Platform mode only — every field is null
+ * in OSS mode, so callers should treat null as "no limit to show".
+ */
+export async function getWorkspaceQuota(): Promise<WorkspaceQuota> {
+  const { data } = await api.get('/api/v1/workspaces/quota');
+  return data;
 }
 
 export interface WorkspaceActionResponse {

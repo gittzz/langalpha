@@ -34,6 +34,10 @@ export interface Workspace {
   status?: string;
   description?: string;
   config?: Record<string, unknown>;
+  /** Sandbox resource tier: 'standard' | 'performance' | 'max'. */
+  resource_tier: string;
+  /** Keep the sandbox running (idle auto-stop disabled). */
+  is_always_on: boolean;
   created_at?: string;
   updated_at?: string;
   [key: string]: unknown;
@@ -42,6 +46,22 @@ export interface Workspace {
 export interface WorkspacesResponse {
   workspaces: Workspace[];
   total?: number;
+}
+
+/** Count-quota status for one elevated capability. `limit === -1` means unlimited. */
+export interface WorkspaceCapacity {
+  used: number;
+  limit: number;
+}
+
+/**
+ * Per-capability workspace quotas (platform mode only). Each field is null when the
+ * quota does not apply — OSS mode, the platform is unreachable, or no count reported.
+ */
+export interface WorkspaceQuota {
+  performance: WorkspaceCapacity | null;
+  max: WorkspaceCapacity | null;
+  always_on: WorkspaceCapacity | null;
 }
 
 export interface ReorderItem {

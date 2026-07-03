@@ -32,6 +32,7 @@ export const queryKeys = {
     list:   (params: Record<string, unknown>) => [...queryKeys.workspaces.lists(), params],
     detail: (id: string) => [...queryKeys.workspaces.all, 'detail', id],
     flash:  () => [...queryKeys.workspaces.all, 'flash'],
+    quota:  () => [...queryKeys.workspaces.all, 'quota'],
   },
   threads: {
     all:         ['threads'],

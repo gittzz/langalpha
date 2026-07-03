@@ -49,7 +49,7 @@ async def get_or_create_flash_workspace(
             ON CONFLICT (workspace_id) DO UPDATE SET updated_at = NOW(), is_pinned = TRUE
             RETURNING workspace_id, user_id, name, description, sandbox_id,
                       status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                      is_pinned, sort_order
+                      is_pinned, sort_order, resource_tier, is_always_on
             """,
             (workspace_id, user_id, "Flash", "Flash mode conversations", config_json, "flash"),
         )
@@ -115,7 +115,7 @@ async def create_workspace(
                     VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING workspace_id, user_id, name, description, sandbox_id,
                               status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                              is_pinned, sort_order
+                              is_pinned, sort_order, resource_tier, is_always_on
                     """,
                     (workspace_id, user_id, name, description, config_json, status),
                 )
@@ -127,7 +127,7 @@ async def create_workspace(
                     VALUES (%s, %s, %s, %s, %s)
                     RETURNING workspace_id, user_id, name, description, sandbox_id,
                               status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                              is_pinned, sort_order
+                              is_pinned, sort_order, resource_tier, is_always_on
                     """,
                     (user_id, name, description, config_json, status),
                 )
@@ -177,7 +177,7 @@ async def get_workspace(
                 """
                 SELECT workspace_id, user_id, name, description, sandbox_id,
                        status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                       is_pinned, sort_order, mcp_config_version
+                       is_pinned, sort_order, resource_tier, is_always_on, mcp_config_version
                 FROM workspaces
                 WHERE workspace_id = %s AND status != 'deleted'
                 """,
@@ -258,7 +258,7 @@ async def get_workspaces_for_user(
                 f"""
                 SELECT workspace_id, user_id, name, description, sandbox_id,
                        status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                       is_pinned, sort_order
+                       is_pinned, sort_order, resource_tier, is_always_on
                 FROM workspaces
                 WHERE user_id = %s {status_filter} {flash_filter}
                 ORDER BY {order_clause}
@@ -344,7 +344,7 @@ async def update_workspace(
                 WHERE workspace_id = %s AND status != 'deleted'
                 RETURNING workspace_id, user_id, name, description, sandbox_id,
                           status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                          is_pinned, sort_order
+                          is_pinned, sort_order, resource_tier, is_always_on
                 """,
                 params,
             )
@@ -398,7 +398,7 @@ async def update_workspace_status(
                     WHERE workspace_id = %s
                     RETURNING workspace_id, user_id, name, description, sandbox_id,
                               status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                              is_pinned, sort_order
+                              is_pinned, sort_order, resource_tier, is_always_on
                 """
                 params = (status, sandbox_id, now, now, workspace_id)
             else:
@@ -408,7 +408,7 @@ async def update_workspace_status(
                     WHERE workspace_id = %s
                     RETURNING workspace_id, user_id, name, description, sandbox_id,
                               status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                              is_pinned, sort_order
+                              is_pinned, sort_order, resource_tier, is_always_on
                 """
                 params = (status, sandbox_id, now, workspace_id)
         else:
@@ -419,7 +419,7 @@ async def update_workspace_status(
                     WHERE workspace_id = %s
                     RETURNING workspace_id, user_id, name, description, sandbox_id,
                               status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                              is_pinned, sort_order
+                              is_pinned, sort_order, resource_tier, is_always_on
                 """
                 params = (status, now, now, workspace_id)
             else:
@@ -429,7 +429,7 @@ async def update_workspace_status(
                     WHERE workspace_id = %s
                     RETURNING workspace_id, user_id, name, description, sandbox_id,
                               status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                              is_pinned, sort_order
+                              is_pinned, sort_order, resource_tier, is_always_on
                 """
                 params = (status, now, workspace_id)
 
@@ -485,7 +485,7 @@ async def try_claim_workspace_for_start(
             WHERE workspace_id = %s AND status = 'stopped'
             RETURNING workspace_id, user_id, name, description, sandbox_id,
                       status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                      is_pinned, sort_order
+                      is_pinned, sort_order, resource_tier, is_always_on
         """
         params = (now, workspace_id)
 
@@ -506,6 +506,90 @@ async def try_claim_workspace_for_start(
 
     except Exception as e:
         logger.error(f"Error claiming workspace {workspace_id} for start: {e}")
+        raise
+
+
+async def set_workspace_resource_tier(
+    workspace_id: str,
+    tier: str,
+    *,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """Set the workspace resource tier; returns updated row, or None if not found."""
+    try:
+        now = datetime.now(timezone.utc)
+
+        async def _execute(cur):
+            await cur.execute(
+                """
+                UPDATE workspaces
+                SET resource_tier = %s, updated_at = %s
+                WHERE workspace_id = %s AND status != 'deleted'
+                RETURNING workspace_id, user_id, name, description, sandbox_id,
+                          status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
+                          is_pinned, sort_order, resource_tier, is_always_on
+                """,
+                (tier, now, workspace_id),
+            )
+            return await cur.fetchone()
+
+        if conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                result = await _execute(cur)
+        else:
+            async with get_db_connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    result = await _execute(cur)
+
+        if result:
+            logger.info(f"Set workspace {workspace_id} resource_tier to: {tier}")
+            return dict(result)
+        return None
+
+    except Exception as e:
+        logger.error(f"Error setting workspace {workspace_id} resource_tier: {e}")
+        raise
+
+
+async def set_workspace_always_on(
+    workspace_id: str,
+    enabled: bool,
+    *,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """Set the workspace always-on flag; returns updated row, or None if not found."""
+    try:
+        now = datetime.now(timezone.utc)
+
+        async def _execute(cur):
+            await cur.execute(
+                """
+                UPDATE workspaces
+                SET is_always_on = %s, updated_at = %s
+                WHERE workspace_id = %s AND status != 'deleted'
+                RETURNING workspace_id, user_id, name, description, sandbox_id,
+                          status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
+                          is_pinned, sort_order, resource_tier, is_always_on
+                """,
+                (enabled, now, workspace_id),
+            )
+            return await cur.fetchone()
+
+        if conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                result = await _execute(cur)
+        else:
+            async with get_db_connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    result = await _execute(cur)
+
+        if result:
+            logger.info(f"Set workspace {workspace_id} is_always_on to: {enabled}")
+            return dict(result)
+        return None
+
+    except Exception as e:
+        logger.error(f"Error setting workspace {workspace_id} is_always_on: {e}")
         raise
 
 
@@ -695,7 +779,7 @@ async def get_workspaces_by_status(
                 """
                 SELECT workspace_id, user_id, name, description, sandbox_id,
                        status, created_at, updated_at, last_activity_at, stopped_at, config, artifacts,
-                       is_pinned, sort_order
+                       is_pinned, sort_order, resource_tier, is_always_on
                 FROM workspaces
                 WHERE status = %s
                 ORDER BY last_activity_at ASC NULLS FIRST

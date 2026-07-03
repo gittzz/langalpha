@@ -10,7 +10,8 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -30,6 +31,27 @@ def _make_config():
     config.sandbox = MagicMock(provider="daytona")
     config.filesystem = MagicMock(working_directory="/home/workspace")
     config.skills = MagicMock(enabled=False)
+    return config
+
+
+def _make_config_with_tiers():
+    """Config whose daytona block exposes real resource tiers + auto-stop.
+
+    ``set_workspace_spec`` reads ``resource_tiers`` (a real dict of tiers with a
+    ``.disk`` attr) to validate the tier and compute downgrade-vs-upgrade, which
+    the bare ``_make_config()`` MagicMock can't provide.
+    """
+    config = _make_config()
+    config.sandbox = MagicMock(provider="daytona")
+    config.sandbox.daytona = MagicMock(
+        resource_tiers={
+            "standard": SimpleNamespace(cpu=1, memory=1, disk=3),
+            "performance": SimpleNamespace(cpu=2, memory=4, disk=5),
+            "max": SimpleNamespace(cpu=4, memory=8, disk=10),
+        },
+        default_tier="standard",
+        auto_stop_interval=3600,
+    )
     return config
 
 
@@ -396,6 +418,125 @@ class TestCleanupIdle:
 
         assert count == 0
         mock_stop.assert_not_awaited()
+
+    # --- always-on entitlement reconciliation (bundled into the idle sweep) ---
+
+    @pytest.mark.asyncio
+    @patch("src.server.dependencies.usage_limits.always_on_entitlement_lost", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.get_workspaces_by_status", new_callable=AsyncMock)
+    async def test_cleanup_always_on_entitled_stays_exempt(
+        self, mock_get_by_status, mock_lost
+    ):
+        """A long-idle always-on workspace whose owner is still entitled is
+        neither disabled nor reaped — the idle exemption holds."""
+        old_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        mock_get_by_status.return_value = [
+            _make_workspace(is_always_on=True, last_activity_at=old_time),
+        ]
+        mock_lost.return_value = False
+
+        wm = WorkspaceManager(_make_config(), idle_timeout=1800)
+        with (
+            patch.object(wm, "stop_workspace", new_callable=AsyncMock) as mock_stop,
+            patch.object(wm, "set_workspace_always_on", new_callable=AsyncMock) as mock_disable,
+        ):
+            count = await wm.cleanup_idle_workspaces()
+
+        assert count == 0
+        mock_stop.assert_not_awaited()
+        mock_disable.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("src.server.dependencies.usage_limits.always_on_entitlement_lost", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.get_workspaces_by_status", new_callable=AsyncMock)
+    async def test_cleanup_always_on_lost_idle_disables_and_reaps(
+        self, mock_get_by_status, mock_lost
+    ):
+        """Lost entitlement clears always-on, then the now-normal idle workspace
+        is reaped in the same tick."""
+        ws_id = str(uuid.uuid4())
+        old_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        mock_get_by_status.return_value = [
+            _make_workspace(
+                workspace_id=ws_id, is_always_on=True, last_activity_at=old_time
+            ),
+        ]
+        mock_lost.return_value = True
+
+        wm = WorkspaceManager(_make_config(), idle_timeout=1800)
+        with (
+            patch.object(wm, "stop_workspace", new_callable=AsyncMock) as mock_stop,
+            patch.object(wm, "set_workspace_always_on", new_callable=AsyncMock) as mock_disable,
+        ):
+            count = await wm.cleanup_idle_workspaces()
+
+        mock_disable.assert_awaited_once_with(ws_id, False)
+        mock_stop.assert_awaited_once_with(ws_id)
+        assert count == 1
+
+    @pytest.mark.asyncio
+    @patch("src.server.dependencies.usage_limits.always_on_entitlement_lost", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.get_workspaces_by_status", new_callable=AsyncMock)
+    async def test_cleanup_always_on_lost_active_disables_without_stop(
+        self, mock_get_by_status, mock_lost
+    ):
+        """Lost entitlement on an actively-used workspace clears always-on but
+        does NOT stop it mid-use — it idle-stops on a later tick."""
+        ws_id = str(uuid.uuid4())
+        mock_get_by_status.return_value = [
+            _make_workspace(
+                workspace_id=ws_id,
+                is_always_on=True,
+                last_activity_at=datetime.now(timezone.utc),
+            ),
+        ]
+        mock_lost.return_value = True
+
+        wm = WorkspaceManager(_make_config(), idle_timeout=1800)
+        with (
+            patch.object(wm, "stop_workspace", new_callable=AsyncMock) as mock_stop,
+            patch.object(wm, "set_workspace_always_on", new_callable=AsyncMock) as mock_disable,
+        ):
+            count = await wm.cleanup_idle_workspaces()
+
+        mock_disable.assert_awaited_once_with(ws_id, False)
+        mock_stop.assert_not_awaited()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    @patch("src.server.dependencies.usage_limits.always_on_entitlement_lost", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.get_workspaces_by_status", new_callable=AsyncMock)
+    async def test_cleanup_always_on_validate_memoized_per_user(
+        self, mock_get_by_status, mock_lost
+    ):
+        """Two always-on workspaces for one user trigger a single platform
+        validate, not one per workspace."""
+        old_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        mock_get_by_status.return_value = [
+            _make_workspace(
+                workspace_id=str(uuid.uuid4()),
+                user_id="user-1",
+                is_always_on=True,
+                last_activity_at=old_time,
+            ),
+            _make_workspace(
+                workspace_id=str(uuid.uuid4()),
+                user_id="user-1",
+                is_always_on=True,
+                last_activity_at=old_time,
+            ),
+        ]
+        mock_lost.return_value = True
+
+        wm = WorkspaceManager(_make_config(), idle_timeout=1800)
+        with (
+            patch.object(wm, "stop_workspace", new_callable=AsyncMock),
+            patch.object(wm, "set_workspace_always_on", new_callable=AsyncMock) as mock_disable,
+        ):
+            await wm.cleanup_idle_workspaces()
+
+        mock_lost.assert_awaited_once_with("user-1")
+        assert mock_disable.await_count == 2
 
 
 class TestReapStuckStarting:
@@ -844,6 +985,38 @@ class TestSandboxRecovery:
         assert result is not None
 
     @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_recover_sandbox_failure_destroys_orphan(
+        self, mock_get_ws, mock_session_mgr, mock_status
+    ):
+        """A failure after the new sandbox is created tears it down via
+        cleanup_session, so a half-built recreate never orphans a billed sandbox."""
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = _make_workspace(
+            workspace_id=ws_id, status="running", resource_tier="standard"
+        )
+
+        session = _make_mock_session()
+        mock_session_mgr.get_session.return_value = session
+        mock_session_mgr.cleanup_session = AsyncMock()
+
+        manager._mint_sandbox_tokens = AsyncMock(return_value={})
+        manager._apply_session_mcp = AsyncMock(return_value=None)
+        manager._sync_sandbox_assets = AsyncMock()
+        # Sandbox is created (initialize ok) but a later step fails.
+        manager._restore_files = AsyncMock(side_effect=RuntimeError("restore boom"))
+
+        with pytest.raises(RuntimeError, match="restore boom"):
+            await manager._recover_sandbox(ws_id, "user-1", MagicMock())
+
+        mock_session_mgr.cleanup_session.assert_awaited_once_with(ws_id)
+        # Broken session not left in the cache.
+        assert ws_id not in manager._sessions
+
+    @pytest.mark.asyncio
     @patch("src.server.services.workspace_manager.db_get_workspace")
     async def test_cache_hit_still_initializing_returns(self, mock_get_ws):
         """Sandbox still initializing → returns session immediately, no recovery."""
@@ -1101,6 +1274,46 @@ class TestSandboxRecovery:
         # activity stamp. Reversing the order would leave a larger window
         # where cleanup_idle_workspaces could stop the workspace.
         assert call_order == ["status", "activity"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("always_on", [True, False])
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    async def test_restart_reseeds_autostop_in_both_directions(
+        self, mock_activity, mock_status, mock_session_mgr, always_on
+    ):
+        """REGRESSION: a plain reconnect must reseed the live auto-stop interval
+        from the current is_always_on flag in BOTH directions. Re-asserting only
+        the enable direction left a workspace whose always-on was disabled while
+        stopped pinned at interval 0 (never auto-stops) until a full recreate —
+        the disable healed only on recreate, not on the cheaper reconnect.
+        """
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        workspace = _make_workspace(
+            workspace_id=ws_id, status="stopped", is_always_on=always_on
+        )
+
+        session = _make_mock_session()
+        mock_session_mgr.get_session.return_value = session
+
+        # Patch non-focus internals so execution reaches the reconnect reseed.
+        manager._sync_sandbox_assets = AsyncMock()
+        manager._maybe_restore_files = AsyncMock()
+        manager._maybe_migrate_sandbox = AsyncMock(return_value=None)
+        manager._apply_autostop_for_always_on = AsyncMock()
+
+        await manager._restart_workspace(
+            workspace, user_id="user-1", lazy_init=False
+        )
+
+        # enabled tracks the flag exactly — True keeps interval 0, False
+        # restores the default so the sandbox can auto-stop again. The non-lazy
+        # reconnect reuses the live runtime, so it's passed through as ``runtime``.
+        manager._apply_autostop_for_always_on.assert_awaited_once_with(
+            "sandbox-abc", enabled=always_on, runtime=ANY
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2037,3 +2250,319 @@ class TestMultiWorkerStartMutex:
 
         assert mock_claim.await_count == 2
         session.initialize_lazy.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# set_workspace_spec — tier change recreates the sandbox (hosted Daytona can't
+# resize a snapshot sandbox). Persist-then-revert on failure; guards against
+# tearing the sandbox out from under a live turn or a too-small disk.
+# ---------------------------------------------------------------------------
+
+
+class TestSetWorkspaceSpec:
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+
+    def teardown_method(self):
+        WorkspaceManager.reset_instance()
+
+    def _make_manager(self):
+        return WorkspaceManager.get_instance(config=_make_config_with_tiers())
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_unknown_tier_raises_before_db(self, mock_get_ws):
+        """An unknown tier is rejected before any DB read."""
+        manager = self._make_manager()
+        with pytest.raises(ValueError, match="Unknown resource tier"):
+            await manager.set_workspace_spec("ws-1", "titanium")
+        mock_get_ws.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_never_started_persists_tier_only(self, mock_get_ws, mock_set_tier):
+        """No sandbox yet → just persist the tier; no recreate."""
+        manager = self._make_manager()
+        ws = _make_workspace(status="creating", sandbox_id=None, resource_tier="standard")
+        mock_get_ws.return_value = ws
+        manager._recover_sandbox = AsyncMock()
+
+        await manager.set_workspace_spec(ws["workspace_id"], "performance")
+
+        mock_set_tier.assert_awaited_once_with(ws["workspace_id"], "performance")
+        manager._recover_sandbox.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_already_at_tier_is_noop(self, mock_get_ws, mock_set_tier):
+        """Same tier + live sandbox → early return, nothing persisted."""
+        manager = self._make_manager()
+        ws = _make_workspace(status="running", sandbox_id="sb-1", resource_tier="max")
+        mock_get_ws.return_value = ws
+
+        result = await manager.set_workspace_spec(ws["workspace_id"], "max")
+
+        assert result is ws
+        mock_set_tier.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.BackgroundTaskManager")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_running_recreate_failure_marks_error_and_reverts_tier(
+        self, mock_get_ws, mock_set_tier, mock_status, mock_session_mgr, mock_btm
+    ):
+        """A failed recreate flips the row to error AND reverts the persisted tier."""
+        manager = self._make_manager()
+        ws = _make_workspace(status="running", sandbox_id="sb-1", resource_tier="standard")
+        mock_get_ws.return_value = ws
+        mock_btm.get_instance.return_value.has_active_tasks_for_workspace = AsyncMock(
+            return_value=False
+        )
+        mock_session_mgr.cleanup_session = AsyncMock()
+        manager._backup_files_to_db = AsyncMock()
+        manager._recover_sandbox = AsyncMock(side_effect=RuntimeError("snapshot build failed"))
+
+        with pytest.raises(RuntimeError, match="snapshot build failed"):
+            await manager.set_workspace_spec(ws["workspace_id"], "max", user_id="user-1")
+
+        # Row marked error so it stops claiming 'running' on a dead sandbox.
+        mock_status.assert_awaited_once_with(workspace_id=ws["workspace_id"], status="error")
+        # Tier persisted to the target first, then reverted on the outer except.
+        assert mock_set_tier.await_args_list[0].args == (ws["workspace_id"], "max")
+        assert mock_set_tier.await_args_list[-1].args == (ws["workspace_id"], "standard")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.BackgroundTaskManager")
+    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_running_with_active_turn_refuses_and_reverts(
+        self, mock_get_ws, mock_set_tier, mock_btm
+    ):
+        """An in-flight agent turn blocks the recreate (would abort execute_code)."""
+        manager = self._make_manager()
+        ws = _make_workspace(status="running", sandbox_id="sb-1", resource_tier="standard")
+        mock_get_ws.return_value = ws
+        mock_btm.get_instance.return_value.has_active_tasks_for_workspace = AsyncMock(
+            return_value=True
+        )
+        manager._backup_files_to_db = AsyncMock()
+        manager._recover_sandbox = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="agent turn is running"):
+            await manager.set_workspace_spec(ws["workspace_id"], "max", user_id="user-1")
+
+        # Refused before any teardown; tier reverted to the original.
+        manager._backup_files_to_db.assert_not_awaited()
+        manager._recover_sandbox.assert_not_awaited()
+        assert mock_set_tier.await_args_list[-1].args == (ws["workspace_id"], "standard")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_stopped_destroys_sandbox_for_recreate_on_next_start(
+        self, mock_get_ws, mock_set_tier
+    ):
+        """A stopped sandbox is destroyed so the next start rebuilds it at the new tier."""
+        manager = self._make_manager()
+        ws = _make_workspace(status="stopped", sandbox_id="sb-1", resource_tier="standard")
+        mock_get_ws.return_value = ws
+        manager._destroy_sandbox = AsyncMock()
+
+        await manager.set_workspace_spec(ws["workspace_id"], "max", user_id="user-1")
+
+        manager._destroy_sandbox.assert_awaited_once_with("sb-1")
+        # Upgrade succeeds → tier stays at the target, never reverted.
+        assert mock_set_tier.await_args_list[-1].args == (ws["workspace_id"], "max")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.get_workspace_total_size")
+    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_downgrade_rejected_when_files_exceed_target_disk(
+        self, mock_get_ws, mock_set_tier, mock_size
+    ):
+        """A downgrade whose backed-up files overflow the smaller disk is refused."""
+        manager = self._make_manager()
+        # max (10 GiB) → standard (3 GiB); 100 GiB of files won't fit.
+        ws = _make_workspace(status="stopped", sandbox_id="sb-1", resource_tier="max")
+        mock_get_ws.return_value = ws
+        mock_size.return_value = 100 * 1024**3
+        manager._destroy_sandbox = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="Cannot downgrade"):
+            await manager.set_workspace_spec(ws["workspace_id"], "standard", user_id="user-1")
+
+        # Refused before teardown; tier reverted to the original.
+        manager._destroy_sandbox.assert_not_awaited()
+        assert mock_set_tier.await_args_list[-1].args == (ws["workspace_id"], "max")
+
+
+# ---------------------------------------------------------------------------
+# duplicate_workspace — copy files + carried tier into a fresh "<name> (copy)";
+# re-check the spec entitlement (a duplicate is a new allocation); eager
+# sandbox create; mark the new row error on create failure.
+# ---------------------------------------------------------------------------
+
+
+class TestDuplicateWorkspace:
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+
+    def teardown_method(self):
+        WorkspaceManager.reset_instance()
+
+    def _make_manager(self):
+        return WorkspaceManager.get_instance(config=_make_config())
+
+    def _install_create_path(self, manager, session):
+        """Stub the eager-create collaborators so the lock body runs clean."""
+        manager._mint_sandbox_tokens = AsyncMock(return_value={})
+        manager._apply_session_mcp = AsyncMock()
+        manager._sync_sandbox_assets = AsyncMock()
+        manager._restore_files = AsyncMock()
+        manager._record_sync = MagicMock()
+        manager._update_workspace_config_fields = AsyncMock()
+        manager._sandbox_config_stamp = MagicMock(return_value={})
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_missing_source_rejected(self, mock_get_ws):
+        manager = self._make_manager()
+        mock_get_ws.return_value = None
+        with pytest.raises(ValueError, match="not found"):
+            await manager.duplicate_workspace("ws-x", "user-1")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_not_owned_rejected(self, mock_get_ws):
+        manager = self._make_manager()
+        mock_get_ws.return_value = _make_workspace(user_id="someone-else")
+        with pytest.raises(ValueError, match="not found"):
+            await manager.duplicate_workspace("ws-x", "user-1")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_flash_source_rejected(self, mock_get_ws):
+        manager = self._make_manager()
+        mock_get_ws.return_value = _make_workspace(status="flash", user_id="user-1")
+        with pytest.raises(ValueError, match="flash"):
+            await manager.duplicate_workspace("ws-x", "user-1")
+
+    @pytest.mark.asyncio
+    @patch("src.server.dependencies.usage_limits.assert_spec_allowed")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.copy_workspace_files")
+    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier")
+    @patch("src.server.services.workspace_manager.db_create_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_carries_tier_and_strips_sandbox_stamps(
+        self, mock_get_ws, mock_session_mgr, mock_create, mock_set_tier,
+        mock_copy, mock_status, mock_assert_spec,
+    ):
+        """Entitled duplicate of an elevated workspace carries the tier and drops
+        the source's sandbox-identity stamps from the copied config."""
+        manager = self._make_manager()
+        source = _make_workspace(
+            status="stopped",
+            user_id="user-1",
+            resource_tier="max",
+            config={
+                "custom": "keep-me",
+                "sandbox_config_hash": "abc",
+                "sandbox_provider": "daytona",
+                "sandbox_working_dir": "/home/workspace",
+            },
+        )
+        mock_get_ws.return_value = source
+        new_id = str(uuid.uuid4())
+        mock_create.return_value = {"workspace_id": new_id}
+        mock_status.return_value = _make_workspace(workspace_id=new_id, status="running")
+        mock_assert_spec.return_value = None  # entitled
+
+        session = _make_mock_session()
+        mock_session_mgr.get_session.return_value = session
+        self._install_create_path(manager, session)
+
+        result = await manager.duplicate_workspace(source["workspace_id"], "user-1")
+
+        # A duplicate is a new allocation → re-check the carried tier's entitlement.
+        mock_assert_spec.assert_awaited_once_with("user-1", "max", current_tier="standard")
+        mock_set_tier.assert_awaited_once_with(new_id, "max")
+        mock_copy.assert_awaited_once_with(source["workspace_id"], new_id)
+        # Sandbox-identity stamps stripped; unrelated config keys preserved.
+        assert mock_create.call_args.kwargs["config"] == {"custom": "keep-me"}
+        # Copy's sandbox built at the carried tier (hosted Daytona can't resize later).
+        assert session.initialize.await_args.kwargs["tier"] == "max"
+        mock_status.assert_awaited_once_with(
+            workspace_id=new_id, status="running", sandbox_id="sandbox-abc"
+        )
+        assert result["status"] == "running"
+
+    @pytest.mark.asyncio
+    @patch("src.server.dependencies.usage_limits.assert_spec_allowed")
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.copy_workspace_files")
+    @patch("src.server.services.workspace_manager.db_set_workspace_resource_tier")
+    @patch("src.server.services.workspace_manager.db_create_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_entitlement_lost_downgrades_copy_to_standard(
+        self, mock_get_ws, mock_session_mgr, mock_create, mock_set_tier,
+        mock_copy, mock_status, mock_assert_spec,
+    ):
+        """If the user is no longer entitled to the source's tier, the copy is
+        created at standard instead of failing the duplicate."""
+        from fastapi import HTTPException
+
+        manager = self._make_manager()
+        source = _make_workspace(status="stopped", user_id="user-1", resource_tier="performance")
+        mock_get_ws.return_value = source
+        new_id = str(uuid.uuid4())
+        mock_create.return_value = {"workspace_id": new_id}
+        mock_status.return_value = _make_workspace(workspace_id=new_id, status="running")
+        mock_assert_spec.side_effect = HTTPException(403, detail="Requires scope: workspace:spec:performance")
+
+        session = _make_mock_session()
+        mock_session_mgr.get_session.return_value = session
+        self._install_create_path(manager, session)
+
+        await manager.duplicate_workspace(source["workspace_id"], "user-1")
+
+        # Fell back to standard → tier not carried, sandbox built at standard.
+        mock_set_tier.assert_not_awaited()
+        assert session.initialize.await_args.kwargs["tier"] == "standard"
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.copy_workspace_files")
+    @patch("src.server.services.workspace_manager.db_create_workspace")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_sandbox_create_failure_marks_new_row_error(
+        self, mock_get_ws, mock_session_mgr, mock_create, mock_copy, mock_status
+    ):
+        """A failed sandbox create marks the new row error and re-raises."""
+        manager = self._make_manager()
+        source = _make_workspace(status="stopped", user_id="user-1", resource_tier="standard")
+        mock_get_ws.return_value = source
+        new_id = str(uuid.uuid4())
+        mock_create.return_value = {"workspace_id": new_id}
+
+        session = _make_mock_session()
+        session.initialize = AsyncMock(side_effect=RuntimeError("sandbox boom"))
+        mock_session_mgr.get_session.return_value = session
+        mock_session_mgr.cleanup_session = AsyncMock()
+        self._install_create_path(manager, session)
+
+        with pytest.raises(RuntimeError, match="sandbox boom"):
+            await manager.duplicate_workspace(source["workspace_id"], "user-1")
+
+        mock_status.assert_awaited_once_with(workspace_id=new_id, status="error")
+        # Orphaned sandbox is torn down, not left billing.
+        mock_session_mgr.cleanup_session.assert_awaited_once_with(new_id)

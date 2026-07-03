@@ -411,11 +411,21 @@ class PTCSandbox:
 
         return env_vars
 
-    async def setup_sandbox_workspace(self) -> str | None:
+    async def setup_sandbox_workspace(
+        self,
+        *,
+        tier: str | None = None,
+        auto_stop_minutes: int | None = None,
+    ) -> str | None:
         """Create sandbox and setup workspace directories.
 
         Can run concurrently with MCP registry connection since it doesn't
         require the registry.
+
+        Args:
+            tier: Resource tier to size the new sandbox at (provider-resolved).
+            auto_stop_minutes: Auto-stop interval override in minutes (0 for
+                always-on); ``None`` uses the provider default.
 
         Returns:
             snapshot_name if used, None otherwise
@@ -432,6 +442,8 @@ class PTCSandbox:
             self.provider.create,
             env_vars=sandbox_env or None,
             mcp_packages=mcp_packages,
+            tier=tier,
+            auto_stop_minutes=auto_stop_minutes,
             retry_policy=RetryPolicy.SAFE,
             allow_reconnect=False,
         )

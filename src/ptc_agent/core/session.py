@@ -88,6 +88,8 @@ class Session:
         user_id: str | None = None,
         workspace_id: str | None = None,
         on_state_observed: Callable[[str], None] | None = None,
+        tier: str | None = None,
+        auto_stop_minutes: int | None = None,
     ) -> None:
         """Initialize the session (connect MCP servers and setup sandbox).
 
@@ -99,6 +101,10 @@ class Session:
             on_state_observed: Optional sync callback invoked with the initial
                 sandbox state string when reconnecting (ignored on new-sandbox
                 path since state doesn't exist yet). See PTCSandbox.reconnect.
+            tier: Resource tier to size a newly-created sandbox at (ignored on the
+                reconnect path — an existing sandbox keeps its size).
+            auto_stop_minutes: Auto-stop interval override in minutes (0 for
+                always-on) applied to a newly-created sandbox.
         """
         if self._initialized:
             logger.warning(
@@ -157,7 +163,9 @@ class Session:
 
             try:
                 snapshot_name, _ = await asyncio.gather(
-                    self.sandbox.setup_sandbox_workspace(),
+                    self.sandbox.setup_sandbox_workspace(
+                        tier=tier, auto_stop_minutes=auto_stop_minutes
+                    ),
                     self.mcp_registry.connect_all(),
                 )
             except Exception:

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Plus, Loader2, Search, ArrowDownUp, MoreHorizontal, Zap, MessageSquareText, Pin, Trash2, GripVertical, Check, Pencil } from 'lucide-react';
+import { Plus, Loader2, Search, ArrowDownUp, MoreHorizontal, Zap, MessageSquareText, Pin, Trash2, GripVertical, Check, Pencil, Cpu, Copy, Infinity as InfinityIcon } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -8,14 +8,32 @@ import type { DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, useSortable, arrayMove, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { toast } from '@/components/ui/use-toast';
+import { isPlatformMode } from '@/config/hostMode';
 import CreateWorkspaceModal from './CreateWorkspaceModal';
 import DeleteConfirmModal from './DeleteConfirmModal';
 import MorphingPageDots from '../../../components/ui/morphing-page-dots';
 import { useIsMobile, getIsMobileSnapshot } from '@/hooks/useIsMobile';
 import { useWorkspaces } from '../../../hooks/useWorkspaces';
 import { queryKeys } from '../../../lib/queryKeys';
-import { createWorkspace, deleteWorkspace, getFlashWorkspace, updateWorkspace, reorderWorkspaces } from '../utils/api';
+import {
+  createWorkspace,
+  deleteWorkspace,
+  getFlashWorkspace,
+  updateWorkspace,
+  reorderWorkspaces,
+  renameWorkspace,
+  setWorkspaceSpec,
+  setWorkspaceAlwaysOn,
+  duplicateWorkspace,
+  getWorkspaceQuota,
+  formatApiErrorDetail,
+  apiErrorStatus,
+} from '../utils/api';
 import { removeStoredThreadId } from '../hooks/useChatMessages';
 import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
 import { forgetNavPanelExpansion } from './navExpansionStore';
@@ -23,6 +41,57 @@ import { forgetStableNavOrder, forgetSharedWorkspaceThreads } from '../hooks/use
 import { clearChatSession } from '../hooks/utils/chatSessionRestore';
 
 const DEFAULT_PAGE_SIZE = 8;
+
+type ResourceTier = 'standard' | 'performance' | 'max';
+
+// Spec presets shown in the change-spec dialog + the per-card tier badge.
+const TIER_OPTIONS: Array<{
+  id: ResourceTier;
+  label: string;
+  spec: string;
+}> = [
+  { id: 'standard', label: 'Standard', spec: '1 vCPU · 1 GB RAM · 3 GB disk' },
+  { id: 'performance', label: 'Performance', spec: '2 vCPU · 4 GB RAM · 5 GB disk' },
+  { id: 'max', label: 'Max', spec: '4 vCPU · 8 GB RAM · 10 GB disk' },
+];
+
+const TIER_LABEL: Record<string, string> = {
+  standard: 'Standard',
+  performance: 'Performance',
+  max: 'Max',
+};
+
+function normalizeTier(tier: unknown): ResourceTier {
+  return tier === 'performance' || tier === 'max' ? tier : 'standard';
+}
+
+/**
+ * Map a mutation error to user-facing copy. In platform mode the backend gates
+ * elevated tiers / always-on: 403 = capability not on plan, 429 = count limit
+ * reached. OSS mode never returns these, so we fall through to the generic
+ * detail message.
+ */
+function entitlementErrorMessage(
+  err: unknown,
+  t: ReturnType<typeof useTranslation>['t'],
+  tier?: ResourceTier,
+): string {
+  if (isPlatformMode) {
+    const status = apiErrorStatus(err);
+    if (status === 403) {
+      return t('workspace.notOnPlan', 'Not available on your plan — upgrade to unlock.');
+    }
+    if (status === 429) {
+      if (tier) {
+        return t('workspace.tierLimitReached', "You've reached your {{tier}} workspace limit.", {
+          tier: TIER_LABEL[tier] ?? tier,
+        });
+      }
+      return t('workspace.workspaceLimitReached', "You've reached your workspace limit.");
+    }
+  }
+  return formatApiErrorDetail(err);
+}
 
 interface WorkspaceRecord {
   workspace_id: string;
@@ -32,6 +101,8 @@ interface WorkspaceRecord {
   is_pinned?: boolean;
   sort_order?: number;
   updated_at?: string;
+  resource_tier?: string;
+  is_always_on?: boolean;
   [key: string]: unknown;
 }
 
@@ -74,11 +145,15 @@ interface CardMenuProps {
   workspace: WorkspaceRecord;
   onTogglePin: (workspace: WorkspaceRecord) => void;
   onRename: (workspace: WorkspaceRecord) => void;
+  onUpgrade: (workspace: WorkspaceRecord) => void;
+  onToggleAlwaysOn: (workspace: WorkspaceRecord) => void;
+  onDuplicate: (workspace: WorkspaceRecord) => void;
   onDelete: (workspace: WorkspaceRecord) => void;
 }
 
-function CardMenu({ workspace, onTogglePin, onRename, onDelete }: CardMenuProps) {
+function CardMenu({ workspace, onTogglePin, onRename, onUpgrade, onToggleAlwaysOn, onDuplicate, onDelete }: CardMenuProps) {
   const { t } = useTranslation();
+  const isAlwaysOn = workspace.is_always_on === true;
 
   return (
     <DropdownMenu modal={false}>
@@ -100,6 +175,22 @@ function CardMenu({ workspace, onTogglePin, onRename, onDelete }: CardMenuProps)
           <Pencil className="h-4 w-4" />
           {t('workspace.rename')}
         </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => onUpgrade(workspace)}>
+          <Cpu className="h-4 w-4" />
+          {t('workspace.changeSpec', 'Change spec')}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onToggleAlwaysOn(workspace)}>
+          <InfinityIcon className="h-4 w-4" />
+          {isAlwaysOn
+            ? t('workspace.alwaysOnDisable', 'Turn off always-on')
+            : t('workspace.alwaysOnEnable', 'Turn on always-on')}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onDuplicate(workspace)}>
+          <Copy className="h-4 w-4" />
+          {t('workspace.duplicate', 'Duplicate')}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem variant="destructive" onSelect={() => onDelete(workspace)}>
           <Trash2 className="h-4 w-4" />
           {t('common.delete', 'Delete')}
@@ -185,13 +276,16 @@ interface WorkspaceCardProps {
   onRenameStart: (workspace: WorkspaceRecord) => void;
   onRenameSubmit: (wsId: string, name: string) => void;
   onRenameCancel: () => void;
+  onUpgrade: (workspace: WorkspaceRecord) => void;
+  onToggleAlwaysOn: (workspace: WorkspaceRecord) => void;
+  onDuplicate: (workspace: WorkspaceRecord) => void;
   onDelete: (workspace: WorkspaceRecord) => void;
   isRenaming?: boolean;
   prefetchThreads?: (wsId: string) => void;
   index?: number;
 }
 
-function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRenameSubmit, onRenameCancel, onDelete, isRenaming, prefetchThreads, index }: WorkspaceCardProps) {
+function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRenameSubmit, onRenameCancel, onUpgrade, onToggleAlwaysOn, onDuplicate, onDelete, isRenaming, prefetchThreads, index }: WorkspaceCardProps) {
   const { t, i18n } = useTranslation();
   const isMobile = useIsMobile();
   const isFlash = workspace.status === 'flash';
@@ -218,6 +312,10 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRena
     if (name && name !== workspace.name) onRenameSubmit(workspace.workspace_id, name);
     else onRenameCancel();
   };
+
+  const tier = normalizeTier(workspace.resource_tier);
+  const showTierBadge = !isFlash && tier !== 'standard';
+  const showAlwaysOn = !isFlash && workspace.is_always_on === true;
 
   return (
     <div
@@ -274,10 +372,34 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRena
             <div className="text-sm line-clamp-2 flex-grow" style={{ color: 'var(--color-text-tertiary)' }}>
               {workspace.description || ''}
             </div>
-            <div className="text-xs mt-auto pt-3 flex justify-between" style={{ color: 'var(--color-text-tertiary)' }}>
-              <span>
+            <div className="text-xs mt-auto pt-3 flex items-center justify-between gap-2" style={{ color: 'var(--color-text-tertiary)' }}>
+              <span className="truncate">
                 {t('workspace.updated', { time: workspace.updated_at ? new Date(workspace.updated_at).toLocaleDateString(i18n.language, { month: 'short', day: 'numeric' }) : t('workspace.recently') })}
               </span>
+              {(showTierBadge || showAlwaysOn) && (
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                  {showTierBadge && (
+                    <span
+                      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                      style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}
+                      title={t('workspace.tierBadgeTitle', { tier: TIER_LABEL[tier] ?? tier })}
+                    >
+                      <Cpu className="h-3 w-3" />
+                      {TIER_LABEL[tier] ?? tier}
+                    </span>
+                  )}
+                  {showAlwaysOn && (
+                    <span
+                      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                      style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-secondary)' }}
+                      title={t('workspace.alwaysOnBadgeTitle', 'Always-on — sandbox stays running')}
+                    >
+                      <InfinityIcon className="h-3 w-3" />
+                      {t('workspace.alwaysOnBadge', 'Always-on')}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -285,7 +407,15 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRena
         {/* Menu (no drag handle in normal mode) */}
         {!isFlash && (
           <div className={`absolute top-3 right-3 z-10 transition-opacity ${isMobile ? 'opacity-60' : 'opacity-0 group-focus-within:opacity-100 group-hover:opacity-100'}`}>
-            <CardMenu workspace={workspace} onTogglePin={onTogglePin} onRename={onRenameStart} onDelete={onDelete} />
+            <CardMenu
+              workspace={workspace}
+              onTogglePin={onTogglePin}
+              onRename={onRenameStart}
+              onUpgrade={onUpgrade}
+              onToggleAlwaysOn={onToggleAlwaysOn}
+              onDuplicate={onDuplicate}
+              onDelete={onDelete}
+            />
           </div>
         )}
       </div>
@@ -324,9 +454,24 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   const [allWorkspaces, setAllWorkspaces] = useState<WorkspaceRecord[]>([]);
   const [renamingWsId, setRenamingWsId] = useState<string | null>(null);
   const renamingWsIdRef = useRef<string | null>(null); // shadows state so the trailing blur-after-Enter no-ops
+  // Rename / Upgrade / Duplicate dialogs each target one workspace at a time.
+  const [renameTarget, setRenameTarget] = useState<WorkspaceRecord | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [upgradeTarget, setUpgradeTarget] = useState<WorkspaceRecord | null>(null);
+  const [upgradeTier, setUpgradeTier] = useState<ResourceTier>('standard');
+  const [upgradeBusy, setUpgradeBusy] = useState(false);
+  const [duplicateTarget, setDuplicateTarget] = useState<WorkspaceRecord | null>(null);
+  const [duplicateBusy, setDuplicateBusy] = useState(false);
+  // Enabling always-on bills 24/7, so it asks for confirmation first; disabling
+  // is harmless and toggles directly. The id set guards against double-submit on
+  // either path (per-workspace, since toggles fire from independent card menus).
+  const [alwaysOnTarget, setAlwaysOnTarget] = useState<WorkspaceRecord | null>(null);
+  const [alwaysOnBusyIds, setAlwaysOnBusyIds] = useState<Set<string>>(() => new Set());
   const navigate = useNavigate();
   const { workspaceId: currentWorkspaceId } = useParams();
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tierRadioRefs = useRef<Array<HTMLButtonElement | null>>([]); // roving-tabindex radiogroup focus
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const slideDirectionRef = useRef(0); // 1 = forward, -1 = back
   const skipInitialAnimRef = useRef(true); // skip slide animation on first render
@@ -359,6 +504,15 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
     queryKey: queryKeys.workspaces.flash(),
     queryFn: getFlashWorkspace,
     staleTime: 5 * 60_000,
+  });
+
+  // Per-tier count quotas — drives the "N left" hint in the change-spec dialog.
+  // Platform mode only, fetched lazily when the dialog opens; null in OSS mode.
+  const { data: workspaceQuota } = useQuery({
+    queryKey: queryKeys.workspaces.quota(),
+    queryFn: getWorkspaceQuota,
+    enabled: isPlatformMode && !!upgradeTarget,
+    staleTime: 60_000,
   });
 
   // Reorder mode: fetch all workspaces
@@ -646,11 +800,13 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   };
 
   /**
-   * Start an inline rename on a card (opens the title input).
+   * Open the rename dialog (the card menu's Rename action). The inline-edit
+   * path (handleRenameSubmit / renamingWsId) stays wired for any non-menu
+   * callers but the menu now routes through the dialog.
    */
   const handleRenameStart = (workspace: WorkspaceRecord) => {
-    renamingWsIdRef.current = workspace.workspace_id;
-    setRenamingWsId(workspace.workspace_id);
+    setRenameTarget(workspace);
+    setRenameDraft(workspace.name);
   };
 
   const handleRenameCancel = () => {
@@ -689,6 +845,181 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
     } catch (err) {
       previous.forEach(([key, data]: [unknown, unknown]) => queryClient.setQueryData(key as readonly unknown[], data));
       console.error('Error renaming workspace:', err);
+    }
+  };
+
+  /**
+   * Optimistically patch one workspace across all cached lists. Returns the
+   * snapshot so the caller can roll back on error (mirrors handleTogglePin).
+   */
+  const patchCachedWorkspace = useCallback((wsId: string, patch: Partial<WorkspaceRecord>) => {
+    const previous = queryClient.getQueriesData({ queryKey: queryKeys.workspaces.lists() });
+    previous.forEach(([key, data]: [unknown, unknown]) => {
+      const d = data as CachedWorkspaceList | undefined;
+      if (!d?.workspaces) return;
+      queryClient.setQueryData(key as readonly unknown[], {
+        ...d,
+        workspaces: d.workspaces.map((ws) =>
+          ws.workspace_id === wsId ? { ...ws, ...patch } : ws
+        ),
+      });
+    });
+    return previous;
+  }, [queryClient]);
+
+  const rollbackCachedWorkspaces = useCallback((previous: [unknown, unknown][]) => {
+    previous.forEach(([key, data]) => queryClient.setQueryData(key as readonly unknown[], data));
+  }, [queryClient]);
+
+  /**
+   * Commit the rename dialog: optimistic patch, persist, invalidate. On error
+   * roll back and surface a toast.
+   */
+  const handleRenameDialogSubmit = async () => {
+    if (!renameTarget) return;
+    const wsId = renameTarget.workspace_id;
+    const trimmed = renameDraft.trim();
+    if (!trimmed || trimmed === renameTarget.name) {
+      setRenameTarget(null);
+      return;
+    }
+    setRenameBusy(true);
+    const previous = patchCachedWorkspace(wsId, { name: trimmed });
+    try {
+      await renameWorkspace(wsId, trimmed);
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.detail(wsId) });
+      setRenameTarget(null);
+    } catch (err) {
+      rollbackCachedWorkspaces(previous);
+      console.error('Error renaming workspace:', err);
+      toast({ variant: 'destructive', title: t('workspace.renameFailed', 'Could not rename workspace'), description: formatApiErrorDetail(err) });
+    } finally {
+      setRenameBusy(false);
+    }
+  };
+
+  /**
+   * Open the upgrade-spec dialog, seeded with the workspace's current tier.
+   */
+  const handleUpgradeStart = (workspace: WorkspaceRecord) => {
+    setUpgradeTarget(workspace);
+    setUpgradeTier(normalizeTier(workspace.resource_tier));
+  };
+
+  /**
+   * Commit the chosen tier. Optimistic patch + rollback; entitlement errors
+   * (403/429 in platform mode) map to plan-aware copy.
+   */
+  const handleUpgradeSubmit = async () => {
+    if (!upgradeTarget) return;
+    const wsId = upgradeTarget.workspace_id;
+    const tier = upgradeTier;
+    if (tier === normalizeTier(upgradeTarget.resource_tier)) {
+      setUpgradeTarget(null);
+      return;
+    }
+    setUpgradeBusy(true);
+    const previous = patchCachedWorkspace(wsId, { resource_tier: tier });
+    try {
+      await setWorkspaceSpec(wsId, tier);
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.detail(wsId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
+      setUpgradeTarget(null);
+      toast({ title: t('workspace.specUpdated', 'Workspace spec updated'), description: TIER_LABEL[tier] ?? tier });
+    } catch (err) {
+      rollbackCachedWorkspaces(previous);
+      console.error('Error updating workspace spec:', err);
+      toast({ variant: 'destructive', title: t('workspace.specFailed', 'Could not update spec'), description: entitlementErrorMessage(err, t, tier) });
+    } finally {
+      setUpgradeBusy(false);
+    }
+  };
+
+  /**
+   * Apply an always-on change. Optimistic flip + rollback; enabling is gated in
+   * platform mode (403/429), disabling is always allowed. The id guard makes a
+   * second toggle for the same workspace a no-op while one is in flight.
+   */
+  const applyAlwaysOn = async (workspace: WorkspaceRecord, next: boolean) => {
+    const wsId = workspace.workspace_id;
+    // Dedupe inside the functional update so a fast double-click (two calls in
+    // one render frame, both seeing a stale closure) can't fire twice.
+    let alreadyBusy = false;
+    setAlwaysOnBusyIds((prev) => {
+      if (prev.has(wsId)) { alreadyBusy = true; return prev; }
+      return new Set(prev).add(wsId);
+    });
+    if (alreadyBusy) return;
+    const previous = patchCachedWorkspace(wsId, { is_always_on: next });
+    try {
+      await setWorkspaceAlwaysOn(wsId, next);
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.detail(wsId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
+      setAlwaysOnTarget((cur) => (cur?.workspace_id === wsId ? null : cur));
+    } catch (err) {
+      rollbackCachedWorkspaces(previous);
+      console.error('Error toggling always-on:', err);
+      toast({ variant: 'destructive', title: t('workspace.alwaysOnFailed', 'Could not change always-on'), description: entitlementErrorMessage(err, t) });
+    } finally {
+      setAlwaysOnBusyIds((prev) => { const n = new Set(prev); n.delete(wsId); return n; });
+    }
+  };
+
+  /**
+   * Card-menu entry point. Enabling opens a confirmation (24/7 billing); disabling
+   * applies directly. Ignored while a toggle for this workspace is in flight.
+   */
+  const handleToggleAlwaysOn = (workspace: WorkspaceRecord) => {
+    if (alwaysOnBusyIds.has(workspace.workspace_id)) return;
+    if (workspace.is_always_on === true) {
+      void applyAlwaysOn(workspace, false);
+    } else {
+      setAlwaysOnTarget(workspace);
+    }
+  };
+
+  /**
+   * Roving-tabindex keyboard nav for the upgrade-spec radiogroup: arrows move
+   * selection + focus (wrapping), matching the WAI-ARIA radio group pattern.
+   */
+  const handleTierKeyDown = (e: React.KeyboardEvent, index: number) => {
+    let nextIndex: number;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+      nextIndex = (index + 1) % TIER_OPTIONS.length;
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+      nextIndex = (index - 1 + TIER_OPTIONS.length) % TIER_OPTIONS.length;
+    } else {
+      return;
+    }
+    e.preventDefault();
+    setUpgradeTier(TIER_OPTIONS[nextIndex].id);
+    tierRadioRefs.current[nextIndex]?.focus();
+  };
+
+  /**
+   * Confirm + run a duplicate. The copy is a new workspace, so we invalidate
+   * the list and jump back to page 0 to reveal it.
+   */
+  const handleDuplicateConfirm = async () => {
+    if (!duplicateTarget) return;
+    const wsId = duplicateTarget.workspace_id;
+    setDuplicateBusy(true);
+    try {
+      await duplicateWorkspace(wsId);
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+      slideDirectionRef.current = -1;
+      gridHeightRef.current = null;
+      setCurrentPage(0);
+      setDuplicateTarget(null);
+      toast({ title: t('workspace.duplicated', 'Workspace duplicated') });
+    } catch (err) {
+      console.error('Error duplicating workspace:', err);
+      toast({ variant: 'destructive', title: t('workspace.duplicateFailed', 'Could not duplicate workspace'), description: entitlementErrorMessage(err, t) });
+    } finally {
+      setDuplicateBusy(false);
     }
   };
 
@@ -930,6 +1261,9 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               onRenameStart={handleRenameStart}
               onRenameSubmit={handleRenameSubmit}
               onRenameCancel={handleRenameCancel}
+              onUpgrade={handleUpgradeStart}
+              onToggleAlwaysOn={handleToggleAlwaysOn}
+              onDuplicate={setDuplicateTarget}
               isRenaming={renamingWsId === workspace.workspace_id}
               onDelete={handleDeleteClick}
               prefetchThreads={prefetchThreads}
@@ -1127,6 +1461,171 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
         isDeleting={isDeleting}
         error={deleteError}
       />
+
+      {/* Rename Dialog */}
+      <Dialog open={!!renameTarget} onOpenChange={(open) => { if (!open && !renameBusy) setRenameTarget(null); }}>
+        <DialogContent style={{ backgroundColor: 'var(--color-bg-page)', borderColor: 'var(--color-border-muted)' }}>
+          <DialogHeader>
+            <DialogTitle>{t('workspace.rename')}</DialogTitle>
+          </DialogHeader>
+          <Input
+            value={renameDraft}
+            onChange={(e) => setRenameDraft(e.target.value)}
+            placeholder={t('workspace.workspaceName')}
+            aria-label={t('workspace.rename')}
+            autoFocus
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void handleRenameDialogSubmit(); } }}
+          />
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setRenameTarget(null)} disabled={renameBusy}>
+              {t('common.cancel')}
+            </Button>
+            <Button
+              onClick={() => void handleRenameDialogSubmit()}
+              disabled={renameBusy || !renameDraft.trim() || renameDraft.trim() === renameTarget?.name}
+            >
+              {renameBusy ? t('common.saving') : t('common.save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Upgrade Spec Dialog */}
+      <Dialog open={!!upgradeTarget} onOpenChange={(open) => { if (!open && !upgradeBusy) setUpgradeTarget(null); }}>
+        <DialogContent style={{ backgroundColor: 'var(--color-bg-page)', borderColor: 'var(--color-border-muted)' }}>
+          <DialogHeader>
+            <DialogTitle>{t('workspace.changeSpec', 'Change spec')}</DialogTitle>
+            <DialogDescription>
+              {t('workspace.changeSpecDesc', 'Pick the sandbox resources for this workspace.')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2" role="radiogroup" aria-label={t('workspace.changeSpec', 'Change spec')}>
+            {TIER_OPTIONS.map((opt, index) => {
+              const selected = upgradeTier === opt.id;
+              // Elevated tiers carry a count quota in platform mode; standard never does.
+              const capacity =
+                opt.id === 'performance' ? workspaceQuota?.performance
+                : opt.id === 'max' ? workspaceQuota?.max
+                : null;
+              return (
+                <button
+                  key={opt.id}
+                  ref={(el) => { tierRadioRefs.current[index] = el; }}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  tabIndex={selected ? 0 : -1}
+                  onKeyDown={(e) => handleTierKeyDown(e, index)}
+                  onClick={() => setUpgradeTier(opt.id)}
+                  className="flex items-start gap-3 rounded-lg border p-3 text-left transition-colors"
+                  style={{
+                    borderColor: selected ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
+                    backgroundColor: selected ? 'var(--color-accent-soft)' : 'transparent',
+                  }}
+                >
+                  <span
+                    className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full border"
+                    style={{ borderColor: selected ? 'var(--color-accent-primary)' : 'var(--color-border-default)' }}
+                  >
+                    {selected && (
+                      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: 'var(--color-accent-primary)' }} />
+                    )}
+                  </span>
+                  <span className="flex-1 min-w-0">
+                    <span className="flex items-center justify-between gap-2">
+                      <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>{opt.label}</span>
+                      {isPlatformMode && capacity && (
+                        <span className="text-xs whitespace-nowrap" style={{ color: 'var(--color-text-tertiary)' }}>
+                          {capacity.limit < 0
+                            ? t('workspace.quotaUnlimited', 'Unlimited')
+                            : capacity.limit === 0
+                              ? t('workspace.quotaNotOnPlan', 'Not on your plan')
+                              : t('workspace.quotaRemaining', '{{remaining}} of {{limit}} left', {
+                                  remaining: Math.max(0, capacity.limit - capacity.used),
+                                  limit: capacity.limit,
+                                })}
+                        </span>
+                      )}
+                    </span>
+                    <span className="block text-sm" style={{ color: 'var(--color-text-tertiary)' }}>{opt.spec}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setUpgradeTarget(null)} disabled={upgradeBusy}>
+              {t('common.cancel')}
+            </Button>
+            <Button
+              onClick={() => void handleUpgradeSubmit()}
+              disabled={upgradeBusy || upgradeTier === normalizeTier(upgradeTarget?.resource_tier)}
+            >
+              {upgradeBusy ? t('common.saving') : t('common.save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Duplicate Confirmation Dialog */}
+      <Dialog open={!!duplicateTarget} onOpenChange={(open) => { if (!open && !duplicateBusy) setDuplicateTarget(null); }}>
+        <DialogContent style={{ backgroundColor: 'var(--color-bg-page)', borderColor: 'var(--color-border-muted)' }}>
+          <DialogHeader>
+            <DialogTitle>{t('workspace.duplicate', 'Duplicate')}</DialogTitle>
+            <DialogDescription>
+              {t('workspace.duplicateConfirm', { name: duplicateTarget?.name ?? '', defaultValue: 'Create a copy of "{{name}}"? Files are copied; always-on starts off on the copy.' })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setDuplicateTarget(null)} disabled={duplicateBusy}>
+              {t('common.cancel')}
+            </Button>
+            <Button onClick={() => void handleDuplicateConfirm()} disabled={duplicateBusy}>
+              {duplicateBusy ? t('workspace.duplicating', 'Duplicating…') : t('workspace.duplicate', 'Duplicate')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Always-On Enable Confirmation Dialog */}
+      <Dialog
+        open={!!alwaysOnTarget}
+        onOpenChange={(open) => {
+          if (!open && !(alwaysOnTarget && alwaysOnBusyIds.has(alwaysOnTarget.workspace_id))) setAlwaysOnTarget(null);
+        }}
+      >
+        <DialogContent style={{ backgroundColor: 'var(--color-bg-page)', borderColor: 'var(--color-border-muted)' }}>
+          {(() => {
+            const busy = alwaysOnTarget ? alwaysOnBusyIds.has(alwaysOnTarget.workspace_id) : false;
+            // Enabling on a stopped workspace starts the sandbox now, so the
+            // confirm copy says so (billing begins immediately, not next turn).
+            const isStopped = alwaysOnTarget?.status === 'stopped';
+            return (
+              <>
+                <DialogHeader>
+                  <DialogTitle>{t('workspace.alwaysOnEnable', 'Turn on always-on')}</DialogTitle>
+                  <DialogDescription>
+                    {isStopped
+                      ? t('workspace.alwaysOnConfirmStopped', { name: alwaysOnTarget?.name ?? '', defaultValue: 'Start "{{name}}" now and keep it running 24/7? The sandbox starts immediately, skips idle shutdown, and keeps billing until you turn always-on off.' })
+                      : t('workspace.alwaysOnConfirm', { name: alwaysOnTarget?.name ?? '', defaultValue: 'Keep "{{name}}" running 24/7? The sandbox skips idle shutdown and keeps billing until you turn always-on off.' })}
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <Button variant="ghost" onClick={() => setAlwaysOnTarget(null)} disabled={busy}>
+                    {t('common.cancel')}
+                  </Button>
+                  <Button
+                    onClick={() => { if (alwaysOnTarget) void applyAlwaysOn(alwaysOnTarget, true); }}
+                    disabled={busy}
+                  >
+                    {busy ? t('common.saving') : t('workspace.alwaysOnEnableConfirm', 'Turn on')}
+                  </Button>
+                </DialogFooter>
+              </>
+            );
+          })()}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

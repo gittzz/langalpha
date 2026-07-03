@@ -24,6 +24,27 @@ DEFAULT_ALLOWED_IMPORTS = [
 DEFAULT_BLOCKED_PATTERNS: list[str] = []
 
 
+# Organization resource ceiling — every tier is clamped to these maxima.
+# cpu in vCPU cores, memory in GiB, disk in GiB.
+RESOURCE_TIER_CEILING = {"cpu": 4, "memory": 8, "disk": 10}
+
+
+class ResourceTier(BaseModel):
+    """A named sandbox resource preset (vCPU cores, memory GiB, disk GiB)."""
+
+    cpu: int = Field(ge=1)
+    memory: int = Field(ge=1)
+    disk: int = Field(ge=1)
+
+
+def _default_resource_tiers() -> dict[str, ResourceTier]:
+    return {
+        "standard": ResourceTier(cpu=1, memory=1, disk=3),
+        "performance": ResourceTier(cpu=2, memory=4, disk=5),
+        "max": ResourceTier(cpu=4, memory=8, disk=10),
+    }
+
+
 class DaytonaConfig(BaseModel):
     """Daytona sandbox configuration.
 
@@ -42,6 +63,24 @@ class DaytonaConfig(BaseModel):
     snapshot_enabled: bool = True
     snapshot_name: str | None = None
     snapshot_auto_create: bool = True
+
+    # Resource tier presets (operator-tunable in agent_config.yaml).
+    default_tier: str = "standard"
+    resource_tiers: dict[str, ResourceTier] = Field(
+        default_factory=_default_resource_tiers
+    )
+
+    @field_validator("resource_tiers")
+    @classmethod
+    def _clamp_tiers_to_ceiling(
+        cls, v: dict[str, ResourceTier]
+    ) -> dict[str, ResourceTier]:
+        """Clamp every tier to the org ceiling (clamp, never reject)."""
+        for tier in v.values():
+            tier.cpu = min(tier.cpu, RESOURCE_TIER_CEILING["cpu"])
+            tier.memory = min(tier.memory, RESOURCE_TIER_CEILING["memory"])
+            tier.disk = min(tier.disk, RESOURCE_TIER_CEILING["disk"])
+        return v
 
 
 class SecurityConfig(BaseModel):

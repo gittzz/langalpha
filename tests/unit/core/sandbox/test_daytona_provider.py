@@ -216,6 +216,27 @@ class TestDaytonaProvider:
         assert isinstance(runtime, DaytonaRuntime)
         mock_daytona_client.create.assert_called_once()
 
+    @patch("ptc_agent.core.sandbox.providers.daytona.AsyncDaytona")
+    @pytest.mark.asyncio
+    async def test_create_raises_when_elevated_tier_snapshot_missing(
+        self, MockAsyncDaytona, mock_daytona_client
+    ):
+        """An elevated tier whose snapshot can't be built must fail loudly, not
+        silently create a base-sized (under-provisioned) sandbox for a billed tier."""
+        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+        provider = DaytonaProvider.__new__(DaytonaProvider)
+        provider._config = DaytonaConfig(api_key="test-key")  # default_tier=standard
+        provider._working_dir = "/home/workspace"
+        provider._client = mock_daytona_client
+
+        # performance resolves to real resources; snapshot build fails (None).
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            with pytest.raises(RuntimeError, match="tier snapshot"):
+                await provider.create(tier="performance")
+
+        mock_daytona_client.create.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_get_returns_runtime(self, mock_daytona_client):
         from ptc_agent.core.sandbox.providers.daytona import (

@@ -243,6 +243,49 @@ async def test_list_workspaces_invalid_sort_by(client):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/v1/workspaces/quota
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_workspace_quota_platform(client):
+    """Platform mode surfaces per-tier {used, limit}; /quota is not shadowed by /{id}."""
+
+    async def fake_capacity(_user_id, check_quota):
+        return {
+            "spec_performance": {"used": 1, "limit": 3},
+            "spec_max": {"used": 0, "limit": 0},
+            "always_on": {"used": 2, "limit": -1},
+        }[check_quota]
+
+    with patch(
+        "src.server.app.workspaces.get_capacity_status",
+        new=AsyncMock(side_effect=fake_capacity),
+    ):
+        resp = await client.get("/api/v1/workspaces/quota")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "performance": {"used": 1, "limit": 3},
+        "max": {"used": 0, "limit": 0},
+        "always_on": {"used": 2, "limit": -1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_workspace_quota_oss_all_null(client):
+    """OSS mode: every capability is None, so the response fields are null."""
+    with patch(
+        "src.server.app.workspaces.get_capacity_status",
+        new=AsyncMock(return_value=None),
+    ):
+        resp = await client.get("/api/v1/workspaces/quota")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"performance": None, "max": None, "always_on": None}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/v1/workspaces/{workspace_id}
 # ---------------------------------------------------------------------------
 
@@ -641,6 +684,125 @@ async def test_drain_warm_tasks_cancels_in_flight():
 
     assert task.cancelled()
     assert not ws_mod._warm_tasks
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/workspaces/{workspace_id}/always-on
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_always_on_enable_on_stopped_starts_immediately(client):
+    """Enabling always-on on a stopped workspace warms it now, returns 'starting'."""
+    ws = _ws(status="stopped")
+    persisted = _ws(status="stopped", is_always_on=True)
+
+    started_event = asyncio.Event()
+    finish_event = asyncio.Event()
+
+    async def slow_get_session(*args, **kwargs):
+        started_event.set()
+        await finish_event.wait()
+
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.workspaces.assert_always_on_allowed",
+            new_callable=AsyncMock,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        mock_manager = AsyncMock()
+        mock_manager.set_workspace_always_on = AsyncMock(return_value=persisted)
+        mock_manager.get_session_for_workspace = AsyncMock(side_effect=slow_get_session)
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/always-on",
+            json={"enabled": True},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["is_always_on"] is True
+        # Response optimistically reflects the start kicked off this request.
+        assert body["status"] == "starting"
+
+        # The warm start was scheduled in the background, not awaited inline.
+        await asyncio.wait_for(started_event.wait(), timeout=0.5)
+        finish_event.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_always_on_enable_on_running_does_not_start(client):
+    """Enabling always-on on a running workspace stays running, no warm start."""
+    ws = _ws(status="running")
+    persisted = _ws(status="running", is_always_on=True)
+
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.workspaces.assert_always_on_allowed",
+            new_callable=AsyncMock,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        mock_manager = AsyncMock()
+        mock_manager.set_workspace_always_on = AsyncMock(return_value=persisted)
+        mock_manager.get_session_for_workspace = AsyncMock()
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/always-on",
+            json={"enabled": True},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "running"
+    mock_manager.get_session_for_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_always_on_disable_does_not_start(client):
+    """Disabling always-on never starts the sandbox (and is never gated)."""
+    ws = _ws(status="stopped", is_always_on=True)
+    persisted = _ws(status="stopped", is_always_on=False)
+
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.workspaces.assert_always_on_allowed",
+            new_callable=AsyncMock,
+        ) as mock_gate,
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        mock_manager = AsyncMock()
+        mock_manager.set_workspace_always_on = AsyncMock(return_value=persisted)
+        mock_manager.get_session_for_workspace = AsyncMock()
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/always-on",
+            json={"enabled": False},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "stopped"
+    mock_manager.get_session_for_workspace.assert_not_awaited()
+    mock_gate.assert_not_awaited()  # disable is ungated
 
 
 # ---------------------------------------------------------------------------
