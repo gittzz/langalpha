@@ -787,8 +787,9 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   };
 
   /**
-   * Confirm + run a duplicate. The copy is a new workspace, so we invalidate
-   * the list and jump back to page 0 to reveal it.
+   * Confirm + run a duplicate. The copy is a new workspace (and inherits the
+   * source's tier, so it can consume a per-tier quota slot) — invalidate the
+   * list + quota and jump back to page 0 to reveal it.
    */
   const handleDuplicateConfirm = async () => {
     if (!duplicateTarget) return;
@@ -797,6 +798,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
     try {
       await duplicateWorkspace(wsId);
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
       slideDirectionRef.current = -1;
       gridHeightRef.current = null;
       setCurrentPage(0);

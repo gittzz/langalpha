@@ -4,7 +4,7 @@
  */
 import { api } from '@/api/client';
 import { supabase } from '@/lib/supabase';
-import type { WorkspaceQuota } from '@/types/api';
+import type { ResourceTier, WorkspaceQuota } from '@/types/api';
 
 const baseURL = api.defaults.baseURL;
 
@@ -149,7 +149,7 @@ export async function renameWorkspace(workspaceId: string, name: string) {
  * In platform mode the backend gates elevated tiers: 403 (not on plan) or
  * 429 (workspace count limit reached). OSS mode is ungated.
  */
-export async function setWorkspaceSpec(workspaceId: string, tier: string) {
+export async function setWorkspaceSpec(workspaceId: string, tier: ResourceTier) {
   if (!workspaceId) throw new Error('Workspace ID is required');
   const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/spec`, { tier });
   return data;
