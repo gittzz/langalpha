@@ -1034,6 +1034,7 @@
     "pinToTop": "置顶",
     "unpin": "取消置顶",
     "rename": "重命名",
+    "renameDescription": "为该工作区设置新名称。",
     "renameFailed": "无法重命名工作区",
     "changeSpec": "更改规格",
     "changeSpecDesc": "为该工作区选择沙箱资源。",
@@ -1045,10 +1046,20 @@
     "alwaysOnBadge": "常驻",
     "alwaysOnBadgeTitle": "常驻：沙箱保持运行",
     "alwaysOnFailed": "无法更改常驻设置",
-    "alwaysOnConfirm": "让“{{name}}”全天候运行？沙箱将不再自动闲置关闭，并持续计费，直到你关闭常驻。",
-    "alwaysOnConfirmStopped": "立即启动“{{name}}”并全天候运行？沙箱将立即启动，不再自动闲置关闭，并持续计费，直到你关闭常驻。",
+    "alwaysOnConfirm": "让“{{name}}”全天候运行？沙箱将不再自动闲置关闭，并持续计费，直到您关闭常驻。",
+    "alwaysOnConfirmStopped": "立即启动“{{name}}”并全天候运行？沙箱将立即启动，不再自动闲置关闭，并持续计费，直到您关闭常驻。",
     "alwaysOnEnableConfirm": "开启",
     "tierBadgeTitle": "{{tier}} 沙箱规格",
+    "tier": {
+      "standard": "标准",
+      "performance": "高性能",
+      "max": "旗舰"
+    },
+    "tierSpec": {
+      "standard": "1 vCPU · 1 GB 内存 · 3 GB 磁盘",
+      "performance": "2 vCPU · 4 GB 内存 · 5 GB 磁盘",
+      "max": "4 vCPU · 8 GB 内存 · 10 GB 磁盘"
+    },
     "specUpdated": "工作区规格已更新",
     "specFailed": "无法更新规格",
     "duplicate": "复制",

@@ -1034,6 +1034,7 @@
     "pinToTop": "Pin to top",
     "unpin": "Unpin",
     "rename": "Rename",
+    "renameDescription": "Give this workspace a new name.",
     "renameFailed": "Could not rename workspace",
     "changeSpec": "Change spec",
     "changeSpecDesc": "Pick the sandbox resources for this workspace.",
@@ -1049,6 +1050,16 @@
     "alwaysOnConfirmStopped": "Start \"{{name}}\" now and keep it running 24/7? The sandbox starts immediately, skips idle shutdown, and keeps billing until you turn always-on off.",
     "alwaysOnEnableConfirm": "Turn on",
     "tierBadgeTitle": "{{tier}} sandbox spec",
+    "tier": {
+      "standard": "Standard",
+      "performance": "Performance",
+      "max": "Max"
+    },
+    "tierSpec": {
+      "standard": "1 vCPU · 1 GB RAM · 3 GB disk",
+      "performance": "2 vCPU · 4 GB RAM · 5 GB disk",
+      "max": "4 vCPU · 8 GB RAM · 10 GB disk"
+    },
     "specUpdated": "Workspace spec updated",
     "specFailed": "Could not update spec",
     "duplicate": "Duplicate",

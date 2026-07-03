@@ -28,16 +28,19 @@ export interface UserPreferences {
 
 // --- Workspace ---
 
+/** Sandbox resource tier. */
+export type ResourceTier = 'standard' | 'performance' | 'max';
+
 export interface Workspace {
   workspace_id: string;
   name: string;
   status?: string;
   description?: string;
   config?: Record<string, unknown>;
-  /** Sandbox resource tier: 'standard' | 'performance' | 'max'. */
-  resource_tier: string;
-  /** Keep the sandbox running (idle auto-stop disabled). */
-  is_always_on: boolean;
+  /** Sandbox resource tier. Absent on flash / legacy rows. */
+  resource_tier?: ResourceTier;
+  /** Keep the sandbox running (idle auto-stop disabled). Absent on flash / legacy rows. */
+  is_always_on?: boolean;
   created_at?: string;
   updated_at?: string;
   [key: string]: unknown;
