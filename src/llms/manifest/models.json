@@ -1045,29 +1045,6 @@
       }
     }
   },
-  "gpt-5.3-codex-oauth": {
-    "model_id": "gpt-5.3-codex",
-    "provider": "codex-oauth",
-    "visible": true,
-    "speed": 3,
-    "intelligence": 4,
-    "context": 400000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "include": [
-        "reasoning.encrypted_content"
-      ],
-      "store": false
-    }
-  },
   "gpt-5.3-codex-spark-oauth": {
     "model_id": "gpt-5.3-codex-spark",
     "provider": "codex-oauth",
