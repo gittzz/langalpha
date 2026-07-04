@@ -8,6 +8,13 @@ import type { ResourceTier, WorkspaceQuota } from '@/types/api';
 
 const baseURL = api.defaults.baseURL;
 
+// The shared axios instance sets no global timeout. Workspace-management ops
+// legitimately run tens of seconds (a spec change rebuilds the sandbox,
+// duplicate provisions one), so these bounds are generous — they convert a
+// network hang into a visible failure rather than race the server.
+const WORKSPACE_MUTATION_TIMEOUT_MS = 120000;
+const WORKSPACE_QUERY_TIMEOUT_MS = 15000;
+
 /** Get Bearer auth headers for raw fetch() calls (SSE streams). */
 async function getAuthHeaders(): Promise<Record<string, string>> {
   if (!supabase) return {};
@@ -140,7 +147,9 @@ export async function reorderWorkspaces(items: Array<{ workspace_id: string; sor
  */
 export async function renameWorkspace(workspaceId: string, name: string) {
   if (!workspaceId) throw new Error('Workspace ID is required');
-  const { data } = await api.put(`/api/v1/workspaces/${workspaceId}`, { name });
+  const { data } = await api.put(`/api/v1/workspaces/${workspaceId}`, { name }, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
   return data;
 }
 
@@ -151,7 +160,9 @@ export async function renameWorkspace(workspaceId: string, name: string) {
  */
 export async function setWorkspaceSpec(workspaceId: string, tier: ResourceTier) {
   if (!workspaceId) throw new Error('Workspace ID is required');
-  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/spec`, { tier });
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/spec`, { tier }, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
   return data;
 }
 
@@ -162,7 +173,9 @@ export async function setWorkspaceSpec(workspaceId: string, tier: ResourceTier) 
  */
 export async function setWorkspaceAlwaysOn(workspaceId: string, enabled: boolean) {
   if (!workspaceId) throw new Error('Workspace ID is required');
-  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/always-on`, { enabled });
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/always-on`, { enabled }, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
   return data;
 }
 
@@ -172,7 +185,9 @@ export async function setWorkspaceAlwaysOn(workspaceId: string, enabled: boolean
  */
 export async function duplicateWorkspace(workspaceId: string) {
   if (!workspaceId) throw new Error('Workspace ID is required');
-  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/duplicate`);
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/duplicate`, null, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
   return data;
 }
 
@@ -181,7 +196,9 @@ export async function duplicateWorkspace(workspaceId: string) {
  * in OSS mode, so callers should treat null as "no limit to show".
  */
 export async function getWorkspaceQuota(): Promise<WorkspaceQuota> {
-  const { data } = await api.get('/api/v1/workspaces/quota');
+  const { data } = await api.get('/api/v1/workspaces/quota', {
+    timeout: WORKSPACE_QUERY_TIMEOUT_MS,
+  });
   return data;
 }
 
