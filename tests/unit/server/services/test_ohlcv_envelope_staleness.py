@@ -15,7 +15,9 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from src.data_client.market_data_provider import _SUFFIX_MAP
 from src.server.services.cache._ohlcv_envelope import (
+    _US_DOTTED_SUFFIXES,
     _follows_us_daily_calendar,
     _is_stale_date,
     is_watermark_stale,
@@ -336,6 +338,13 @@ class TestDailyWatermarkStale:
 # ---------------------------------------------------------------------------
 
 class TestFollowsUsDailyCalendar:
+    def test_us_dotted_suffixes_disjoint_from_foreign_suffix_map(self):
+        # Trusting _US_DOTTED_SUFFIXES as US-calendar is safe only while none
+        # of them doubles as a foreign region suffix in _SUFFIX_MAP (which
+        # already carries single-letter codes like L/T). A future addition
+        # must fail here, not silently misclassify foreign symbols as US.
+        assert _US_DOTTED_SUFFIXES.isdisjoint(_SUFFIX_MAP)
+
     def test_bare_us_ticker(self):
         assert _follows_us_daily_calendar("AAPL", False) is True
 

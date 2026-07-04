@@ -203,6 +203,8 @@ def is_watermark_stale(
         if time.time() - envelope.get("fetched_at", 0) < _DAILY_STALE_REFETCH_COOLDOWN:
             # Just fetched — the provider simply hasn't published a newer bar
             # yet; flagging stale again would re-fetch on every request.
+            # Deliberately ahead of the corrupt-watermark check: a persistently
+            # corrupt feed re-fetches once per cooldown, not per request.
             return False
         last_bar_date = watermark_to_date_str(envelope.get("watermark"))
         if last_bar_date is None:
