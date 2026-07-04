@@ -182,9 +182,10 @@ def is_watermark_stale(
     by a prior refresh that fetched nothing new (``_is_stale_date`` alone can't
     catch that). US symbols only: non-US daily bars anchor at exchange-local
     midnight, which converts to the *previous* ET date and would read as
-    permanently stale against the US calendar — daily callers should pass
-    ``symbol`` (and ``is_index``) so non-US symbols keep the date-level
-    check via ``_is_stale_date`` alone.
+    permanently stale against the US calendar — daily callers must pass
+    ``symbol`` (and ``is_index``); without a symbol the daily check is
+    skipped and non-US symbols keep the date-level check via
+    ``_is_stale_date`` alone.
 
     Tolerance: ``2 * interval_period``. Absorbs provider delay plus small
     clock skew without hiding real stagnation.
@@ -193,8 +194,10 @@ def is_watermark_stale(
         # Date-level: stale when the newest bar's trading date is behind the
         # newest daily bar that should exist now. Uses the same watermark→date
         # conversion the daily delta-refresh trusts for its from_date.
-        if symbol is not None and not _follows_us_daily_calendar(symbol, is_index):
-            return False  # non-US anchors don't map to ET dates — see docstring
+        if symbol is None or not _follows_us_daily_calendar(symbol, is_index):
+            # Unclassifiable (no symbol) or non-US: fail closed — a foreign
+            # anchor read against the ET calendar would look permanently stale.
+            return False
         if not envelope.get("bars"):
             return False  # empty window — soft-TTL governs re-fetch timing
         if time.time() - envelope.get("fetched_at", 0) < _DAILY_STALE_REFETCH_COOLDOWN:
@@ -249,8 +252,8 @@ def _needs_refresh(
 
     ``interval`` is optional for backward compatibility, but callers should
     pass it whenever available so the watermark check fires. Daily callers
-    should also pass ``symbol`` so non-US symbols skip the US-calendar
-    watermark check (see :func:`is_watermark_stale`).
+    must also pass ``symbol`` — without it the daily watermark check is
+    skipped (see :func:`is_watermark_stale`).
     """
     if is_live:
         # 1. Stale date — strongest signal

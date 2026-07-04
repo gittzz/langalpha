@@ -110,8 +110,8 @@ class TestIsWatermarkStale:
     def test_empty_daily_envelope_is_not_stale(self):
         # An empty daily window has nothing to be behind — soft-TTL handles it.
         env = {"watermark": 0, "data_date": "1970-01-01", "bars": []}
-        assert is_watermark_stale(env, "1day") is False
-        assert is_watermark_stale({"watermark": 0, "data_date": "1970-01-01"}, "1day") is False
+        assert is_watermark_stale(env, "1day", symbol="AAPL") is False
+        assert is_watermark_stale({"watermark": 0, "data_date": "1970-01-01"}, "1day", symbol="AAPL") is False
 
     def test_empty_envelope_is_not_stale(self):
         # Empty-bar envelopes (no data in requested window) are deliberately
@@ -193,42 +193,42 @@ class TestDailyWatermarkStale:
         # check must still flag it stale so the cache re-fetches.
         tue_open = datetime(2026, 5, 26, 11, 0, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 21), data_date="2026-05-26")
-        assert is_watermark_stale(env, "1day", now=tue_open) is True
+        assert is_watermark_stale(env, "1day", now=tue_open, symbol="AAPL") is True
 
     def test_today_bar_present_is_fresh(self):
         # Provider returns the in-progress current-day daily bar → not stale.
         tue_open = datetime(2026, 5, 26, 11, 0, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 26), data_date="2026-05-26")
-        assert is_watermark_stale(env, "1day", now=tue_open) is False
+        assert is_watermark_stale(env, "1day", now=tue_open, symbol="AAPL") is False
 
     def test_friday_bar_on_saturday_is_fresh(self):
         # Saturday's current trading date is Friday; a Friday bar is current.
         saturday = datetime(2026, 4, 18, 10, 0, tzinfo=ET)
         env = self._daily_env(datetime(2026, 4, 17), data_date="2026-04-17")
-        assert is_watermark_stale(env, "1day", now=saturday) is False
+        assert is_watermark_stale(env, "1day", now=saturday, symbol="AAPL") is False
 
     def test_missing_last_session_is_stale(self):
         # Saturday read, newest bar is Thursday — Friday's completed bar is
         # missing → stale.
         saturday = datetime(2026, 4, 18, 10, 0, tzinfo=ET)
         env = self._daily_env(datetime(2026, 4, 16), data_date="2026-04-17")
-        assert is_watermark_stale(env, "1day", now=saturday) is True
+        assert is_watermark_stale(env, "1day", now=saturday, symbol="AAPL") is True
 
     def test_holiday_walks_back_to_last_trading_day(self):
         # Memorial Day 2026-05-25 is a holiday; current trading date is Fri 05-22.
         holiday = datetime(2026, 5, 25, 11, 0, tzinfo=ET)
         fresh = self._daily_env(datetime(2026, 5, 22), data_date="2026-05-22")
         stale = self._daily_env(datetime(2026, 5, 21), data_date="2026-05-22")
-        assert is_watermark_stale(fresh, "1day", now=holiday) is False
-        assert is_watermark_stale(stale, "1day", now=holiday) is True
+        assert is_watermark_stale(fresh, "1day", now=holiday, symbol="AAPL") is False
+        assert is_watermark_stale(stale, "1day", now=holiday, symbol="AAPL") is True
 
     def test_empty_daily_window_is_not_stale(self):
         # No bars → nothing to be behind; soft-TTL governs re-fetch.
-        assert is_watermark_stale({"bars": [], "watermark": 0}, "1day") is False
+        assert is_watermark_stale({"bars": [], "watermark": 0}, "1day", symbol="AAPL") is False
 
     def test_corrupt_daily_watermark_is_stale(self):
         # Bars present but watermark is 0 → corrupt, force re-fetch.
-        assert is_watermark_stale({"bars": [{"time": 123}], "watermark": 0}, "1day") is True
+        assert is_watermark_stale({"bars": [{"time": 123}], "watermark": 0}, "1day", symbol="AAPL") is True
 
     # -- pre-market: today's daily bar doesn't exist yet -----------------
     # The freshest bar that can legitimately exist before 09:30 ET is the
@@ -241,28 +241,28 @@ class TestDailyWatermarkStale:
         # bar can't exist yet → yesterday's bar is fresh, NOT stale.
         wed_premkt = datetime(2026, 5, 27, 8, 0, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 26), data_date="2026-05-27")
-        assert is_watermark_stale(env, "1day", now=wed_premkt) is False
+        assert is_watermark_stale(env, "1day", now=wed_premkt, symbol="AAPL") is False
 
     def test_premarket_gross_staleness_still_caught(self):
         # Pre-market does NOT mean "never stale": a week-old bar (with a lying
         # data_date) is still behind the previous trading day → stale.
         wed_premkt = datetime(2026, 5, 27, 8, 0, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 20), data_date="2026-05-27")
-        assert is_watermark_stale(env, "1day", now=wed_premkt) is True
+        assert is_watermark_stale(env, "1day", now=wed_premkt, symbol="AAPL") is True
 
     def test_premarket_after_weekend_walks_back(self):
         # Mon 08:00 ET pre-market; freshest possible bar is Fri's (weekend has
         # no sessions). A Friday bar is fresh.
         mon_premkt = datetime(2026, 5, 18, 8, 0, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 15), data_date="2026-05-18")
-        assert is_watermark_stale(env, "1day", now=mon_premkt) is False
+        assert is_watermark_stale(env, "1day", now=mon_premkt, symbol="AAPL") is False
 
     def test_at_open_today_bar_expected(self):
         # At 09:30 ET the session has opened — today's in-progress bar should
         # exist. A cache still on yesterday is now stale (chases today's bar).
         wed_open = datetime(2026, 5, 27, 9, 30, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 26), data_date="2026-05-27")
-        assert is_watermark_stale(env, "1day", now=wed_open) is True
+        assert is_watermark_stale(env, "1day", now=wed_open, symbol="AAPL") is True
 
     # -- re-fetch cooldown: a just-fetched envelope is never stale ---------
     # Right after the open the provider may not have published today's daily
@@ -274,13 +274,13 @@ class TestDailyWatermarkStale:
         wed_open = datetime(2026, 5, 27, 9, 35, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 26), data_date="2026-05-27")
         env["fetched_at"] = time.time()
-        assert is_watermark_stale(env, "1day", now=wed_open) is False
+        assert is_watermark_stale(env, "1day", now=wed_open, symbol="AAPL") is False
 
     def test_cooldown_expiry_restores_staleness(self):
         wed_open = datetime(2026, 5, 27, 9, 35, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 26), data_date="2026-05-27")
         env["fetched_at"] = time.time() - 300  # past the 120s cooldown
-        assert is_watermark_stale(env, "1day", now=wed_open) is True
+        assert is_watermark_stale(env, "1day", now=wed_open, symbol="AAPL") is True
 
     # -- non-US symbols: the backstop is US-calendar only ------------------
     # Non-US daily bars anchor at exchange-local midnight (e.g. 00:00 HKT),
@@ -321,6 +321,14 @@ class TestDailyWatermarkStale:
         tue_open = datetime(2026, 5, 26, 11, 0, tzinfo=ET)
         env = self._daily_env(datetime(2026, 5, 21), data_date="2026-05-26")
         assert is_watermark_stale(env, "1day", now=tue_open, symbol="SOX", is_index=True) is True
+
+    def test_no_symbol_fails_closed(self):
+        # No symbol → can't classify the calendar anchor → the backstop is
+        # skipped entirely, even for a grossly behind watermark. Guards the
+        # symbol-less intraday call sites if "1day" ever routes through them.
+        tue_open = datetime(2026, 5, 26, 11, 0, tzinfo=ET)
+        env = self._daily_env(datetime(2026, 5, 21), data_date="2026-05-26")
+        assert is_watermark_stale(env, "1day", now=tue_open) is False
 
 
 # ---------------------------------------------------------------------------
