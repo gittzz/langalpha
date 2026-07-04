@@ -99,6 +99,12 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         # Once sandbox is ready and sync completes, workspace is removed from this set
         self._pending_lazy_sync: set[str] = set()
 
+        # Elevated-tier workspaces restarted this request, owed an entitlement
+        # re-check in Phase 2 (lazy spec reclaim). Marked in _restart_workspace
+        # where the row is already in hand, so standard-tier restarts skip the
+        # check without any extra read.
+        self._pending_tier_recheck: set[str] = set()
+
         # Per-workspace locks (replaces global _lock to avoid cross-workspace blocking)
         self._lock_registry_mu = asyncio.Lock()  # protects _workspace_locks dict only
         self._workspace_locks: Dict[str, asyncio.Lock] = {}
@@ -239,6 +245,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         if evict_session is None or self._sessions.get(workspace_id) is evict_session:
             self._sessions.pop(workspace_id, None)
         self._pending_lazy_sync.discard(workspace_id)
+        self._pending_tier_recheck.discard(workspace_id)
 
     async def push_vault_secrets(
         self, workspace_id: str, sandbox: "PTCSandbox | None" = None,
@@ -1688,6 +1695,26 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 )
 
             try:
+                # Lazy spec reclaim, deliberately OFF the Phase-1 lock: a lazy
+                # restart reconnects at the persisted size, and rebuilding here
+                # instead of in _restart_workspace keeps the per-workspace lock
+                # free during the full reprovision (which would otherwise
+                # head-of-line block every op on this workspace up to the 60s
+                # lock ceiling). The entitlement RTT overlaps the sandbox's
+                # background start, and the caller never sees the outsized
+                # sandbox — Phase 2 gates the return either way.
+                if (
+                    needs_deferred_sync
+                    and workspace_user_id
+                    and workspace_id in self._pending_tier_recheck
+                ):
+                    reclaimed = await self._maybe_reclaim_lazy_tier(
+                        workspace_id, workspace_user_id, session
+                    )
+                    if reclaimed is not None:
+                        mark("tier_reclaim")
+                        return reclaimed
+
                 await session.sandbox.ensure_sandbox_ready()
                 mark("sandbox_ready")
 
@@ -2207,6 +2234,12 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 f"Workspace {workspace_id} has no sandbox_id. Cannot restart."
             )
 
+        # A restart reconnects at the persisted size, so an elevated tier owes
+        # an entitlement re-check — done in Phase 2, off the per-workspace lock
+        # (see _maybe_reclaim_lazy_tier). Marked here where the row is in hand.
+        if (workspace.get("resource_tier") or "standard") != "standard":
+            self._pending_tier_recheck.add(workspace_id)
+
         # Force non-lazy init if sandbox config may have changed (e.g., working
         # directory migration).  Without blocking init we cannot detect the
         # mismatch before the agent starts executing with stale paths.
@@ -2230,29 +2263,6 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             # Get session from SessionManager
             core_config = self.config.to_core_config()
             session = SessionManager.get_session(workspace_id, core_config)
-
-            # Lazy spec reclaim: a reconnect would bring the sandbox back at its
-            # old size, so when the owner's elevated-tier entitlement lapsed,
-            # destroy the stopped sandbox and recover instead — recovery
-            # provisions at the reclaimed (standard) tier and restores files
-            # from the DB backup taken at stop.
-            tier = workspace.get("resource_tier") or "standard"
-            if tier != "standard" and user_id:
-                entitled = await self._entitled_tier(workspace, user_id)
-                if entitled != tier:
-                    try:
-                        await self._destroy_sandbox(sandbox_id)
-                    except Exception as e:
-                        # Best-effort: an orphaned stopped sandbox is reclaimed
-                        # by Daytona's dormancy timers; don't block the start.
-                        logger.warning(
-                            f"Failed to destroy outsized sandbox {sandbox_id} "
-                            f"for workspace {workspace_id}: {e}"
-                        )
-                    await self._clear_session(workspace_id)
-                    return await self._recover_sandbox(
-                        workspace_id, user_id, core_config
-                    )
 
             sandbox_gone = False
 

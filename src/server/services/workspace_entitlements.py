@@ -105,6 +105,47 @@ class WorkspaceEntitlementsMixin:
         await db_set_workspace_always_on(workspace_id, False)
         return False
 
+    async def _maybe_reclaim_lazy_tier(
+        self, workspace_id: str, user_id: str, session: Session
+    ) -> Session | None:
+        """Phase-2 arm of lazy spec reclaim: when the owner's elevated-tier
+        entitlement lapsed, destroy the reconnected sandbox and recover at the
+        reclaimed tier, returning the recovered session; None when the restart
+        may proceed on the existing sandbox.
+
+        Runs outside the per-workspace lock — cross-worker exclusion comes from
+        the 'starting' claim row, same-worker coalescing from the Phase-2 event.
+        """
+        self._pending_tier_recheck.discard(workspace_id)
+        workspace = await db_get_workspace(workspace_id)
+        tier = (workspace or {}).get("resource_tier") or "standard"
+        if workspace is None or tier == "standard":
+            return None
+        if await self._entitled_tier(workspace, user_id) == tier:
+            return None
+        sandbox_id = workspace.get("sandbox_id")
+        if sandbox_id:
+            try:
+                await self._destroy_sandbox(sandbox_id)
+            except Exception as e:
+                # Best-effort: an orphaned sandbox is reclaimed by Daytona's
+                # dormancy timers; don't block the rebuild.
+                logger.warning(
+                    f"Failed to destroy outsized sandbox {sandbox_id} "
+                    f"for workspace {workspace_id}: {e}"
+                )
+        if self._sessions.get(workspace_id) is session:
+            await self._clear_session(workspace_id, evict_session=session)
+        # _clear_session discards _pending_lazy_sync; re-arm it so a recovery
+        # failure hits Phase 2's revert-to-'stopped' + re-raise handler instead
+        # of being tolerated as a warm re-sync hiccup.
+        self._pending_lazy_sync.add(workspace_id)
+        recovered = await self._recover_sandbox(
+            workspace_id, user_id, self.config.to_core_config()
+        )
+        self._pending_lazy_sync.discard(workspace_id)
+        return recovered
+
     async def _destroy_sandbox(self, sandbox_id: str) -> None:
         """Delete a sandbox by id via the provider, reaching it like archive_workspace.
 
