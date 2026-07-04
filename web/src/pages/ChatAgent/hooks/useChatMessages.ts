@@ -102,6 +102,32 @@ const PROPOSAL_DATA_KEY_MAP: Record<string, string> = {
 /** Secretary action interrupt types (for type guard in handlers). */
 const SECRETARY_ACTION_TYPES = new Set(['delete_workspace', 'stop_workspace', 'delete_thread']);
 
+/**
+ * Message-map buckets whose entries carry an `interruptId` (rendered HITL
+ * cards). `satisfies keyof AssistantMessage` makes a renamed/added bucket a
+ * compile error here instead of a silently-wrong dedup rebuild.
+ */
+const INTERRUPT_CARD_BUCKETS = [
+  'planApprovals', 'userQuestions', 'workspaceProposals',
+  'questionProposals', 'ptcAgentProposals', 'secretaryActionProposals',
+] as const satisfies readonly (keyof AssistantMessage)[];
+
+/** Collects the interrupt_ids of every HITL card rendered on the given messages. */
+function collectRenderedInterruptIds(messages: ChatMessage[]): Set<string> {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (m.role !== 'assistant') continue;
+    for (const bucket of INTERRUPT_CARD_BUCKETS) {
+      const entries = m[bucket];
+      if (!entries) continue;
+      for (const entry of Object.values(entries)) {
+        if (entry?.interruptId) ids.add(entry.interruptId);
+      }
+    }
+  }
+  return ids;
+}
+
 /** Pending HITL interrupt state. */
 interface PendingInterrupt {
   type?: string;
@@ -670,6 +696,14 @@ export function useChatMessages(
   // Batch parallel interrupt responses: track all interrupt IDs in current batch
   // and collect individual responses until all are answered, then resume at once.
   const pendingInterruptIdsRef = useRef(new Set<string>());
+  // Thread-scoped set of interrupt_ids that already have a rendered card. An
+  // unanswered interrupt is re-raised by LangGraph with the SAME interrupt_id on
+  // every resume; each re-raise arrives on a later turn's bubble, so the per-map
+  // dedup (keyed by interrupt_id) never collides and a duplicate card would be
+  // appended. This ref survives resume (NOT cleared with pendingInterruptIdsRef),
+  // cleared only on thread switch / fresh history load. Shared by replay + live
+  // so a live re-raise after a history load dedupes against replayed cards too.
+  const renderedInterruptIdsRef = useRef(new Set<string>());
   const collectedHitlResponsesRef = useRef<Record<string, { decisions: Array<{ type: string; message?: string }> }>>({});
 
   // Track approved PTC agent proposals waiting for thread_id backfill from tool_call_result.
@@ -895,6 +929,9 @@ export function useChatMessages(
         turnCheckpointsRef.current = null;
         // The rendered-turn watermark belongs to the thread we're leaving.
         lastRenderedTurnIndexRef.current = null;
+        // Interrupt cards belong to the thread we're leaving; the next thread's
+        // replay repopulates this from its persisted interrupt events.
+        renderedInterruptIdsRef.current.clear();
       }
     }
   }, [workspaceId, initialThreadId]);
@@ -924,6 +961,10 @@ export function useChatMessages(
       // any in-flight streaming bubble survives the filter.
       historyMessagesRef.current.clear();
       newMessagesStartIndexRef.current = 0;
+      // A re-replay rebuilds every history bubble from persisted events, so the
+      // rendered-interrupt set must start empty and be repopulated by this pass;
+      // otherwise stale ids would suppress cards this replay legitimately renders.
+      renderedInterruptIdsRef.current.clear();
       setMessages((prev) => prev.filter((m) => !m.isHistory));
 
       // Fresh attach (refresh or thread switch): clear the live-stream cursor so
@@ -1628,11 +1669,21 @@ export function useChatMessages(
 
         // Handle interrupt events during history replay
         if (eventType === 'interrupt') {
+          // Skip a re-raised interrupt: LangGraph re-emits an unanswered
+          // interrupt with the same interrupt_id on every resume, landing on a
+          // later turn's bubble. The first occurrence owns the card (and its
+          // pendingHistoryInterrupts entry, which answer-replay resolves by id);
+          // re-emissions would append a duplicate card and a phantom pending
+          // entry, so drop them wholesale.
+          if (event.interrupt_id && renderedInterruptIdsRef.current.has(event.interrupt_id)) return;
           const pairIndex = event.turn_index ?? currentActivePairIndex;
           const interruptAssistantId = pairIndex != null ? assistantMessagesByPair.get(pairIndex) : null;
           const pairState = pairIndex != null ? pairStateByPair.get(pairIndex) : null;
 
           if (interruptAssistantId && pairState) {
+            // Mark rendered only once a card will actually attach — a pair-less
+            // event must not poison the set and drop a later valid re-raise.
+            if (event.interrupt_id) renderedInterruptIdsRef.current.add(event.interrupt_id);
             const actionRequests = event.action_requests || [];
             const actionType = actionRequests[0]?.type as string | undefined;
 
@@ -2250,6 +2301,14 @@ export function useChatMessages(
     // writes resolution status to where the proposal actually lives now.
     const stripList = unresolvedHistoryInterruptRef.current;
     if (stripList.length > 0) {
+      // Release the stripped ids from the rendered-interrupt set, synchronously
+      // before the stream opens: the reconnect stream re-delivers a still-pending
+      // interrupt with the same interrupt_id, and after this strip that
+      // re-delivery is the ONLY copy — a stale entry would suppress it and leave
+      // the interrupt with no card anywhere, unanswerable until a full reload.
+      for (const info of stripList) {
+        if (info.interruptId) renderedInterruptIdsRef.current.delete(info.interruptId);
+      }
       const stripsByMsgId = new Map<string, HistoryInterruptInfo[]>();
       for (const info of stripList) {
         const arr = stripsByMsgId.get(info.assistantMessageId) || [];
@@ -4069,6 +4128,23 @@ export function useChatMessages(
         const actionRequests = event.action_requests || [];
         const actionType = actionRequests[0]?.type as string | undefined;
 
+        // A still-pending interrupt re-raised after a HITL resume streams into a
+        // fresh `assistant-hitl-*` bubble with the same interrupt_id. Suppress the
+        // duplicate CARD (the segment push) while keeping the map write + pending
+        // tracking below, so the original card stays answerable and the resume's
+        // pending set (cleared at resume start) still re-tracks it.
+        const interruptAlreadyRendered = event.interrupt_id
+          ? renderedInterruptIdsRef.current.has(event.interrupt_id)
+          : false;
+        if (event.interrupt_id) renderedInterruptIdsRef.current.add(event.interrupt_id);
+        // Every branch below MUST push its card segment through this helper so
+        // the re-raise suppression can't be forgotten on a future interrupt type.
+        const appendCardSegment = (
+          segs: AssistantMessage['contentSegments'] | undefined,
+          seg: AssistantMessage['contentSegments'][number],
+        ): AssistantMessage['contentSegments'] =>
+          interruptAlreadyRendered ? (segs || []) : [...(segs || []), seg];
+
         if (actionType === 'ask_user_question') {
           // --- User question interrupt ---
           const questionId = event.interrupt_id || `question-${Date.now()}`;
@@ -4078,10 +4154,7 @@ export function useChatMessages(
           setMessages((prev) =>
             updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
               ...msg,
-              contentSegments: [
-                ...(msg.contentSegments || []),
-                { type: 'user_question', questionId, order },
-              ],
+              contentSegments: appendCardSegment(msg.contentSegments, { type: 'user_question', questionId, order }),
               userQuestions: {
                 ...(msg.userQuestions || {}),
                 [questionId]: {
@@ -4113,10 +4186,7 @@ export function useChatMessages(
           setMessages((prev) =>
             updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
               ...msg,
-              contentSegments: [
-                ...(msg.contentSegments || []),
-                { type: 'create_workspace', proposalId, order },
-              ],
+              contentSegments: appendCardSegment(msg.contentSegments, { type: 'create_workspace', proposalId, order }),
               workspaceProposals: {
                 ...(msg.workspaceProposals || {}),
                 [proposalId]: {
@@ -4146,10 +4216,7 @@ export function useChatMessages(
           setMessages((prev) =>
             updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
               ...msg,
-              contentSegments: [
-                ...(msg.contentSegments || []),
-                { type: 'start_question', proposalId, order },
-              ],
+              contentSegments: appendCardSegment(msg.contentSegments, { type: 'start_question', proposalId, order }),
               questionProposals: {
                 ...(msg.questionProposals || {}),
                 [proposalId]: {
@@ -4179,10 +4246,7 @@ export function useChatMessages(
           setMessages((prev) =>
             updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
               ...msg,
-              contentSegments: [
-                ...(msg.contentSegments || []),
-                { type: 'ptc_agent' as const, proposalId, order },
-              ],
+              contentSegments: appendCardSegment(msg.contentSegments, { type: 'ptc_agent' as const, proposalId, order }),
               ptcAgentProposals: {
                 ...(msg.ptcAgentProposals || {}),
                 [proposalId]: {
@@ -4219,10 +4283,7 @@ export function useChatMessages(
           setMessages((prev) =>
             updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
               ...msg,
-              contentSegments: [
-                ...(msg.contentSegments || []),
-                { type: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread', proposalId, order },
-              ],
+              contentSegments: appendCardSegment(msg.contentSegments, { type: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread', proposalId, order }),
               secretaryActionProposals: {
                 ...(msg.secretaryActionProposals || {}),
                 [proposalId]: {
@@ -4257,10 +4318,7 @@ export function useChatMessages(
           setMessages((prev) =>
             updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
               ...msg,
-              contentSegments: [
-                ...(msg.contentSegments || []),
-                { type: 'plan_approval', planApprovalId, order },
-              ],
+              contentSegments: appendCardSegment(msg.contentSegments, { type: 'plan_approval', planApprovalId, order }),
               planApprovals: {
                 ...(msg.planApprovals || {}),
                 [planApprovalId]: {
@@ -4992,27 +5050,36 @@ export function useChatMessages(
         const finalId = currentMessageRef.current || assistantMessageId;
         cleanupAfterStreamEnd(finalId);
       }
+      // NOTE: an `assistant-hitl-*` bubble that finalizes empty (content landed
+      // elsewhere, or the turn re-interrupted and the re-raise was deduped) must
+      // NOT be pruned from state: a HITL resume is a backend turn, and
+      // edit/regenerate map UI position → turn_index by counting non-steering
+      // assistant bubbles. MessageList hides empty settled bubbles instead.
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, threadId, updateTodoListCard, updateSubagentCard, inactivateAllSubagents, finalizePendingTodos]);
 
   const handleApproveInterrupt = useCallback(() => {
     if (!pendingInterrupt) return;
-    const { interruptId, assistantMessageId, planApprovalId, planMode } = pendingInterrupt;
+    const { interruptId, planApprovalId, planMode } = pendingInterrupt;
     const approvalId = planApprovalId!;
 
-    // Update plan card status to "approved"
+    // Flip the plan card to "approved" wherever it lives (mirrors
+    // resolveProposal): a deduped re-raise can point pendingInterrupt at a
+    // hidden resume bubble, so a single-bubble write could miss the visible card.
     setMessages((prev) =>
-      updateMessage(prev,assistantMessageId!, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
-        ...msg,
-        planApprovals: {
-          ...(msg.planApprovals || {}),
-          [approvalId]: {
-            ...(msg.planApprovals?.[approvalId] || {}),
-            status: 'approved',
+      prev.map((m) => {
+        if (m.role !== 'assistant') return m;
+        const msg = m as AssistantMessage;
+        if (!msg.planApprovals?.[approvalId]) return m;
+        return {
+          ...msg,
+          planApprovals: {
+            ...msg.planApprovals,
+            [approvalId]: { ...msg.planApprovals[approvalId], status: 'approved' },
           },
-        },
-      }; })
+        };
+      })
     );
 
     const hitlResponse = {
@@ -5023,21 +5090,23 @@ export function useChatMessages(
 
   const handleRejectInterrupt = useCallback(() => {
     if (!pendingInterrupt) return;
-    const { interruptId, assistantMessageId, planApprovalId, planMode } = pendingInterrupt;
+    const { interruptId, planApprovalId, planMode } = pendingInterrupt;
     const approvalId = planApprovalId!;
 
-    // Update plan card status to "rejected"
+    // Flip the plan card to "rejected" wherever it lives (see approve above).
     setMessages((prev) =>
-      updateMessage(prev,assistantMessageId!, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
-        ...msg,
-        planApprovals: {
-          ...(msg.planApprovals || {}),
-          [approvalId]: {
-            ...(msg.planApprovals?.[approvalId] || {}),
-            status: 'rejected',
+      prev.map((m) => {
+        if (m.role !== 'assistant') return m;
+        const msg = m as AssistantMessage;
+        if (!msg.planApprovals?.[approvalId]) return m;
+        return {
+          ...msg,
+          planApprovals: {
+            ...msg.planApprovals,
+            [approvalId]: { ...msg.planApprovals[approvalId], status: 'rejected' },
           },
-        },
-      }; })
+        };
+      })
     );
 
     // Store interruptId + planMode so next handleSendMessage routes as rejection feedback
@@ -5304,6 +5373,16 @@ export function useChatMessages(
       recentlySentTrackerRef.current.track(message!.trim(), userMessage.timestamp, userMessage.id);
     }
 
+    // Rebuild the rendered-interrupt set from the cards that survive the
+    // truncation. The fork re-executes the turn server-side, and LangGraph
+    // interrupt ids are deterministic — the new run can legitimately re-raise
+    // the id of a card this truncation removes; a stale entry would suppress
+    // the new card and leave the interrupt unanswerable. Done synchronously
+    // (not in the setMessages updater) so the first stream event can't race
+    // the rebuild. `messages` here is the same render snapshot the caller
+    // computed truncateIndex against.
+    renderedInterruptIdsRef.current = collectRenderedInterruptIds(messages.slice(0, truncateIndex));
+
     setMessages((prev) => {
       const truncated = prev.slice(0, truncateIndex);
       const newMsgs = userMessage
@@ -5413,8 +5492,10 @@ export function useChatMessages(
         cleanupAfterStreamEnd(finalId);
       }
     }
+  // `messages` is a real dep: the rendered-interrupt rebuild above needs the
+  // same render snapshot the caller computed truncateIndex against.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspaceId, threadId, agentMode]);
+  }, [messages, workspaceId, threadId, agentMode]);
 
   /**
    * Edit a user message: truncate to before that message, send modified content
