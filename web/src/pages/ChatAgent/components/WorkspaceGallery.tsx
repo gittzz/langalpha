@@ -792,7 +792,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
    * list + quota and jump back to page 0 to reveal it.
    */
   const handleDuplicateConfirm = async () => {
-    if (!duplicateTarget) return;
+    if (!duplicateTarget || duplicateBusy) return;
     const wsId = duplicateTarget.workspace_id;
     setDuplicateBusy(true);
     try {
