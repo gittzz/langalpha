@@ -799,6 +799,9 @@ async def duplicate_workspace(
         The newly created workspace
     """
     async with _workspace_action_errors("duplicate", workspace_id):
+        workspace = await db_get_workspace(workspace_id)
+        require_workspace_owner(workspace, user_id=x_user_id)
+
         manager = WorkspaceManager.get_instance()
         new_workspace = await manager.duplicate_workspace(workspace_id, x_user_id)
 

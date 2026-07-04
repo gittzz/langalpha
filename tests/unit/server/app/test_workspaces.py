@@ -806,6 +806,51 @@ async def test_always_on_disable_does_not_start(client):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/v1/workspaces/{workspace_id}/duplicate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_duplicate_workspace_forbidden_for_non_owner(client):
+    """Ownership is enforced at the router (403), matching the sibling endpoints."""
+    ws = _ws(user_id="other-user", status="stopped")
+    with patch(
+        "src.server.app.workspaces.db_get_workspace",
+        new_callable=AsyncMock,
+        return_value=ws,
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/duplicate"
+        )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_duplicate_workspace_returns_created_copy(client):
+    ws = _ws(status="stopped")
+    copy = _ws(status="stopped")
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        mock_manager = AsyncMock()
+        mock_manager.duplicate_workspace = AsyncMock(return_value=copy)
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/duplicate"
+        )
+
+    assert resp.status_code == 201
+    assert resp.json()["workspace_id"] == copy["workspace_id"]
+    mock_manager.duplicate_workspace.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # GET /api/v1/workspaces/{workspace_id}/events — SSE status stream
 # ---------------------------------------------------------------------------
 
