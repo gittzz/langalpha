@@ -193,6 +193,13 @@ class SandboxRuntime(ABC):
         """
         raise NotImplementedError
 
+    async def set_autostop_interval(self, minutes: int) -> None:
+        """Set the idle auto-stop interval in minutes (0 disables auto-stop).
+
+        Not all providers support this; the default raises NotImplementedError.
+        """
+        raise NotImplementedError
+
     # -- Sessions (background processes) --
 
     async def create_session(self, session_id: str) -> None:
@@ -248,9 +255,18 @@ class SandboxProvider(ABC):
         self,
         *,
         env_vars: dict[str, str] | None = None,
+        tier: str | None = None,
+        auto_stop_minutes: int | None = None,
         **kwargs: Any,
     ) -> SandboxRuntime:
-        """Create a new sandbox runtime."""
+        """Create a new sandbox runtime.
+
+        Args:
+            env_vars: Environment variables injected at creation time.
+            tier: Resource tier name (provider-resolved; may be ignored by
+                providers without tiered sizing).
+            auto_stop_minutes: Auto-stop interval override in minutes (0 disables).
+        """
         ...
 
     @abstractmethod

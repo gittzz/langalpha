@@ -525,16 +525,18 @@ class TestDiscoveryKickSeesCachedSession:
         WorkspaceManager.reset_instance()
 
     @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.update_workspace_status", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.update_workspace_activity", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.SessionManager")
     async def test_recover_sandbox_caches_before_kick(
-        self, mock_session_mgr, mock_activity, mock_status
+        self, mock_session_mgr, mock_activity, mock_status, mock_get_ws
     ):
         """_recover_sandbox caches the session before _kick_mcp_discovery, so the
         kick's liveness check (``_sessions.get(ws) is session``) passes."""
         wm = WorkspaceManager.get_instance(config=_make_config())
         ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = {"resource_tier": "standard", "is_always_on": False}
 
         session = _make_session(version=1, summary="s")
         session.initialize = AsyncMock()
@@ -597,16 +599,18 @@ class TestDiscoveryKickSeesCachedSession:
         assert wm._sessions.get(ws_id) is session
 
     @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.update_workspace_status", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.update_workspace_activity", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.SessionManager")
     async def test_recover_sandbox_unwinds_cache_on_post_kick_failure(
-        self, mock_session_mgr, mock_activity, mock_status
+        self, mock_session_mgr, mock_activity, mock_status, mock_get_ws
     ):
         """If a post-kick step raises, the broken session is not left cached —
         preserving the old code's 'only cached on full success' semantics."""
         wm = WorkspaceManager.get_instance(config=_make_config())
         ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = {"resource_tier": "standard", "is_always_on": False}
 
         session = _make_session(version=1, summary="s")
         session.initialize = AsyncMock()
@@ -703,3 +707,131 @@ class TestClearSessionCancelsDiscovery:
         await wm._clear_session(ws_id)
 
         assert order == ["cancel", "cleanup"]
+
+
+# ---------------------------------------------------------------------------
+# set_workspace_spec downgrade disk-fit guard
+# ---------------------------------------------------------------------------
+
+
+class TestSetWorkspaceSpecDiskGuard:
+    """A tier downgrade recreates the sandbox on a smaller disk; restore is
+    best-effort, so the guard rejects (before any teardown) when the backed-up
+    files won't fit. Upgrades and lateral moves skip the check.
+    """
+
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+
+    def teardown_method(self):
+        WorkspaceManager.reset_instance()
+
+    @staticmethod
+    def _config_with_tiers():
+        config = _make_config()
+        config.sandbox.daytona.resource_tiers = {
+            "standard": MagicMock(cpu=1, memory=1, disk=3),
+            "performance": MagicMock(cpu=2, memory=4, disk=5),
+            "max": MagicMock(cpu=4, memory=8, disk=10),
+        }
+        return config
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_entitlements.get_workspace_total_size", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_set_workspace_resource_tier", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_entitlements.db_get_workspace", new_callable=AsyncMock)
+    async def test_running_downgrade_rejected_when_files_exceed_disk(
+        self, mock_get_ws, mock_session_mgr, mock_set_tier, mock_total_size
+    ):
+        wm = WorkspaceManager.get_instance(config=self._config_with_tiers())
+        ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = _make_workspace(
+            ws_id, status="running", resource_tier="max", sandbox_id="sb-1"
+        )
+        mock_total_size.return_value = 5 * 1024**3  # 5 GiB; standard usable ~1 GiB
+        wm._sessions[ws_id] = MagicMock(sandbox=MagicMock())
+        wm._backup_files_to_db = AsyncMock()
+        wm._recover_sandbox = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="Cannot downgrade"):
+            await wm.set_workspace_spec(ws_id, "standard", user_id="user-1")
+
+        # Backed up (for fresh sizes) but the live sandbox is never torn down.
+        wm._backup_files_to_db.assert_awaited_once()
+        wm._recover_sandbox.assert_not_awaited()
+        mock_session_mgr.cleanup_session.assert_not_called()
+        # Tier set to target optimistically, then reverted to the original.
+        assert mock_set_tier.await_args_list[0].args == (ws_id, "standard")
+        assert mock_set_tier.await_args_list[-1].args == (ws_id, "max")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_entitlements.get_workspace_total_size", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_set_workspace_resource_tier", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_entitlements.db_get_workspace", new_callable=AsyncMock)
+    async def test_running_downgrade_allowed_when_files_fit(
+        self, mock_get_ws, mock_session_mgr, mock_set_tier, mock_total_size
+    ):
+        wm = WorkspaceManager.get_instance(config=self._config_with_tiers())
+        ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = _make_workspace(
+            ws_id, status="running", resource_tier="max", sandbox_id="sb-1"
+        )
+        mock_total_size.return_value = 100 * 1024**2  # 100 MiB — fits standard
+        mock_session_mgr.cleanup_session = AsyncMock()
+        wm._sessions[ws_id] = MagicMock(sandbox=MagicMock())
+        wm._backup_files_to_db = AsyncMock()
+        wm._destroy_sandbox = AsyncMock()
+        wm._recover_sandbox = AsyncMock()
+
+        await wm.set_workspace_spec(ws_id, "standard", user_id="user-1")
+
+        wm._recover_sandbox.assert_awaited_once()
+        # Tier never reverted — the last write is the target.
+        assert mock_set_tier.await_args_list[-1].args == (ws_id, "standard")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_entitlements.get_workspace_total_size", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_set_workspace_resource_tier", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_entitlements.db_get_workspace", new_callable=AsyncMock)
+    async def test_upgrade_skips_disk_guard(
+        self, mock_get_ws, mock_session_mgr, mock_set_tier, mock_total_size
+    ):
+        wm = WorkspaceManager.get_instance(config=self._config_with_tiers())
+        ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = _make_workspace(
+            ws_id, status="running", resource_tier="standard", sandbox_id="sb-1"
+        )
+        mock_session_mgr.cleanup_session = AsyncMock()
+        wm._sessions[ws_id] = MagicMock(sandbox=MagicMock())
+        wm._backup_files_to_db = AsyncMock()
+        wm._destroy_sandbox = AsyncMock()
+        wm._recover_sandbox = AsyncMock()
+
+        await wm.set_workspace_spec(ws_id, "max", user_id="user-1")
+
+        mock_total_size.assert_not_awaited()  # no fit check on an upgrade
+        wm._recover_sandbox.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_entitlements.get_workspace_total_size", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_set_workspace_resource_tier", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_entitlements.db_get_workspace", new_callable=AsyncMock)
+    async def test_stopped_downgrade_rejected_before_destroy(
+        self, mock_get_ws, mock_set_tier, mock_total_size
+    ):
+        wm = WorkspaceManager.get_instance(config=self._config_with_tiers())
+        ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = _make_workspace(
+            ws_id, status="stopped", resource_tier="max", sandbox_id="sb-1"
+        )
+        mock_total_size.return_value = 5 * 1024**3
+        wm._destroy_sandbox = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="Cannot downgrade"):
+            await wm.set_workspace_spec(ws_id, "standard", user_id="user-1")
+
+        wm._destroy_sandbox.assert_not_awaited()
+        assert mock_set_tier.await_args_list[-1].args == (ws_id, "max")  # reverted

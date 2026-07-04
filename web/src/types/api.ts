@@ -28,12 +28,19 @@ export interface UserPreferences {
 
 // --- Workspace ---
 
+/** Sandbox resource tier. */
+export type ResourceTier = 'standard' | 'performance' | 'max';
+
 export interface Workspace {
   workspace_id: string;
   name: string;
   status?: string;
   description?: string;
   config?: Record<string, unknown>;
+  /** Sandbox resource tier. Absent on flash / legacy rows. */
+  resource_tier?: ResourceTier;
+  /** Keep the sandbox running (idle auto-stop disabled). Absent on flash / legacy rows. */
+  is_always_on?: boolean;
   created_at?: string;
   updated_at?: string;
   [key: string]: unknown;
@@ -42,6 +49,22 @@ export interface Workspace {
 export interface WorkspacesResponse {
   workspaces: Workspace[];
   total?: number;
+}
+
+/** Count-quota status for one elevated capability. `limit === -1` means unlimited. */
+export interface WorkspaceCapacity {
+  used: number;
+  limit: number;
+}
+
+/**
+ * Per-capability workspace quotas (platform mode only). Each field is null when the
+ * quota does not apply — OSS mode, the platform is unreachable, or no count reported.
+ */
+export interface WorkspaceQuota {
+  performance: WorkspaceCapacity | null;
+  max: WorkspaceCapacity | null;
+  always_on: WorkspaceCapacity | null;
 }
 
 export interface ReorderItem {

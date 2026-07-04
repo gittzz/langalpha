@@ -13,6 +13,7 @@ from daytona_sdk.common.daytona import (
     CreateSandboxFromSnapshotParams,
     Image,
 )
+from daytona_sdk.common.sandbox import Resources
 from daytona_sdk.common.process import CodeRunParams, SessionExecuteRequest
 from daytona_sdk.common.snapshot import CreateSnapshotParams
 
@@ -293,10 +294,23 @@ class DaytonaRuntime(SandboxRuntime):
 
     @property
     def capabilities(self) -> set[str]:
-        return {"exec", "code_run", "file_io", "archive", "snapshot", "preview_url", "sessions"}
+        return {
+            "exec",
+            "code_run",
+            "file_io",
+            "archive",
+            "snapshot",
+            "preview_url",
+            "sessions",
+            "autostop",
+        }
 
     async def archive(self) -> None:
         await self._sandbox.archive()
+
+    async def set_autostop_interval(self, minutes: int) -> None:
+        """Set the idle auto-stop interval in minutes (0 disables auto-stop)."""
+        await self._sandbox.set_autostop_interval(minutes)
 
     async def get_metadata(self) -> dict[str, Any]:
         meta: dict[str, Any] = {
@@ -345,6 +359,8 @@ class DaytonaProvider(SandboxProvider):
         *,
         env_vars: dict[str, str] | None = None,
         mcp_packages: list[str] | None = None,
+        tier: str | None = None,
+        auto_stop_minutes: int | None = None,
         **kwargs: Any,
     ) -> DaytonaRuntime:
         """Create a new Daytona sandbox, optionally from a snapshot.
@@ -352,19 +368,75 @@ class DaytonaProvider(SandboxProvider):
         Args:
             env_vars: Environment variables injected at creation time.
             mcp_packages: NPM packages for MCP servers (needed for snapshot).
+            tier: Resource tier name. Hosted Daytona can't resize a snapshot
+                sandbox or override its resources at create time, so a tier's
+                cpu/mem/disk is baked into a tier-specific snapshot. ``None``
+                resolves to the configured default tier, whose size is applied
+                the same way. An unknown (removed-from-config) tier falls back to
+                a base-sized sandbox so the workspace stays recoverable.
+            auto_stop_minutes: Auto-stop interval override in minutes (0 disables,
+                for always-on). ``None`` uses the configured default.
             **kwargs: Extra keyword arguments (reserved for future use).
 
         Returns:
             A DaytonaRuntime wrapping the new sandbox.
         """
+        # Resolve resources for every tier uniformly (including the default) so
+        # the configured default-tier cpu/mem/disk actually take effect instead
+        # of falling through to the Daytona platform default. The default tier is
+        # guaranteed present by DaytonaConfig's model validator.
+        effective_tier = tier or self._config.default_tier
+        is_default_tier = effective_tier == self._config.default_tier
+
+        resources: Resources | None = None
+        rt = self._config.resource_tiers.get(effective_tier)
+        if rt is not None:
+            resources = Resources(cpu=rt.cpu, memory=rt.memory, disk=rt.disk)
+        elif not is_default_tier:
+            # A persisted tier (e.g. from _recover_sandbox/duplicate) that was
+            # later removed from config. Raising here would make that workspace
+            # unrecoverable, so warn and fall back to the base snapshot instead of
+            # locking the user out.
+            logger.warning(
+                "Unknown resource tier %r; creating base-sized sandbox",
+                effective_tier,
+            )
+
         snapshot_name = await self._ensure_snapshot(
-            mcp_packages=mcp_packages or []
+            mcp_packages=mcp_packages or [],
+            tier=effective_tier,
+            resources=resources,
         )
 
+        # An elevated (non-default) tier's size lives only in its snapshot. If
+        # that snapshot's BUILD failed, creating from the base (snapshot=None)
+        # would silently under-provision a billed tier — fail loudly so the caller
+        # (e.g. set_workspace_spec) reverts the tier instead of charging for a
+        # size the user never received. Guarded on snapshot_enabled so a globally
+        # snapshots-disabled deployment still creates a base-sized sandbox rather
+        # than raising (it never expected a sized snapshot in the first place).
+        # The default tier is exempt: base-sized ~= default, so a missing default
+        # snapshot degrades gracefully instead of hard-failing sandbox creation.
+        if (
+            resources is not None
+            and not is_default_tier
+            and snapshot_name is None
+            and self._config.snapshot_enabled
+        ):
+            raise RuntimeError(
+                f"Could not provision the {effective_tier!r} tier snapshot; "
+                "refusing to create a base-sized sandbox for an elevated tier"
+            )
+
+        auto_stop = (
+            auto_stop_minutes
+            if auto_stop_minutes is not None
+            else self._config.auto_stop_interval // 60
+        )
         params = CreateSandboxFromSnapshotParams(
             snapshot=snapshot_name if snapshot_name else None,
             env_vars=env_vars or None,
-            auto_stop_interval=self._config.auto_stop_interval // 60,
+            auto_stop_interval=auto_stop,
             auto_archive_interval=self._config.auto_archive_interval // 60,
             auto_delete_interval=self._config.auto_delete_interval // 60,
         )
@@ -424,14 +496,32 @@ class DaytonaProvider(SandboxProvider):
     # -- Snapshot management --
 
     def _get_snapshot_hash(
-        self, mcp_packages: list[str] | None = None
+        self,
+        mcp_packages: list[str] | None = None,
+        *,
+        resources: Resources | None = None,
     ) -> str:
-        """Generate an 8-char hash for snapshot versioning."""
+        """Generate an 8-char hash for snapshot versioning.
+
+        ``resources`` (cpu/memory/disk) are folded into the hash so a tier's size
+        is part of its snapshot identity. Hosted Daytona bakes size into the
+        snapshot at build time, so retuning a tier's cpu/mem/disk must yield a new
+        hash — otherwise the stale-sized snapshot would be reused silently.
+        """
         config_data = {
             "base_image": "ubuntu:24.04",
             "working_dir": self._working_dir,
             "python_version": self.SNAPSHOT_PYTHON_VERSION,
             "dependencies": self.DEFAULT_DEPENDENCIES,
+            "resources": (
+                {
+                    "cpu": resources.cpu,
+                    "memory": resources.memory,
+                    "disk": resources.disk,
+                }
+                if resources is not None
+                else None
+            ),
             # The apt-list strings below (e.g. "nodejs", "playwright") are static
             # labels — they stay identical when the pinned Node version or the baked
             # Playwright browser layout changes, so hash those explicitly to force a
@@ -579,9 +669,18 @@ class DaytonaProvider(SandboxProvider):
         return image
 
     async def _ensure_snapshot(
-        self, mcp_packages: list[str] | None = None
+        self,
+        mcp_packages: list[str] | None = None,
+        *,
+        tier: str | None = None,
+        resources: Resources | None = None,
     ) -> str | None:
         """Ensure a snapshot exists for the current configuration.
+
+        When ``resources`` is given (a non-default tier), they're baked into a
+        tier-specific snapshot — the only way to size a snapshot-born sandbox on
+        hosted Daytona, which supports neither runtime resize nor per-sandbox
+        resource overrides.
 
         Returns:
             Snapshot name if available, None otherwise.
@@ -590,9 +689,12 @@ class DaytonaProvider(SandboxProvider):
             logger.debug("Snapshot feature disabled in config")
             return None
 
-        config_hash = self._get_snapshot_hash(mcp_packages)
+        config_hash = self._get_snapshot_hash(mcp_packages, resources=resources)
         base_name = self._config.snapshot_name or "ptc-base"
-        snapshot_name = f"{base_name}-{config_hash}"
+        if resources is not None:
+            snapshot_name = f"{base_name}-{tier}-{config_hash}"
+        else:
+            snapshot_name = f"{base_name}-{config_hash}"
 
         logger.info("Checking for snapshot", snapshot_name=snapshot_name)
 
@@ -697,7 +799,9 @@ class DaytonaProvider(SandboxProvider):
 
             try:
                 await self._client.snapshot.create(
-                    CreateSnapshotParams(name=snapshot_name, image=image),
+                    CreateSnapshotParams(
+                        name=snapshot_name, image=image, resources=resources
+                    ),
                     on_logs=lambda log: logger.debug(
                         "Snapshot build", log=log
                     ),

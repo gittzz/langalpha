@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Plus, Loader2, Search, ArrowDownUp, MoreHorizontal, Zap, MessageSquareText, Pin, Trash2, GripVertical, Check, Pencil } from 'lucide-react';
+import { Plus, Loader2, Search, ArrowDownUp, MoreHorizontal, Zap, MessageSquareText, Pin, Trash2, GripVertical, Check, Pencil, Cpu, Copy, Infinity as InfinityIcon } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -8,37 +8,81 @@ import type { DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, useSortable, arrayMove, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { toast } from '@/components/ui/use-toast';
+import { isPlatformMode } from '@/config/hostMode';
+import type { ResourceTier, Workspace } from '@/types/api';
 import CreateWorkspaceModal from './CreateWorkspaceModal';
 import DeleteConfirmModal from './DeleteConfirmModal';
+import ChangeSpecDialog, { normalizeTier, tierLabel } from './ChangeSpecDialog';
+import RenameWorkspaceDialog from './RenameWorkspaceDialog';
+import DuplicateWorkspaceDialog from './DuplicateWorkspaceDialog';
+import AlwaysOnConfirmDialog from './AlwaysOnConfirmDialog';
 import MorphingPageDots from '../../../components/ui/morphing-page-dots';
 import { useIsMobile, getIsMobileSnapshot } from '@/hooks/useIsMobile';
 import { useWorkspaces } from '../../../hooks/useWorkspaces';
 import { queryKeys } from '../../../lib/queryKeys';
-import { createWorkspace, deleteWorkspace, getFlashWorkspace, updateWorkspace, reorderWorkspaces } from '../utils/api';
+import {
+  createWorkspace,
+  deleteWorkspace,
+  getFlashWorkspace,
+  updateWorkspace,
+  reorderWorkspaces,
+  renameWorkspace,
+  setWorkspaceSpec,
+  setWorkspaceAlwaysOn,
+  duplicateWorkspace,
+  getWorkspaceQuota,
+  formatApiErrorDetail,
+  apiErrorDetailMessage,
+  apiErrorStatus,
+} from '../utils/api';
 import { removeStoredThreadId } from '../hooks/useChatMessages';
 import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
 import { forgetNavPanelExpansion } from './navExpansionStore';
 import { forgetStableNavOrder, forgetSharedWorkspaceThreads } from '../hooks/useNavigationData';
 import { clearChatSession } from '../hooks/utils/chatSessionRestore';
+import { useWorkspaceMutation, patchCachedWorkspace, rollbackCachedWorkspaces } from '../hooks/useWorkspaceMutation';
 
 const DEFAULT_PAGE_SIZE = 8;
 
-interface WorkspaceRecord {
-  workspace_id: string;
-  name: string;
-  description?: string;
-  status?: string;
-  is_pinned?: boolean;
-  sort_order?: number;
-  updated_at?: string;
-  [key: string]: unknown;
+/**
+ * Map a mutation error to user-facing copy. In platform mode the backend gates
+ * elevated tiers / always-on: 403 = capability not on plan, 429 = count limit
+ * reached. OSS mode never returns these, so we fall through to the generic
+ * detail message.
+ */
+function entitlementErrorMessage(
+  err: unknown,
+  t: ReturnType<typeof useTranslation>['t'],
+  tier?: ResourceTier,
+): string {
+  if (isPlatformMode) {
+    const status = apiErrorStatus(err);
+    if (status === 403) {
+      return t('workspace.notOnPlan', 'Not available on your plan — upgrade to unlock.');
+    }
+    if (status === 429) {
+      // Prefer the platform's structured quota message when it forwards one
+      // (detail: { message, type, current, limit, remaining }); fall back to
+      // the localized generic copy otherwise.
+      const platformMessage = apiErrorDetailMessage(err);
+      if (platformMessage) return platformMessage;
+      if (tier) {
+        return t('workspace.tierLimitReached', "You've reached your {{tier}} workspace limit.", {
+          tier: tierLabel(t, tier),
+        });
+      }
+      return t('workspace.workspaceLimitReached', "You've reached your workspace limit.");
+    }
+  }
+  return formatApiErrorDetail(err);
 }
 
-// Shape of a cached workspace-list query entry (queryKeys.workspaces.lists()).
-interface CachedWorkspaceList {
-  workspaces: WorkspaceRecord[];
-  [key: string]: unknown;
+// Gallery view of a workspace: the shared DTO plus manual-order metadata.
+interface WorkspaceRecord extends Workspace {
+  is_pinned?: boolean;
+  sort_order?: number;
 }
 
 interface DeleteModalState {
@@ -74,11 +118,15 @@ interface CardMenuProps {
   workspace: WorkspaceRecord;
   onTogglePin: (workspace: WorkspaceRecord) => void;
   onRename: (workspace: WorkspaceRecord) => void;
+  onUpgrade: (workspace: WorkspaceRecord) => void;
+  onToggleAlwaysOn: (workspace: WorkspaceRecord) => void;
+  onDuplicate: (workspace: WorkspaceRecord) => void;
   onDelete: (workspace: WorkspaceRecord) => void;
 }
 
-function CardMenu({ workspace, onTogglePin, onRename, onDelete }: CardMenuProps) {
+function CardMenu({ workspace, onTogglePin, onRename, onUpgrade, onToggleAlwaysOn, onDuplicate, onDelete }: CardMenuProps) {
   const { t } = useTranslation();
+  const isAlwaysOn = workspace.is_always_on === true;
 
   return (
     <DropdownMenu modal={false}>
@@ -100,6 +148,22 @@ function CardMenu({ workspace, onTogglePin, onRename, onDelete }: CardMenuProps)
           <Pencil className="h-4 w-4" />
           {t('workspace.rename')}
         </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => onUpgrade(workspace)}>
+          <Cpu className="h-4 w-4" />
+          {t('workspace.changeSpec', 'Change spec')}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onToggleAlwaysOn(workspace)}>
+          <InfinityIcon className="h-4 w-4" />
+          {isAlwaysOn
+            ? t('workspace.alwaysOnDisable', 'Turn off always-on')
+            : t('workspace.alwaysOnEnable', 'Turn on always-on')}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onDuplicate(workspace)}>
+          <Copy className="h-4 w-4" />
+          {t('workspace.duplicate', 'Duplicate')}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem variant="destructive" onSelect={() => onDelete(workspace)}>
           <Trash2 className="h-4 w-4" />
           {t('common.delete', 'Delete')}
@@ -183,41 +247,22 @@ interface WorkspaceCardProps {
   onSelect: (wsId: string, name?: string, status?: string) => void;
   onTogglePin: (workspace: WorkspaceRecord) => void;
   onRenameStart: (workspace: WorkspaceRecord) => void;
-  onRenameSubmit: (wsId: string, name: string) => void;
-  onRenameCancel: () => void;
+  onUpgrade: (workspace: WorkspaceRecord) => void;
+  onToggleAlwaysOn: (workspace: WorkspaceRecord) => void;
+  onDuplicate: (workspace: WorkspaceRecord) => void;
   onDelete: (workspace: WorkspaceRecord) => void;
-  isRenaming?: boolean;
   prefetchThreads?: (wsId: string) => void;
   index?: number;
 }
 
-function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRenameSubmit, onRenameCancel, onDelete, isRenaming, prefetchThreads, index }: WorkspaceCardProps) {
+function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onUpgrade, onToggleAlwaysOn, onDuplicate, onDelete, prefetchThreads, index }: WorkspaceCardProps) {
   const { t, i18n } = useTranslation();
   const isMobile = useIsMobile();
   const isFlash = workspace.status === 'flash';
 
-  // Inline rename — the title becomes a text input while editing. Commit on
-  // Enter/blur, cancel on Escape; the parent guards the trailing blur-after-Enter.
-  const [renameDraft, setRenameDraft] = useState(workspace.name);
-  const renameInputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (!isRenaming) return;
-    // Seed the draft once on entry only. Re-running on workspace.name would let a
-    // background refetch (e.g. another session's rename) clobber the in-progress
-    // input mid-edit, so it's intentionally absent from the deps.
-    setRenameDraft(workspace.name);
-    const raf = requestAnimationFrame(() => {
-      renameInputRef.current?.focus();
-      renameInputRef.current?.select();
-    });
-    return () => cancelAnimationFrame(raf);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isRenaming]);
-  const commitRename = () => {
-    const name = renameDraft.trim();
-    if (name && name !== workspace.name) onRenameSubmit(workspace.workspace_id, name);
-    else onRenameCancel();
-  };
+  const tier = normalizeTier(workspace.resource_tier);
+  const showTierBadge = !isFlash && tier !== 'standard';
+  const showAlwaysOn = !isFlash && workspace.is_always_on === true;
 
   return (
     <div
@@ -229,7 +274,7 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRena
         onMouseEnter={!isMobile ? () => prefetchThreads?.(workspace.workspace_id) : undefined}
       >
         <div
-          onClick={() => { if (!isRenaming) onSelect(workspace.workspace_id, workspace.name, workspace.status); }}
+          onClick={() => onSelect(workspace.workspace_id, workspace.name, workspace.status)}
           className="relative flex cursor-pointer flex-col overflow-hidden rounded-xl py-4 pl-5 pr-4 transition-all ease-in-out hover:shadow-sm active:scale-[0.98] h-full w-full"
           style={{
             background: isFlash
@@ -250,34 +295,41 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRena
               {!isFlash && workspace.is_pinned && (
                 <Pin className="h-3.5 w-3.5 flex-shrink-0 rotate-45" style={{ color: 'var(--color-text-tertiary)' }} />
               )}
-              {isRenaming ? (
-                <input
-                  ref={renameInputRef}
-                  className="font-medium bg-transparent outline-none border-b min-w-0 flex-1"
-                  style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-muted)' }}
-                  value={renameDraft}
-                  onChange={(e) => setRenameDraft(e.target.value)}
-                  onClick={(e) => e.stopPropagation()}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
-                    else if (e.key === 'Escape') { e.preventDefault(); onRenameCancel(); }
-                  }}
-                  onBlur={commitRename}
-                  aria-label={t('workspace.rename')}
-                />
-              ) : (
-                <div className="font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-                  {workspace.name}
-                </div>
-              )}
+              <div className="font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
+                {workspace.name}
+              </div>
             </div>
             <div className="text-sm line-clamp-2 flex-grow" style={{ color: 'var(--color-text-tertiary)' }}>
               {workspace.description || ''}
             </div>
-            <div className="text-xs mt-auto pt-3 flex justify-between" style={{ color: 'var(--color-text-tertiary)' }}>
-              <span>
+            <div className="text-xs mt-auto pt-3 flex items-center justify-between gap-2" style={{ color: 'var(--color-text-tertiary)' }}>
+              <span className="truncate">
                 {t('workspace.updated', { time: workspace.updated_at ? new Date(workspace.updated_at).toLocaleDateString(i18n.language, { month: 'short', day: 'numeric' }) : t('workspace.recently') })}
               </span>
+              {(showTierBadge || showAlwaysOn) && (
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                  {showTierBadge && (
+                    <span
+                      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                      style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}
+                      title={t('workspace.tierBadgeTitle', { tier: tierLabel(t, tier) })}
+                    >
+                      <Cpu className="h-3 w-3" />
+                      {tierLabel(t, tier)}
+                    </span>
+                  )}
+                  {showAlwaysOn && (
+                    <span
+                      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                      style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-secondary)' }}
+                      title={t('workspace.alwaysOnBadgeTitle', 'Always-on — sandbox stays running')}
+                    >
+                      <InfinityIcon className="h-3 w-3" />
+                      {t('workspace.alwaysOnBadge', 'Always-on')}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -285,7 +337,15 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onRena
         {/* Menu (no drag handle in normal mode) */}
         {!isFlash && (
           <div className={`absolute top-3 right-3 z-10 transition-opacity ${isMobile ? 'opacity-60' : 'opacity-0 group-focus-within:opacity-100 group-hover:opacity-100'}`}>
-            <CardMenu workspace={workspace} onTogglePin={onTogglePin} onRename={onRenameStart} onDelete={onDelete} />
+            <CardMenu
+              workspace={workspace}
+              onTogglePin={onTogglePin}
+              onRename={onRenameStart}
+              onUpgrade={onUpgrade}
+              onToggleAlwaysOn={onToggleAlwaysOn}
+              onDuplicate={onDuplicate}
+              onDelete={onDelete}
+            />
           </div>
         )}
       </div>
@@ -322,8 +382,14 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   const [currentPage, setCurrentPage] = useState(0);
   const [isReorderMode, setIsReorderMode] = useState(false);
   const [allWorkspaces, setAllWorkspaces] = useState<WorkspaceRecord[]>([]);
-  const [renamingWsId, setRenamingWsId] = useState<string | null>(null);
-  const renamingWsIdRef = useRef<string | null>(null); // shadows state so the trailing blur-after-Enter no-ops
+  // Rename / Change-spec / Duplicate / Always-on dialogs each target one workspace
+  // at a time. Enabling always-on bills 24/7, so it asks for confirmation first;
+  // disabling is harmless and toggles directly.
+  const [renameTarget, setRenameTarget] = useState<WorkspaceRecord | null>(null);
+  const [upgradeTarget, setUpgradeTarget] = useState<WorkspaceRecord | null>(null);
+  const [duplicateTarget, setDuplicateTarget] = useState<WorkspaceRecord | null>(null);
+  const [duplicateBusy, setDuplicateBusy] = useState(false);
+  const [alwaysOnTarget, setAlwaysOnTarget] = useState<WorkspaceRecord | null>(null);
   const navigate = useNavigate();
   const { workspaceId: currentWorkspaceId } = useParams();
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -359,6 +425,15 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
     queryKey: queryKeys.workspaces.flash(),
     queryFn: getFlashWorkspace,
     staleTime: 5 * 60_000,
+  });
+
+  // Per-tier count quotas — drives the "N left" hint in the change-spec dialog.
+  // Platform mode only, fetched lazily when the dialog opens; null in OSS mode.
+  const { data: workspaceQuota } = useQuery({
+    queryKey: queryKeys.workspaces.quota(),
+    queryFn: getWorkspaceQuota,
+    enabled: isPlatformMode && !!upgradeTarget,
+    staleTime: 60_000,
   });
 
   // Reorder mode: fetch all workspaces
@@ -610,25 +685,15 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   };
 
   /**
-   * Toggle pin state with optimistic update and rollback on error.
+   * Toggle pin state with optimistic update and rollback on error. Kept separate
+   * from useWorkspaceMutation: no toast on error and a custom success side effect
+   * (pinning reorders the list, so we snap back to page 0).
    */
   const handleTogglePin = async (workspace: WorkspaceRecord) => {
     const newPinned = !workspace.is_pinned;
     const wsId = workspace.workspace_id;
 
-    // Snapshot + optimistic flip across all cached workspace lists
-    const previous = queryClient.getQueriesData({ queryKey: queryKeys.workspaces.lists() });
-    previous.forEach(([key, data]: [unknown, unknown]) => {
-      const d = data as CachedWorkspaceList | undefined;
-      if (!d?.workspaces) return;
-      queryClient.setQueryData(key as readonly unknown[], {
-        ...d,
-        workspaces: d.workspaces.map((ws) =>
-          ws.workspace_id === wsId ? { ...ws, is_pinned: newPinned } : ws
-        ),
-      });
-    });
-
+    const previous = patchCachedWorkspace(queryClient, wsId, { is_pinned: newPinned });
     try {
       await updateWorkspace(wsId, { is_pinned: newPinned });
       // Refetch from server -- pinning changes global sort order
@@ -639,56 +704,111 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
       }
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
     } catch (err) {
-      // Rollback optimistic update
-      previous.forEach(([key, data]: [unknown, unknown]) => queryClient.setQueryData(key as readonly unknown[], data));
+      rollbackCachedWorkspaces(queryClient, previous);
       console.error('Error toggling pin:', err);
     }
   };
 
-  /**
-   * Start an inline rename on a card (opens the title input).
-   */
+  // Rename: plain error map. Upgrade + always-on: entitlement-aware map + quota
+  // invalidation. run() returns true on success so the dialog closes / toasts.
+  const renameMutation = useWorkspaceMutation<string>({
+    mutationFn: (wsId, name) => renameWorkspace(wsId, name),
+    optimisticPatch: (name) => ({ name }),
+    errorTitleKey: 'workspace.renameFailed',
+  });
+  const upgradeMutation = useWorkspaceMutation<ResourceTier>({
+    mutationFn: (wsId, tier) => setWorkspaceSpec(wsId, tier),
+    optimisticPatch: (tier) => ({ resource_tier: tier }),
+    invalidateQuota: true,
+    errorTitleKey: 'workspace.specFailed',
+    mapError: (err, tier) => entitlementErrorMessage(err, t, tier),
+  });
+  const alwaysOnMutation = useWorkspaceMutation<boolean>({
+    mutationFn: (wsId, next) => setWorkspaceAlwaysOn(wsId, next),
+    optimisticPatch: (next) => ({ is_always_on: next }),
+    invalidateQuota: true,
+    errorTitleKey: 'workspace.alwaysOnFailed',
+    mapError: (err) => entitlementErrorMessage(err, t),
+  });
+
+  /** Open the rename dialog (the card menu's Rename action). */
   const handleRenameStart = (workspace: WorkspaceRecord) => {
-    renamingWsIdRef.current = workspace.workspace_id;
-    setRenamingWsId(workspace.workspace_id);
+    setRenameTarget(workspace);
   };
 
-  const handleRenameCancel = () => {
-    renamingWsIdRef.current = null;
-    setRenamingWsId(null);
+  /** Commit the rename dialog; close on success. */
+  const handleRenameSubmit = async (name: string) => {
+    if (!renameTarget) return;
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === renameTarget.name) {
+      setRenameTarget(null);
+      return;
+    }
+    const ok = await renameMutation.run(renameTarget.workspace_id, trimmed);
+    if (ok) setRenameTarget(null);
+  };
+
+  /** Open the change-spec dialog. */
+  const handleUpgradeStart = (workspace: WorkspaceRecord) => {
+    setUpgradeTarget(workspace);
+  };
+
+  /** Commit the chosen tier; close + toast on success. */
+  const handleUpgradeSubmit = async (tier: ResourceTier) => {
+    if (!upgradeTarget) return;
+    const ok = await upgradeMutation.run(upgradeTarget.workspace_id, tier);
+    if (ok) {
+      setUpgradeTarget(null);
+      toast({ title: t('workspace.specUpdated', 'Workspace spec updated'), description: tierLabel(t, tier) });
+    }
   };
 
   /**
-   * Commit a rename: optimistic update across cached lists, persist, then
-   * invalidate the list + detail caches so every surface (gallery, nav panel,
-   * FilePanel header) reflects the new name. Rolls back on error.
+   * Apply an always-on change (enabling is gated in platform mode, disabling is
+   * always allowed). Closes the confirm dialog on success. The mutation's busy
+   * set dedupes double-submits inside its functional updater.
    */
-  const handleRenameSubmit = async (wsId: string, name: string) => {
-    if (renamingWsIdRef.current !== wsId) return; // idempotent: trailing blur after Enter no-ops
-    renamingWsIdRef.current = null;
-    setRenamingWsId(null);
-    const trimmed = name.trim();
-    if (!trimmed) return;
+  const applyAlwaysOn = async (workspace: WorkspaceRecord, next: boolean) => {
+    const ok = await alwaysOnMutation.run(workspace.workspace_id, next);
+    if (ok) setAlwaysOnTarget((cur) => (cur?.workspace_id === workspace.workspace_id ? null : cur));
+  };
 
-    const previous = queryClient.getQueriesData({ queryKey: queryKeys.workspaces.lists() });
-    previous.forEach(([key, data]: [unknown, unknown]) => {
-      const d = data as CachedWorkspaceList | undefined;
-      if (!d?.workspaces) return;
-      queryClient.setQueryData(key as readonly unknown[], {
-        ...d,
-        workspaces: d.workspaces.map((ws) =>
-          ws.workspace_id === wsId ? { ...ws, name: trimmed } : ws
-        ),
-      });
-    });
+  /**
+   * Card-menu entry point. Enabling opens a confirmation (24/7 billing); disabling
+   * applies directly. Ignored while a toggle for this workspace is in flight.
+   */
+  const handleToggleAlwaysOn = (workspace: WorkspaceRecord) => {
+    if (alwaysOnMutation.busyIds.has(workspace.workspace_id)) return;
+    if (workspace.is_always_on === true) {
+      void applyAlwaysOn(workspace, false);
+    } else {
+      setAlwaysOnTarget(workspace);
+    }
+  };
 
+  /**
+   * Confirm + run a duplicate. The copy is a new workspace (and inherits the
+   * source's tier, so it can consume a per-tier quota slot) — invalidate the
+   * list + quota and jump back to page 0 to reveal it.
+   */
+  const handleDuplicateConfirm = async () => {
+    if (!duplicateTarget || duplicateBusy) return;
+    const wsId = duplicateTarget.workspace_id;
+    setDuplicateBusy(true);
     try {
-      await updateWorkspace(wsId, { name: trimmed });
+      await duplicateWorkspace(wsId);
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
-      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.detail(wsId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
+      slideDirectionRef.current = -1;
+      gridHeightRef.current = null;
+      setCurrentPage(0);
+      setDuplicateTarget(null);
+      toast({ title: t('workspace.duplicated', 'Workspace duplicated') });
     } catch (err) {
-      previous.forEach(([key, data]: [unknown, unknown]) => queryClient.setQueryData(key as readonly unknown[], data));
-      console.error('Error renaming workspace:', err);
+      console.error('Error duplicating workspace:', err);
+      toast({ variant: 'destructive', title: t('workspace.duplicateFailed', 'Could not duplicate workspace'), description: entitlementErrorMessage(err, t) });
+    } finally {
+      setDuplicateBusy(false);
     }
   };
 
@@ -928,9 +1048,9 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               onSelect={onWorkspaceSelect}
               onTogglePin={handleTogglePin}
               onRenameStart={handleRenameStart}
-              onRenameSubmit={handleRenameSubmit}
-              onRenameCancel={handleRenameCancel}
-              isRenaming={renamingWsId === workspace.workspace_id}
+              onUpgrade={handleUpgradeStart}
+              onToggleAlwaysOn={handleToggleAlwaysOn}
+              onDuplicate={setDuplicateTarget}
               onDelete={handleDeleteClick}
               prefetchThreads={prefetchThreads}
             />
@@ -1126,6 +1246,39 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
         onCancel={handleCancelDelete}
         isDeleting={isDeleting}
         error={deleteError}
+      />
+
+      {/* Rename Dialog */}
+      <RenameWorkspaceDialog
+        target={renameTarget}
+        onClose={() => setRenameTarget(null)}
+        onSubmit={(name) => void handleRenameSubmit(name)}
+        busy={renameTarget ? renameMutation.busyIds.has(renameTarget.workspace_id) : false}
+      />
+
+      {/* Change Spec Dialog */}
+      <ChangeSpecDialog
+        target={upgradeTarget}
+        onClose={() => setUpgradeTarget(null)}
+        onSubmit={(tier) => void handleUpgradeSubmit(tier)}
+        busy={upgradeTarget ? upgradeMutation.busyIds.has(upgradeTarget.workspace_id) : false}
+        quota={workspaceQuota}
+      />
+
+      {/* Duplicate Confirmation Dialog */}
+      <DuplicateWorkspaceDialog
+        target={duplicateTarget}
+        onClose={() => setDuplicateTarget(null)}
+        onConfirm={() => void handleDuplicateConfirm()}
+        busy={duplicateBusy}
+      />
+
+      {/* Always-On Enable Confirmation Dialog */}
+      <AlwaysOnConfirmDialog
+        target={alwaysOnTarget}
+        onClose={() => setAlwaysOnTarget(null)}
+        onConfirm={() => { if (alwaysOnTarget) void applyAlwaysOn(alwaysOnTarget, true); }}
+        busy={alwaysOnTarget ? alwaysOnMutation.busyIds.has(alwaysOnTarget.workspace_id) : false}
       />
     </div>
   );

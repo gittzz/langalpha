@@ -4,8 +4,16 @@
  */
 import { api } from '@/api/client';
 import { supabase } from '@/lib/supabase';
+import type { ResourceTier, WorkspaceQuota } from '@/types/api';
 
 const baseURL = api.defaults.baseURL;
+
+// The shared axios instance sets no global timeout. Workspace-management ops
+// legitimately run tens of seconds (a spec change rebuilds the sandbox,
+// duplicate provisions one), so these bounds are generous — they convert a
+// network hang into a visible failure rather than race the server.
+const WORKSPACE_MUTATION_TIMEOUT_MS = 120000;
+const WORKSPACE_QUERY_TIMEOUT_MS = 15000;
 
 /** Get Bearer auth headers for raw fetch() calls (SSE streams). */
 async function getAuthHeaders(): Promise<Record<string, string>> {
@@ -34,12 +42,29 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
 }
 
 /**
+ * Extract the `message` from a structured object-shaped `detail` (e.g. the
+ * platform's 429 quota payload `{ message, type, current, limit, remaining }`).
+ * Returns null for string/array/absent details so callers can fall back to
+ * their own copy.
+ */
+export function apiErrorDetailMessage(err: unknown): string | null {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+    const message = (detail as { message?: unknown }).message;
+    if (typeof message === 'string' && message) return message;
+  }
+  return null;
+}
+
+/**
  * Normalize an axios/fetch error into a readable message.
  *
  * Reads `err.response.data.detail`. FastAPI emits a string for most errors,
  * but validation failures come back as a list of `{ loc, msg }` entries — those
  * are flattened to `loc.path: msg` joined with `'; '` so the UI never renders
- * `[object Object]`. Falls back to `err.message` then a generic label.
+ * `[object Object]`. A structured object detail (e.g. the platform quota
+ * payload) surfaces its `message` field. Falls back to `err.message` then a
+ * generic label.
  */
 export function formatApiErrorDetail(err: unknown): string {
   const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
@@ -54,9 +79,18 @@ export function formatApiErrorDetail(err: unknown): string {
       .filter(Boolean);
     if (parts.length > 0) return parts.join('; ');
   }
+  const objectMessage = apiErrorDetailMessage(err);
+  if (objectMessage) return objectMessage;
   if (typeof detail === 'string' && detail) return detail;
   const message = (err as { message?: unknown })?.message;
   return typeof message === 'string' && message ? message : 'Request failed';
+}
+
+/** Extract the HTTP status code from an axios error, or null if absent. */
+export function apiErrorStatus(err: unknown): number | null {
+  const status = (err as { response?: { status?: unknown }; status?: unknown })?.response?.status
+    ?? (err as { status?: unknown })?.status;
+  return typeof status === 'number' ? status : null;
 }
 
 // --- Workspaces ---
@@ -105,6 +139,67 @@ export async function updateWorkspace(workspaceId: string, updates: Record<strin
 export async function reorderWorkspaces(items: Array<{ workspace_id: string; sort_order: number }>) {
   if (!items?.length) throw new Error('Reorder items are required');
   await api.post('/api/v1/workspaces/reorder', { items });
+}
+
+/**
+ * Rename a workspace. Thin wrapper over the existing update endpoint
+ * (PUT /api/v1/workspaces/{id} with { name }).
+ */
+export async function renameWorkspace(workspaceId: string, name: string) {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.put(`/api/v1/workspaces/${workspaceId}`, { name }, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
+  return data;
+}
+
+/**
+ * Change a workspace's sandbox resource tier (standard / performance / max).
+ * In platform mode the backend gates elevated tiers: 403 (not on plan) or
+ * 429 (workspace count limit reached). OSS mode is ungated.
+ */
+export async function setWorkspaceSpec(workspaceId: string, tier: ResourceTier) {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/spec`, { tier }, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
+  return data;
+}
+
+/**
+ * Toggle always-on (keep the sandbox running, disable idle auto-stop).
+ * In platform mode enabling is gated (403 not on plan / 429 limit reached);
+ * disabling is always allowed. OSS mode is ungated.
+ */
+export async function setWorkspaceAlwaysOn(workspaceId: string, enabled: boolean) {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/always-on`, { enabled }, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
+  return data;
+}
+
+/**
+ * Duplicate a workspace (copies persisted files; always-on is reset to off on
+ * the copy so it re-checks entitlement). Returns the new workspace record.
+ */
+export async function duplicateWorkspace(workspaceId: string) {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/duplicate`, null, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
+  return data;
+}
+
+/**
+ * Fetch per-tier workspace count quotas. Platform mode only — every field is null
+ * in OSS mode, so callers should treat null as "no limit to show".
+ */
+export async function getWorkspaceQuota(): Promise<WorkspaceQuota> {
+  const { data } = await api.get('/api/v1/workspaces/quota', {
+    timeout: WORKSPACE_QUERY_TIMEOUT_MS,
+  });
+  return data;
 }
 
 export interface WorkspaceActionResponse {

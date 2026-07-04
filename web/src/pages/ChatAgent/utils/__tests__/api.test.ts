@@ -41,6 +41,8 @@ import {
   // pins that the boundary surface exposes the decoded signal.
   decodeReportBackSignal,
   shouldArmReportBack,
+  formatApiErrorDetail,
+  apiErrorDetailMessage,
 } from '../api';
 
 const mockGet = api.get as Mock;
@@ -695,6 +697,51 @@ describe('ChatAgent API utilities', () => {
       expect(mockGet).toHaveBeenCalledWith('/api/v1/threads/dispatches/liveness', {
         params: { ids: 't-1,t-2' },
       });
+    });
+  });
+
+  describe('apiErrorDetailMessage', () => {
+    it('returns the message from a structured object detail (platform 429 quota)', () => {
+      const err = {
+        response: {
+          data: {
+            detail: { message: 'Performance workspace limit reached', type: 'spec_performance', current: 2, limit: 2, remaining: 0 },
+          },
+        },
+      };
+      expect(apiErrorDetailMessage(err)).toBe('Performance workspace limit reached');
+    });
+
+    it('returns null for string, array, or absent details', () => {
+      expect(apiErrorDetailMessage({ response: { data: { detail: 'plain string' } } })).toBeNull();
+      expect(apiErrorDetailMessage({ response: { data: { detail: [{ loc: ['body'], msg: 'bad' }] } } })).toBeNull();
+      expect(apiErrorDetailMessage({ response: { data: {} } })).toBeNull();
+      expect(apiErrorDetailMessage(new Error('boom'))).toBeNull();
+    });
+
+    it('returns null when the object detail has no string message', () => {
+      expect(apiErrorDetailMessage({ response: { data: { detail: { type: 'spec_max' } } } })).toBeNull();
+    });
+  });
+
+  describe('formatApiErrorDetail', () => {
+    it('surfaces a structured object detail message', () => {
+      const err = { response: { data: { detail: { message: 'Quota exhausted', limit: 0 } } } };
+      expect(formatApiErrorDetail(err)).toBe('Quota exhausted');
+    });
+
+    it('flattens FastAPI validation arrays', () => {
+      const err = { response: { data: { detail: [{ loc: ['body', 'tier'], msg: 'invalid' }] } } };
+      expect(formatApiErrorDetail(err)).toBe('body.tier: invalid');
+    });
+
+    it('passes through a plain string detail', () => {
+      expect(formatApiErrorDetail({ response: { data: { detail: 'nope' } } })).toBe('nope');
+    });
+
+    it('falls back to err.message then a generic label', () => {
+      expect(formatApiErrorDetail(new Error('network'))).toBe('network');
+      expect(formatApiErrorDetail({})).toBe('Request failed');
     });
   });
 });

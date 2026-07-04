@@ -8,11 +8,14 @@ This module defines pure data classes for core configuration:
 - Logging settings
 """
 
+import logging
 import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 # Default security lists — used by SecurityConfig defaults and create_default_security_config()
 DEFAULT_ALLOWED_IMPORTS = [
@@ -22,6 +25,27 @@ DEFAULT_ALLOWED_IMPORTS = [
 ]
 
 DEFAULT_BLOCKED_PATTERNS: list[str] = []
+
+
+# Organization resource ceiling — every tier is clamped to these maxima.
+# cpu in vCPU cores, memory in GiB, disk in GiB.
+RESOURCE_TIER_CEILING = {"cpu": 4, "memory": 8, "disk": 10}
+
+
+class ResourceTier(BaseModel):
+    """A named sandbox resource preset (vCPU cores, memory GiB, disk GiB)."""
+
+    cpu: int = Field(ge=1)
+    memory: int = Field(ge=1)
+    disk: int = Field(ge=1)
+
+
+def _default_resource_tiers() -> dict[str, ResourceTier]:
+    return {
+        "standard": ResourceTier(cpu=1, memory=1, disk=3),
+        "performance": ResourceTier(cpu=2, memory=4, disk=5),
+        "max": ResourceTier(cpu=4, memory=8, disk=10),
+    }
 
 
 class DaytonaConfig(BaseModel):
@@ -42,6 +66,40 @@ class DaytonaConfig(BaseModel):
     snapshot_enabled: bool = True
     snapshot_name: str | None = None
     snapshot_auto_create: bool = True
+
+    # Resource tier presets (operator-tunable in agent_config.yaml).
+    default_tier: str = "standard"
+    resource_tiers: dict[str, ResourceTier] = Field(
+        default_factory=_default_resource_tiers, validate_default=True
+    )
+
+    @field_validator("resource_tiers")
+    @classmethod
+    def _clamp_tiers_to_ceiling(
+        cls, v: dict[str, ResourceTier]
+    ) -> dict[str, ResourceTier]:
+        """Clamp every tier to the org ceiling (clamp, never reject)."""
+        for name, tier in v.items():
+            for resource, ceiling in RESOURCE_TIER_CEILING.items():
+                value = getattr(tier, resource)
+                if value > ceiling:
+                    logger.warning(
+                        "resource_tiers[%r].%s=%s exceeds the org ceiling %s; clamping",
+                        name, resource, value, ceiling,
+                    )
+                    setattr(tier, resource, ceiling)
+        return v
+
+    @model_validator(mode="after")
+    def _default_tier_must_exist(self) -> "DaytonaConfig":
+        """The default tier must resolve to a real preset — the create path
+        relies on it to size base sandboxes, so a missing default is a config bug."""
+        if self.default_tier not in self.resource_tiers:
+            raise ValueError(
+                f"default_tier {self.default_tier!r} is not defined in "
+                f"resource_tiers (available: {sorted(self.resource_tiers)})"
+            )
+        return self
 
 
 class SecurityConfig(BaseModel):
