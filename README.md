@@ -11,6 +11,10 @@
 </p>
 
 <p align="center">
+  <strong>English</strong> ｜ <a href="docs/README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="#getting-started">Getting Started</a> &bull;
   <a href="docs/api/README.md">API Docs</a> &bull;
   <a href="src/ptc_agent/">Agent Core</a> &bull;
