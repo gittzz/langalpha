@@ -1311,7 +1311,9 @@ class TestModelResilienceEvents:
         assert data["status_code"] == 500
         # Credentials scrubbed from the middleware-provided error text
         assert "secret" not in data["error"]
-        assert "agent" in data
+        # Main-stream events pin "main" (empty namespace + no langgraph_node
+        # in the middleware payload would otherwise hit the "agent" fallback).
+        assert data["agent"] == "main"
         # Transient: never persisted to the SSE event log
         persisted = handler.get_sse_events() or []
         assert "model_retry" not in [e["event"] for e in persisted]
@@ -1339,6 +1341,7 @@ class TestModelResilienceEvents:
         assert data["to_model"] == "fallback-a"
         assert data["from_is_primary"] is True
         assert data["attempts_on_from"] == 1
+        assert data["agent"] == "main"
         # Persisted so the transcript note survives history replay
         persisted = handler.get_sse_events() or []
         assert "model_fallback" in [e["event"] for e in persisted]

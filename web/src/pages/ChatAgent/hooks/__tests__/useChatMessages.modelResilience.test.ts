@@ -60,12 +60,13 @@ vi.mock('../../utils/api', () => ({
   watchThread: vi.fn(),
 }));
 
-import { sendChatMessageStream, replayThreadHistory } from '../../utils/api';
+import { sendChatMessageStream, sendHitlResponse, replayThreadHistory } from '../../utils/api';
 import { getStoredThreadId } from '../utils/threadStorage';
 import { useChatMessages } from '../useChatMessages';
 import type { AssistantMessage } from '@/types/chat';
 
 const mockSendStream = sendChatMessageStream as Mock;
+const mockSendHitl = sendHitlResponse as Mock;
 const mockReplay = replayThreadHistory as Mock;
 const mockGetStoredThreadId = getStoredThreadId as Mock;
 
@@ -304,6 +305,51 @@ describe('useChatMessages — model retry/fallback resilience', () => {
     await waitFor(() => expect(assistantOf(result)?.content).toContain('hi there'));
 
     await releaseHungSend(hang, send);
+  });
+
+  it('HITL resume clears a lingering fallbackSuggestion (new-run boundary)', async () => {
+    // A fallback fires, then the turn interrupts for approval; the stream
+    // ends there (matching the real interrupt flow).
+    mockSendStream.mockImplementation(
+      async (
+        _msg: string,
+        _ws: string,
+        _tid: string | null,
+        _hist: unknown[],
+        _plan: boolean,
+        onEvent: OnEvent,
+      ) => {
+        onEvent({
+          event: 'model_fallback',
+          agent: 'main',
+          from_model: 'model-alpha',
+          to_model: 'model-beta',
+        });
+        onEvent({
+          event: 'interrupt',
+          interrupt_id: 'plan-1',
+          action_requests: [{ name: 'SubmitPlan', description: 'Step 1.' }],
+        });
+        return { disconnected: false };
+      },
+    );
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-hitl'));
+    await act(async () => {
+      await result.current.handleSendMessage('make a plan', false);
+    });
+    await waitFor(() => expect(result.current.fallbackSuggestion).not.toBeNull());
+    await waitFor(() => expect(result.current.pendingInterrupt).not.toBeNull());
+
+    // Approving opens a fresh backend run whose model calls start from the
+    // primary again — the pre-interrupt suggestion must not survive to sit
+    // under the resumed turn's answer (a re-fired model_fallback re-sets it).
+    mockSendHitl.mockResolvedValue({ disconnected: false, aborted: false });
+    await act(async () => {
+      result.current.handleApproveInterrupt();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    await waitFor(() => expect(mockSendHitl).toHaveBeenCalled());
+    expect(result.current.fallbackSuggestion).toBeNull();
   });
 
   it('thread switch clears a mid-retry modelStatus (no stale pill on thread B)', async () => {

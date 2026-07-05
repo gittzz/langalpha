@@ -236,6 +236,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse | AIMessage:
+        # Sync twin of awrap_model_call. Unused in production (the graph is
+        # only driven async) — time.sleep here would stall an event loop.
         candidates = self._candidates(request)
         records: list[_AttemptRecord] = []
 

@@ -691,11 +691,18 @@ class WorkflowStreamHandler:
                         # (accumulate=False, like ``metadata``); ``model_fallback``
                         # is persisted so the transcript note survives replay.
                         if event_type in ("model_retry", "model_fallback"):
+                            # Same attribution contract as provenance events
+                            # (`agent` is "main" | "task:{id}"): the main agent
+                            # streams with an empty namespace and the middleware
+                            # payload has no langgraph_node, so pin "main"
+                            # instead of _extract_agent_name's "agent" fallback.
                             resilience_data: Dict[str, Any] = {
                                 "thread_id": self.thread_id,
                                 "agent": self._extract_agent_name(
                                     agent_from_stream, event_data
-                                ),
+                                )
+                                if agent_from_stream
+                                else "main",
                             }
                             for key in (
                                 "model",

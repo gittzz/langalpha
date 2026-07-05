@@ -5164,6 +5164,10 @@ export function useChatMessages(
 
     setIsLoading(true);
     setMessageError(null);
+    // New-run boundary like send/edit/regenerate: a pre-interrupt fallback
+    // suggestion would go stale if the resumed run's model calls (which start
+    // from the primary again) succeed; a re-fired model_fallback re-sets it.
+    setFallbackSuggestion(null);
     wasStoppedRef.current = false;
     backgroundReconnectRef.current = false;
     acquireStreamOwnership(threadId);
