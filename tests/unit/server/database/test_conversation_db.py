@@ -7,7 +7,9 @@ thread sharing, and pagination logic.
 
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
+import psycopg
 import pytest
 
 
@@ -16,6 +18,21 @@ import pytest
 # conftest mock_db_connection fixture (which patches exactly that path)
 # is sufficient here.
 # ---------------------------------------------------------------------------
+
+
+def _make_unique_violation(constraint_name):
+    """A raisable ``psycopg.errors.UniqueViolation`` whose ``diag.constraint_name``
+    reports ``constraint_name`` (psycopg exposes the offending index name there).
+
+    Sets ``diag`` as a subclass attribute so it shadows the base read-only
+    property in the MRO — the production code reads it via ``getattr``.
+    """
+
+    class _UV(psycopg.errors.UniqueViolation):
+        pass
+
+    _UV.diag = SimpleNamespace(constraint_name=constraint_name)
+    return _UV("duplicate key value violates unique constraint")
 
 
 def _thread_row(
@@ -187,6 +204,9 @@ async def test_update_thread_title(mock_db_connection, mock_cursor):
     params = mock_cursor.execute.call_args[0][1]
     assert params[0] == "New Title"
     assert params[1] == "t-1"
+    # RETURNING now includes platform so the endpoint response carries it.
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "platform" in sql
 
 
 @pytest.mark.asyncio
@@ -210,6 +230,173 @@ async def test_delete_thread(mock_db_connection, mock_cursor):
     assert result is True
     sql = mock_cursor.execute.call_args[0][0]
     assert "DELETE FROM conversation_threads" in sql
+
+
+# ===========================================================================
+# External-id stamping (update_thread_external_id) + create-race hardening
+# ===========================================================================
+
+_EXTERNAL_INDEX = "idx_conversation_threads_external"
+
+
+@pytest.mark.asyncio
+async def test_update_thread_external_id_success(mock_db_connection, mock_cursor):
+    """Happy path: blind-by-thread_id UPDATE stamps platform + external_id.
+
+    Ownership is enforced by the route before this is called, so the DB layer
+    mirrors update_thread_title — a single UPDATE keyed on conversation_thread_id
+    with no workspace join.
+    """
+    from src.server.database.conversation import update_thread_external_id
+
+    row = _thread_row(
+        thread_id="t-1", workspace_id="ws-1", platform="telegram", external_id="chat:42"
+    )
+    mock_cursor.fetchone.return_value = row
+
+    result = await update_thread_external_id("t-1", "telegram", "chat:42")
+
+    assert result is not None
+    assert result["platform"] == "telegram"
+    assert result["external_id"] == "chat:42"
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "UPDATE conversation_threads" in sql
+    # Blind by thread_id — no ownership join re-checked in SQL.
+    assert "w.user_id" not in sql
+    assert "FROM workspaces" not in sql
+    params = mock_cursor.execute.call_args[0][1]
+    assert params == ("telegram", "chat:42", "t-1")
+
+
+@pytest.mark.asyncio
+async def test_update_thread_external_id_idempotent_restamp(
+    mock_db_connection, mock_cursor
+):
+    """Re-stamping identical values is a no-op-safe success: the row already
+    holds them, so the unique index sees no conflicting peer."""
+    from src.server.database.conversation import update_thread_external_id
+
+    row = _thread_row(thread_id="t-1", platform="telegram", external_id="chat:42")
+    mock_cursor.fetchone.return_value = row
+
+    result = await update_thread_external_id("t-1", "telegram", "chat:42")
+
+    assert result["external_id"] == "chat:42"
+
+
+@pytest.mark.asyncio
+async def test_update_thread_external_id_conflict_raises(
+    mock_db_connection, mock_cursor
+):
+    """A collision on idx_conversation_threads_external → ExternalIdConflictError."""
+    from src.server.database.conversation import (
+        ExternalIdConflictError,
+        update_thread_external_id,
+    )
+
+    mock_cursor.execute.side_effect = _make_unique_violation(_EXTERNAL_INDEX)
+
+    with pytest.raises(ExternalIdConflictError) as exc_info:
+        await update_thread_external_id("t-1", "telegram", "chat:42")
+
+    assert exc_info.value.platform == "telegram"
+    assert exc_info.value.external_id == "chat:42"
+
+
+@pytest.mark.asyncio
+async def test_update_thread_external_id_missing_returns_none(
+    mock_db_connection, mock_cursor
+):
+    """UPDATE ... WHERE conversation_thread_id = %s matches no row → None
+    (thread vanished; route maps to 404)."""
+    from src.server.database.conversation import update_thread_external_id
+
+    mock_cursor.fetchone.return_value = None
+
+    result = await update_thread_external_id("t-1", "telegram", "chat:42")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_update_thread_external_id_other_unique_violation_bubbles(
+    mock_db_connection, mock_cursor
+):
+    """A unique violation on some OTHER index is not masked as a conflict."""
+    from src.server.database.conversation import update_thread_external_id
+
+    mock_cursor.execute.side_effect = _make_unique_violation("some_other_index")
+
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        await update_thread_external_id("t-1", "telegram", "chat:42")
+
+
+@pytest.mark.asyncio
+async def test_create_thread_external_race_raises_conflict(
+    mock_db_connection, mock_cursor
+):
+    """A create that loses the (platform, external_id) dedup index raises a typed
+    ExternalIdConflictError — never silently resolved to the winner. Routes map it
+    to a 409 / external_id_conflict SSE error the channel client recovers from by
+    regenerating under a fresh external key."""
+    from src.server.database.conversation import (
+        ExternalIdConflictError,
+        create_thread,
+    )
+
+    # execute: [calc-index, INSERT raises the external-index UV]. No re-lookup —
+    # the conflict is raised straight away.
+    mock_cursor.execute.side_effect = [
+        None,
+        _make_unique_violation(_EXTERNAL_INDEX),
+    ]
+    mock_cursor.fetchone.side_effect = [
+        {"next_index": 0},
+    ]
+
+    with pytest.raises(ExternalIdConflictError) as exc_info:
+        await create_thread(
+            conversation_thread_id="new-thread",
+            workspace_id="ws-1",
+            current_status="in_progress",
+            external_id="chat:42",
+            platform="telegram",
+        )
+
+    assert exc_info.value.platform == "telegram"
+    assert exc_info.value.external_id == "chat:42"
+
+
+@pytest.mark.asyncio
+async def test_create_thread_thread_index_conflict_still_retries(
+    mock_db_connection, mock_cursor
+):
+    """A thread_index unique violation keeps the existing recalc-and-retry path
+    (unchanged by the external-id branch)."""
+    from src.server.database.conversation import create_thread
+
+    row = _thread_row(thread_id="t-1", workspace_id="ws-1")
+
+    # attempt 0: calc, INSERT raises thread_index UV. attempt 1: recalc, INSERT ok.
+    mock_cursor.execute.side_effect = [
+        None,
+        _make_unique_violation("unique_thread_index_per_workspace"),
+        None,
+        None,
+    ]
+    mock_cursor.fetchone.side_effect = [
+        {"next_index": 0},
+        {"next_index": 1},
+        row,
+    ]
+
+    result = await create_thread(
+        conversation_thread_id="t-1",
+        workspace_id="ws-1",
+        current_status="in_progress",
+    )
+
+    assert result["conversation_thread_id"] == "t-1"
 
 
 # ===========================================================================

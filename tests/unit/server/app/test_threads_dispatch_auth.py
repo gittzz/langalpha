@@ -233,3 +233,20 @@ async def test_no_dispatch_header_foreground_unchanged(monkeypatch):
         resp = await _post(app)
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_service_token_rejected_not_500(monkeypatch):
+    """A non-ASCII X-Service-Token must 403, not 500. Header values arrive
+    latin-1-decoded, and the compare now runs through service_token_matches
+    (bytes), so a high byte can't raise TypeError out of hmac.compare_digest."""
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", TOKEN)
+    app = _app()
+    with _stub_workflow():
+        # Raw latin-1 byte 0xE5 → Starlette decodes it to a non-ASCII str.
+        resp = await _post(
+            app,
+            headers={"X-Dispatch": "background", "X-Service-Token": b"\xe5-not-ascii"},
+        )
+    assert resp.status_code == 403
