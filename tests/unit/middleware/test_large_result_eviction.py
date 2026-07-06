@@ -176,6 +176,23 @@ class TestAwrapToolCall:
         from langgraph.types import Command
         assert isinstance(result, Command)
 
+    @pytest.mark.asyncio
+    async def test_glob_result_is_evicted_when_large(self):
+        """Glob is no longer on the exclusion list, so a pathological result must be
+        evicted to the filesystem instead of reaching the model (Glob self-caps for
+        the common case; eviction is the backstop)."""
+        assert "Glob" not in TOOLS_EXCLUDED_FROM_EVICTION
+        backend = _make_backend()
+        limit = 10
+        mw = LargeResultEvictionMiddleware(backend=backend, tool_token_limit_before_evict=limit)
+        request = _make_tool_request("Glob")
+        large_content = "x" * (NUM_CHARS_PER_TOKEN * limit + 100)
+        msg = ToolMessage(content=large_content, tool_call_id="call_1", name="Glob")
+        handler = AsyncMock(return_value=msg)
+        result = await mw.awrap_tool_call(request, handler)
+        from langgraph.types import Command
+        assert isinstance(result, Command)
+
 
 class TestAinterceptCommandBranch:
     """Tests for `_aintercept_large_tool_result` handling pre-wrapped Commands.
