@@ -7,6 +7,14 @@ from ptc_agent.agent.backends import FilesystemBackend
 
 logger = structlog.get_logger(__name__)
 
+# Hard cap on paths returned to the model. A recursive glob over a project with a
+# dependency tree (node_modules, etc.) can match tens of thousands of files; without
+# a cap the single tool message can exceed every model's context window. Matches are
+# backend-sorted (sandbox: most-recent first), so the head is the most useful slice.
+# Kept well under LargeResultEvictionMiddleware's threshold, which now also backstops
+# this tool if the cap is ever raised.
+GLOB_MATCH_LIMIT = 1000
+
 
 def create_glob_tool(backend: FilesystemBackend) -> BaseTool:
     """Factory function to create Glob tool.
@@ -54,16 +62,25 @@ def create_glob_tool(backend: FilesystemBackend) -> BaseTool:
             # Virtualize paths in output (strip working directory prefix)
             virtual_matches = [backend.virtualize_path(m) for m in matches]
 
-            # Format output with virtual paths
-            result = f"Found {len(virtual_matches)} file(s) matching '{pattern}':\n"
-            for match in virtual_matches:
-                result += f"{match}\n"
+            # Cap the number of paths returned to the model (see GLOB_MATCH_LIMIT).
+            total = len(virtual_matches)
+            truncated = total > GLOB_MATCH_LIMIT
+            shown = virtual_matches[:GLOB_MATCH_LIMIT]
+
+            lines = [f"Found {total} file(s) matching '{pattern}':", *shown]
+            if truncated:
+                lines.append(
+                    f"\n[showing first {GLOB_MATCH_LIMIT} of {total} matches — narrow "
+                    f"the pattern or pass a subdirectory path to see the rest]"
+                )
+            result = "\n".join(lines)
 
             logger.info(
                 "Glob completed successfully",
                 pattern=pattern,
                 path=search_path,
-                matches=len(virtual_matches),
+                matches=total,
+                truncated=truncated,
             )
 
             return result.rstrip()

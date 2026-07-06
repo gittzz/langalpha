@@ -23,10 +23,12 @@ from deepagents.backends.utils import (
 NUM_CHARS_PER_TOKEN = 4
 
 # Tools excluded from eviction (PascalCase versions of the original snake_case tools)
-# These either have built-in truncation or are problematic to evict
+# These either have built-in truncation or are problematic to evict.
+# Glob is deliberately NOT excluded: it self-caps (GLOB_MATCH_LIMIT) for the common
+# case, but eviction is kept as a backstop so a pathological result can never reach
+# the model — the same protection Bash already relies on.
 TOOLS_EXCLUDED_FROM_EVICTION = (
-    "Glob",  # Has built-in truncation
-    "Grep",  # Has built-in truncation
+    "Grep",  # Has built-in truncation (ripgrep + head_limit)
     "Read",  # Problematic truncation behavior (single long lines)
     "Write",  # Returns minimal confirmation
     "Edit",  # Returns minimal confirmation
