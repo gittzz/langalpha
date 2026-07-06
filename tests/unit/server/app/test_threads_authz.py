@@ -160,21 +160,9 @@ async def test_post_new_thread_no_owner_proceeds():
     assert resp.status_code == 200
 
 
-@pytest.mark.asyncio
-async def test_internal_dispatch_with_owner_user_id_proceeds():
-    """Report-back dispatch sets X-User-Id to the owner -> owner_id == user_id.
-
-    The auth dependency reflects that X-User-Id resolution by pinning the auth
-    user to the owner; the guard must let the dispatch through (no 403).
-    """
-    app = _app_for(OWNER)
-    with _stub_downstream(owner_id=OWNER, ws_owner=OWNER):
-        resp = await _post(
-            app,
-            "/api/v1/threads/tid-dispatch/messages",
-            headers={"X-Dispatch": "background"},
-        )
-    assert resp.status_code == 200
+# The former internal-dispatch case (X-Dispatch with no service token -> 200
+# via silent foreground downgrade) is deliberately repinned to a 403 in
+# test_threads_dispatch_auth.py, which owns the dispatch-auth matrix.
 
 
 @pytest.mark.asyncio

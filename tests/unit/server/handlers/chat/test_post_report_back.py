@@ -159,3 +159,15 @@ async def test_busy_wait_cap_exhausted_returns_drop():
         )
     assert outcome == ("drop", None)
     assert session.post_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# A configured INTERNAL_SERVICE_TOKEN is the normal production state and, with
+# auth enabled, a precondition for dispatch (the preflight guard drops without
+# it). These tests exercise the dispatch path itself, not the guard, so give
+# the whole module a token regardless of the ambient environment. The guard
+# test module asserts the unset behaviour separately.
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _internal_service_token(monkeypatch):
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-internal-service-token")

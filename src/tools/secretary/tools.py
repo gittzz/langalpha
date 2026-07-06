@@ -407,6 +407,19 @@ async def ptc_agent(
     if not user_id:
         return _error_command("user_id not found in config", tool_call_id)
 
+    # With auth enabled, the endpoint rejects an unauthenticated background
+    # dispatch (403); abort before any side effect (HITL prompt, workspace
+    # creation, cap reservation) so the user gets the specific error instead.
+    from src.config.settings import HOST_MODE
+
+    if HOST_MODE != "oss" and not os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip():
+        logger.error(
+            "PTC dispatch aborted: INTERNAL_SERVICE_TOKEN is not set, so the "
+            "background dispatch cannot be authenticated. Set it on the "
+            "backend service to enable dispatch."
+        )
+        return _error_command("internal_service_token_missing", tool_call_id)
+
     is_continuation = thread_id is not None
 
     # Resolve workspace_id from existing thread or create/verify workspace
