@@ -160,9 +160,11 @@ async def test_post_new_thread_no_owner_proceeds():
     assert resp.status_code == 200
 
 
-# The former internal-dispatch case (X-Dispatch with no service token -> 200
-# via silent foreground downgrade) is deliberately repinned to a 403 in
-# test_threads_dispatch_auth.py, which owns the dispatch-auth matrix.
+# The former internal-dispatch case (X-Dispatch with no service token, no
+# HOST_MODE patch) asserted the old silent foreground downgrade returned 200.
+# Its outcome now depends on mode — 403 in platform, a trusted background
+# dispatch in oss — so it moved to test_threads_dispatch_auth.py, which patches
+# HOST_MODE explicitly and mocks the dispatch path for both.
 
 
 @pytest.mark.asyncio

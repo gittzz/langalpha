@@ -962,9 +962,9 @@ async def _post_report_back(
     # With auth enabled, the endpoint rejects an unauthenticated background
     # dispatch (403) — a defer status for this loop, so firing it anyway would
     # busy-wait the whole cap. Drop immediately instead.
-    from src.config.settings import HOST_MODE
+    from src.config.settings import background_dispatch_requires_token
 
-    if HOST_MODE != "oss" and not service_token.strip():
+    if background_dispatch_requires_token():
         logger.error(
             "[FLASH_REPORT_BACK] INTERNAL_SERVICE_TOKEN is not set; report-back "
             "for PTC thread %s cannot be dispatched as background. Set it on "

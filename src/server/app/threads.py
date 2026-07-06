@@ -465,6 +465,32 @@ async def _handle_send_message(
                 },
             )
 
+        # Reject an unauthenticated background dispatch up front, before the
+        # owner lookup, workspace/LLM resolution, and credit check below — a
+        # request that will 403 anyway shouldn't do that work first. In oss mode
+        # with no INTERNAL_SERVICE_TOKEN configured there is nothing to
+        # authenticate against, so the self-dispatch is trusted; a configured
+        # token is enforced in every mode. This single is_internal value is
+        # reused by the field strip and both dispatch branches below.
+        _req_token = (raw_request.headers.get("X-Service-Token", "") if raw_request else "")
+        _svc_token = _get_service_token()
+        is_internal = bool(
+            _svc_token and _req_token and hmac.compare_digest(_req_token, _svc_token)
+        ) or (HOST_MODE == "oss" and not _svc_token)
+        if (
+            not is_internal
+            and raw_request
+            and raw_request.headers.get("X-Dispatch") == "background"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Background dispatch requires internal service auth. "
+                    "Configure INTERNAL_SERVICE_TOKEN and send it as "
+                    "X-Service-Token."
+                ),
+            )
+
         # IDOR guard: an existing thread must belong to the caller. A brand-new
         # thread_id has no owner yet -> creation proceeds. The internal report-back
         # dispatch sets X-User-Id to the owner, so it passes.
@@ -573,34 +599,6 @@ async def _handle_send_message(
         # - BYOK/OAuth (is_byok=True): block only on negative balance (outstanding
         #   debt from past platform usage, e.g. fallback routing).
         await enforce_credit_limit(user_id, byok=is_byok)
-
-        # Only honour X-Dispatch: background for internal service-to-service
-        # calls. In oss mode with no INTERNAL_SERVICE_TOKEN configured there is
-        # nothing to authenticate against, so the self-dispatch is trusted; a
-        # configured token is enforced in every mode.
-        _req_token = (raw_request.headers.get("X-Service-Token", "") if raw_request else "")
-        _svc_token = _get_service_token()
-        is_internal = bool(
-            _svc_token and _req_token and hmac.compare_digest(_req_token, _svc_token)
-        ) or (HOST_MODE == "oss" and not _svc_token)
-
-        # An unauthenticated background dispatch is rejected, not silently
-        # downgraded to a foreground SSE run (which would execute the whole
-        # workflow synchronously and burn credits for an ack the caller can
-        # never parse).
-        if (
-            not is_internal
-            and raw_request
-            and raw_request.headers.get("X-Dispatch") == "background"
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "Background dispatch requires internal service auth. "
-                    "Configure INTERNAL_SERVICE_TOKEN and send it as "
-                    "X-Service-Token."
-                ),
-            )
 
         # Strip internal-only fields from non-internal requests (prevent
         # spoofing system messages / forging report-back watch cleanup).

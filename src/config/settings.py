@@ -30,6 +30,15 @@ from src.config.env import (  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
+def background_dispatch_requires_token() -> bool:
+    """True when auth is enabled but no INTERNAL_SERVICE_TOKEN is configured.
+
+    Internal background dispatch is rejected with 403 in that state, so callers
+    must not fire one. In oss mode the self-dispatch is trusted without a token.
+    """
+    return HOST_MODE != "oss" and not os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip()
+
+
 # =============================================================================
 # Application Settings — delegates to InfrastructureConfig
 # =============================================================================

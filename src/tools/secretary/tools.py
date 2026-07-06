@@ -410,9 +410,9 @@ async def ptc_agent(
     # With auth enabled, the endpoint rejects an unauthenticated background
     # dispatch (403); abort before any side effect (HITL prompt, workspace
     # creation, cap reservation) so the user gets the specific error instead.
-    from src.config.settings import HOST_MODE
+    from src.config.settings import background_dispatch_requires_token
 
-    if HOST_MODE != "oss" and not os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip():
+    if background_dispatch_requires_token():
         logger.error(
             "PTC dispatch aborted: INTERNAL_SERVICE_TOKEN is not set, so the "
             "background dispatch cannot be authenticated. Set it on the "
