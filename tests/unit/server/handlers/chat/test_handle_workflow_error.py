@@ -145,3 +145,44 @@ async def test_tracker_failure_does_not_break_error_flow(patch_tracker):
         ))
 
     assert sse in events
+
+
+@pytest.mark.asyncio
+async def test_external_id_conflict_branch_emits_conflict_and_skips_mark_failed(
+    patch_tracker,
+):
+    # A cross-user (platform, external_id) create race surfaces as a clean SSE
+    # error carrying error_type=external_id_conflict, and (like the admission-
+    # conflict path) must NOT mark the thread failed or persist an error.
+    import json as _json
+
+    from src.server.database.conversation import ExternalIdConflictError
+
+    err = ExternalIdConflictError(platform="telegram", external_id="chat:42")
+
+    with patch.object(_common, "release_burst_slot", new=AsyncMock()), \
+         patch.object(_common, "get_max_workflow_retries", return_value=3):
+        # handler=None takes the json.dumps SSE branch, easy to parse.
+        events = await _consume(_common.handle_workflow_error(
+            e=err,
+            thread_id="t-ext",
+            user_id="u-1",
+            workspace_id="ws-1",
+            handler=None,
+            token_callback=None,
+            persistence_service=None,
+            start_time=0.0,
+            request=_make_request(),
+            is_byok=False,
+            msg_type="user",
+            log_prefix="CHAT",
+        ))
+
+    assert len(events) == 1
+    assert events[0].startswith("event: error\n")
+    payload = _json.loads(events[0].split("data: ", 1)[1].strip())
+    assert payload["error_type"] == "external_id_conflict"
+    assert payload["platform"] == "telegram"
+    assert payload["external_id"] == "chat:42"
+    # Deterministic protocol conflict — not a workflow failure.
+    patch_tracker.mark_failed.assert_not_awaited()

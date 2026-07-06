@@ -26,6 +26,46 @@ _optional_bearer = HTTPBearer(auto_error=False)
 _SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 
 
+def service_token_matches(candidate: str, secret: str) -> bool:
+    """Constant-time check that a client-supplied service token equals ``secret``.
+
+    Compares as UTF-8 bytes: ``hmac.compare_digest`` raises ``TypeError`` on
+    non-ASCII ``str`` and header values arrive latin-1-decoded, so a non-ASCII
+    token must not 500. An empty ``candidate`` or ``secret`` (service auth
+    unconfigured, or no header sent) is never a match.
+    """
+    return bool(
+        secret
+        and candidate
+        and hmac.compare_digest(candidate.encode("utf-8"), secret.encode("utf-8"))
+    )
+
+
+def _service_token_user_id(request: Request) -> tuple[bool, Optional[str]]:
+    """Resolve a service-to-service caller from the request headers.
+
+    Returns ``(matched, user_id)``:
+      - ``matched`` is ``True`` only when a valid ``X-Service-Token`` is present
+        (a present-but-wrong token raises 401). ``user_id`` is then the
+        ``X-User-Id`` header, which MAY be ``None`` (a token-only privileged
+        caller).
+      - ``matched`` is ``False`` when service auth is not in play (no
+        ``INTERNAL_SERVICE_TOKEN`` configured, or no ``X-Service-Token`` header);
+        the caller falls through to the normal auth path.
+
+    Shared by ``get_current_user_id`` (which then requires ``X-User-Id``) and
+    ``get_stamp_auth`` (which tolerates its absence).
+    """
+    if not _SERVICE_TOKEN:
+        return False, None
+    token = request.headers.get("X-Service-Token")
+    if not token:
+        return False, None
+    if not service_token_matches(token, _SERVICE_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid service token")
+    return True, request.headers.get("X-User-Id")
+
+
 async def get_current_user_id(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
@@ -39,15 +79,11 @@ async def get_current_user_id(
     When auth is enabled, requires a valid Bearer JWT (Supabase).
     """
     # Service-to-service auth (only active if INTERNAL_SERVICE_TOKEN is set)
-    if _SERVICE_TOKEN:
-        token = request.headers.get("X-Service-Token")
-        if token:
-            if not hmac.compare_digest(token, _SERVICE_TOKEN):
-                raise HTTPException(status_code=401, detail="Invalid service token")
-            user_id = request.headers.get("X-User-Id")
-            if not user_id:
-                raise HTTPException(status_code=401, detail="Missing X-User-Id")
-            return user_id
+    matched, user_id = _service_token_user_id(request)
+    if matched:
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Missing X-User-Id")
+        return user_id
 
     if HOST_MODE == "oss":
         return LOCAL_DEV_USER_ID
@@ -60,6 +96,34 @@ async def get_current_user_id(
 
 # Annotated type for cleaner endpoint signatures
 CurrentUserId = Annotated[str, Depends(get_current_user_id)]
+
+
+async def get_stamp_auth(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> Optional[str]:
+    """Auth resolver for the external-id stamp route (PUT /threads/{id}/external-id).
+
+    Returns the user id to enforce thread ownership against, or ``None`` for a
+    privileged service caller — a valid ``X-Service-Token`` with no ``X-User-Id``
+    (the one-time external-id backfill, which cannot know each thread's owner).
+    Such a caller may stamp any thread; the service token already permits
+    impersonating any user via ``X-User-Id``, so omitting the ownership check for
+    a token-only call is not an escalation. A service token WITH ``X-User-Id``
+    resolves to that user (ownership enforced). Every other caller resolves to a
+    concrete id via the normal ``get_current_user_id`` path.
+    """
+    matched, user_id = _service_token_user_id(request)
+    if matched:
+        # X-User-Id optional here (unlike get_current_user_id): a token-only
+        # caller is a privileged service acting without a specific owner.
+        return user_id
+    return await get_current_user_id(request, credentials)
+
+
+# Annotated type for the stamp route's auth dependency: the resolved owner id, or
+# None for a privileged service caller.
+StampThreadAuth = Annotated[Optional[str], Depends(get_stamp_auth)]
 
 
 def handle_api_exceptions(

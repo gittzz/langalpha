@@ -13,7 +13,6 @@ from typing import Annotated, Optional
 from uuid import uuid4
 
 import asyncio
-import hmac
 import os
 
 from fastapi import APIRouter, Header, HTTPException, Path, Query, Request
@@ -21,14 +20,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.server.utils.api import (
     CurrentUserId,
+    StampThreadAuth,
     require_thread_owner,
     require_workspace_owner,
+    service_token_matches,
 )
 from src.server.models.chat import ChatRequest, SubagentMessageRequest
 from src.server.models.conversation import (
     WorkspaceThreadListItem,
     WorkspaceThreadsListResponse,
     ThreadUpdateRequest,
+    ThreadExternalIdRequest,
     ThreadDeleteResponse,
     ThreadShareRequest,
     ThreadShareResponse,
@@ -38,10 +40,13 @@ from src.server.models.conversation import (
 )
 from src.server.models.workflow import RetryRequest
 from src.server.database.conversation import (
+    ExternalIdConflictError,
+    external_id_conflict_payload,
     get_workspace_threads,
     get_threads_for_user,
     delete_thread,
     update_thread_title,
+    update_thread_external_id,
     get_thread_by_id,
     get_thread_owner_id,
     update_thread_sharing,
@@ -348,30 +353,34 @@ async def delete_thread_endpoint(thread_id: str, x_user_id: CurrentUserId):
         )
 
 
+def _thread_list_item(row: dict) -> WorkspaceThreadListItem:
+    """Build the list-item response from an updated thread row."""
+    return WorkspaceThreadListItem(
+        thread_id=str(row["conversation_thread_id"]),
+        workspace_id=str(row["workspace_id"]),
+        thread_index=row["thread_index"],
+        current_status=row["current_status"],
+        msg_type=row.get("msg_type"),
+        title=row.get("title"),
+        platform=row.get("platform"),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
 @router.patch("/{thread_id}", response_model=WorkspaceThreadListItem)
 async def update_thread_endpoint(
     thread_id: str, request: ThreadUpdateRequest, x_user_id: CurrentUserId
 ):
-    """Update thread properties (currently only title)."""
+    """Rename a thread's title."""
     try:
         await require_thread_owner(thread_id, x_user_id)
         updated_thread = await update_thread_title(thread_id, request.title)
-
         if not updated_thread:
             raise HTTPException(
                 status_code=404, detail=f"Thread not found: {thread_id}"
             )
-
-        return WorkspaceThreadListItem(
-            thread_id=str(updated_thread["conversation_thread_id"]),
-            workspace_id=str(updated_thread["workspace_id"]),
-            thread_index=updated_thread["thread_index"],
-            current_status=updated_thread["current_status"],
-            msg_type=updated_thread.get("msg_type"),
-            title=updated_thread.get("title"),
-            created_at=updated_thread["created_at"],
-            updated_at=updated_thread["updated_at"],
-        )
+        return _thread_list_item(updated_thread)
 
     except HTTPException:
         raise
@@ -379,6 +388,45 @@ async def update_thread_endpoint(
         logger.exception(f"Error updating thread {thread_id}: {e}")
         raise HTTPException(
             status_code=500, detail=f"Failed to update thread: {str(e)}"
+        )
+
+
+@router.put("/{thread_id}/external-id", response_model=WorkspaceThreadListItem)
+async def stamp_thread_external_id_endpoint(
+    thread_id: str, request: ThreadExternalIdRequest, user_id: StampThreadAuth
+):
+    """Stamp a channel identity (``platform`` + ``external_id``) onto a thread.
+
+    A user-scoped caller must own the thread. A privileged service caller (valid
+    ``X-Service-Token`` with no ``X-User-Id``) skips the ownership check and
+    stamps by thread_id alone — used by the one-time external-id backfill, which
+    cannot know each thread's owner. A ``(platform, external_id)`` already held by
+    another thread maps to a 409 carrying the shared conflict payload.
+    """
+    try:
+        if user_id is not None:
+            await require_thread_owner(thread_id, user_id)
+        try:
+            updated_thread = await update_thread_external_id(
+                thread_id, request.platform, request.external_id
+            )
+        except ExternalIdConflictError as e:
+            raise HTTPException(
+                status_code=409,
+                detail=external_id_conflict_payload(e.platform, e.external_id),
+            )
+        if not updated_thread:
+            raise HTTPException(
+                status_code=404, detail=f"Thread not found: {thread_id}"
+            )
+        return _thread_list_item(updated_thread)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error stamping thread {thread_id}: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to stamp thread: {str(e)}"
         )
 
 
@@ -474,9 +522,9 @@ async def _handle_send_message(
         # reused by the field strip and both dispatch branches below.
         _req_token = (raw_request.headers.get("X-Service-Token", "") if raw_request else "")
         _svc_token = _get_service_token()
-        is_internal = bool(
-            _svc_token and _req_token and hmac.compare_digest(_req_token, _svc_token)
-        ) or (HOST_MODE == "oss" and not _svc_token)
+        is_internal = service_token_matches(_req_token, _svc_token) or (
+            HOST_MODE == "oss" and not _svc_token
+        )
         if (
             not is_internal
             and raw_request

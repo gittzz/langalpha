@@ -257,7 +257,7 @@ class _SubagentTokenForwarder:
 
         Without this, both success and failure terminate the per-task stream
         with only the ``subagent_stream_end`` sentinel — leaving downstream
-        trackers (ginlix-integration's Slack/Discord/Feishu task tracker, the
+        trackers (the channel gateway's Slack/Discord/Feishu task tracker, the
         web frontend, ptc-cli) unable to surface failure to the user.
 
         Best-effort: failures here are absorbed so they cannot mask the
