@@ -958,6 +958,21 @@ async def _post_report_back(
 
     self_base_url = os.environ.get("GINLIXFLOW_BASE_URL", "http://localhost:8000")
     service_token = os.environ.get("INTERNAL_SERVICE_TOKEN", "")
+
+    # With auth enabled, the endpoint rejects an unauthenticated background
+    # dispatch (403) — a defer status for this loop, so firing it anyway would
+    # busy-wait the whole cap. Drop immediately instead.
+    from src.config.settings import background_dispatch_requires_token
+
+    if background_dispatch_requires_token():
+        logger.error(
+            "[FLASH_REPORT_BACK] INTERNAL_SERVICE_TOKEN is not set; report-back "
+            "for PTC thread %s cannot be dispatched as background. Set it on "
+            "the backend service.",
+            ptc_thread_id,
+        )
+        return "drop", None
+
     ws_label = origin.get("ptc_workspace_id") or "an auto-created workspace"
     message = (
         "<system>\n"

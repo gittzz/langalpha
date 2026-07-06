@@ -330,3 +330,15 @@ async def test_continuation_non_uuid_thread_id_short_circuits():
     assert "thread not found" in payload.get("error", ""), payload
     owner.assert_not_awaited()
     by_id.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# A configured INTERNAL_SERVICE_TOKEN is the normal production state and, with
+# auth enabled, a precondition for dispatch (the preflight guard aborts without
+# it). These tests exercise the dispatch path itself, not the guard, so give
+# the whole module a token regardless of the ambient environment. The guard
+# test module asserts the unset behaviour separately.
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _internal_service_token(monkeypatch):
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-internal-service-token")
