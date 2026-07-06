@@ -152,11 +152,37 @@ class WorkspaceMessagesResponse(BaseModel):
 # ==================== Thread Management Request/Response Models ====================
 
 class ThreadUpdateRequest(BaseModel):
-    """Request model for updating a thread."""
+    """Request model for updating a thread (currently only title)."""
     title: Optional[str] = Field(None, max_length=255, description="New thread title")
 
     model_config = ConfigDict(json_schema_extra={
         "example": {"title": "Tesla Stock Analysis"},
+    })
+
+
+class ThreadExternalIdRequest(BaseModel):
+    """Request model for stamping a channel identity onto a thread.
+
+    Both fields are required and non-empty — the stamp API never clears
+    ``external_id`` back to NULL (the partial-unique dedup index relies on it).
+    """
+    platform: str = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="Origin platform to stamp (e.g. 'telegram', 'slack', "
+        "'discord', 'feishu').",
+    )
+    external_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="External channel thread identifier to stamp "
+        "(e.g. 'chat_id:topic_id').",
+    )
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"platform": "telegram", "external_id": "chat_id:topic_id"},
     })
 
 

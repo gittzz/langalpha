@@ -780,6 +780,17 @@ async def wait_or_steer(
     )
 
 
+def _emit_sse_error(handler, payload: dict) -> str:
+    """Format an ``error`` SSE frame via *handler* when present, else raw.
+
+    Single source for the ``if handler: _format_sse_event else: raw f-string``
+    shape repeated across ``handle_workflow_error``'s terminal branches.
+    """
+    if handler:
+        return handler._format_sse_event("error", payload)
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
 async def handle_workflow_error(
     e: Exception,
     thread_id: str,
@@ -833,10 +844,34 @@ async def handle_workflow_error(
             "error_class": type(e).__name__,
             "code": detail["code"],
         }
-        if handler:
-            yield handler._format_sse_event("error", error_payload)
-        else:
-            yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
+        yield _emit_sse_error(handler, error_payload)
+        return
+
+    # A (platform, external_id) create race won by a DIFFERENT user is a
+    # deterministic protocol conflict, not a workflow execution failure: thread
+    # creation lost the ``idx_conversation_threads_external`` check. Surface it
+    # as a clean SSE error carrying the same structured ``error_type`` as the
+    # stamp API's HTTP 409, and (like the admission-conflict path above) never
+    # persist it or call ``mark_failed``. Thread creation runs inside the
+    # already-started stream, so this is the response surface — a synchronous
+    # HTTP 409 status is not reachable from here.
+    if isinstance(e, qr_db.ExternalIdConflictError):
+        await release_burst_slot(user_id)
+        # Same core fields (error_type discriminator + offending pair + human
+        # wording) as the stamp API's HTTP 409, built from the shared helper so
+        # the two surfaces never drift; the SSE-envelope fields (thread_id, type,
+        # error_class) are layered on top.
+        conflict = qr_db.external_id_conflict_payload(e.platform, e.external_id)
+        error_payload = {
+            "thread_id": thread_id,
+            "error": conflict["message"],
+            "type": "workflow_error",
+            "error_type": conflict["error_type"],
+            "error_class": type(e).__name__,
+            "platform": conflict["platform"],
+            "external_id": conflict["external_id"],
+        }
+        yield _emit_sse_error(handler, error_payload)
         return
 
     MAX_RETRIES = get_max_workflow_retries()
@@ -987,8 +1022,4 @@ async def handle_workflow_error(
             "error_type": error_type_label,
             "error_class": type(e).__name__,
         }
-        if handler:
-            error_event = handler._format_sse_event("error", error_payload)
-            yield error_event
-        else:
-            yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
+        yield _emit_sse_error(handler, error_payload)

@@ -42,6 +42,74 @@ class QueryConflictError(Exception):
         )
 
 
+class ExternalIdConflictError(Exception):
+    """Raised when a ``(platform, external_id)`` pair is already claimed by a
+    DIFFERENT thread, violating ``idx_conversation_threads_external`` (the global
+    partial-unique index on ``(platform, external_id) WHERE external_id IS NOT NULL``).
+
+    Surfaced by:
+      - ``update_thread_external_id`` (the stamp API) when the UPDATE collides.
+      - ``create_thread`` when a create race loses the ``(platform, external_id)``
+        unique-index check; the winner resolves upstream via
+        ``lookup_thread_by_external_id`` and the loser regenerates a fresh key.
+
+    Routers convert it to an HTTP 409 whose body carries
+    ``error_type="external_id_conflict"`` plus the offending pair, so channel
+    clients can detect the collision and fall back to their own dedup.
+    """
+
+    def __init__(self, platform: str, external_id: str):
+        self.platform = platform
+        self.external_id = external_id
+        super().__init__(
+            f"external_id already in use: platform={platform} external_id={external_id}"
+        )
+
+
+# Name of the global partial-unique index on (platform, external_id). Matched
+# against ``UniqueViolation.diag.constraint_name`` to tell an external-id dedup
+# collision apart from the per-workspace thread_index uniqueness constraint.
+_EXTERNAL_ID_INDEX = "idx_conversation_threads_external"
+
+# Stable ``error_type`` discriminator emitted whenever a (platform, external_id)
+# pair collides. Channel clients key on this exact string to fall back to their
+# own dedup, so every surface that reports the conflict — the HTTP 409 detail and
+# the in-stream SSE error frame — MUST carry it. Centralized here (next to the
+# error it describes) so the two surfaces can't drift.
+EXTERNAL_ID_CONFLICT_ERROR_TYPE = "external_id_conflict"
+
+# Canonical human-facing wording for the conflict (originally the HTTP 409
+# detail's message). Shared so the SSE frame reads identically.
+_EXTERNAL_ID_CONFLICT_MESSAGE = (
+    "This (platform, external_id) is already linked to another thread."
+)
+
+
+def external_id_conflict_payload(platform: str, external_id: str) -> Dict[str, Any]:
+    """Core fields describing a (platform, external_id) collision.
+
+    Single source of truth shared by the HTTP 409 detail body and the SSE error
+    frame so their ``error_type``, offending pair, and human message stay in
+    lockstep. Callers layer any surface-specific fields on top.
+    """
+    return {
+        "error_type": EXTERNAL_ID_CONFLICT_ERROR_TYPE,
+        "message": _EXTERNAL_ID_CONFLICT_MESSAGE,
+        "platform": platform,
+        "external_id": external_id,
+    }
+
+
+def _unique_violation_constraint(exc: Exception) -> Optional[str]:
+    """Best-effort constraint/index name from a psycopg UniqueViolation.
+
+    For a standalone unique index (like ``idx_conversation_threads_external``)
+    psycopg reports the index name in ``diag.constraint_name``; returns ``None``
+    when the diagnostic is unavailable.
+    """
+    return getattr(getattr(exc, "diag", None), "constraint_name", None)
+
+
 # Cache key helpers — single source of truth for key format.
 # Invalidation sites import these instead of hardcoding the prefix.
 _EXISTS_TTL = 86400  # 24h — freshness via explicit invalidation
@@ -308,9 +376,15 @@ async def create_thread(
     `platform` records where the chat originated. Conventions:
       - "web"                   — main ChatAgent page
       - "market_view:<SYMBOL>"  — MarketView side panel, symbol uppercased
-      - "telegram" | "slack" | "discord" | "feishu" — ginlix-integration channels
+      - "telegram" | "slack" | "discord" | "feishu" — channel integrations
     `external_id` is only set by channel integrations and combined with platform
     is unique-indexed for dedup. Web-originated threads have external_id NULL.
+
+    A concurrent create that loses the `(platform, external_id)` dedup index
+    raises ``ExternalIdConflictError`` (routes map it to a 409 / an in-stream
+    ``external_id_conflict`` SSE error); it is never silently resolved to the
+    winning thread here — the channel client regenerates under a fresh external
+    key. The winner already resolves upstream via ``lookup_thread_by_external_id``.
     """
     columns = [
         "conversation_thread_id",
@@ -365,7 +439,22 @@ async def create_thread(
                         result = await cur.fetchone()
                         return dict(result)
 
-        except psycopg.errors.UniqueViolation:
+        except psycopg.errors.UniqueViolation as e:
+            # A collision on the external-id dedup index can't be fixed by
+            # retrying — (platform, external_id) is fixed for this insert, so a
+            # concurrent create won the race. Surface a typed conflict (routes map
+            # it to a 409 / an in-stream ``external_id_conflict`` SSE error) that
+            # channel clients recover from by regenerating under a fresh external
+            # key. Only the per-workspace thread_index constraint is the retryable
+            # race handled below (recalc thread_index + reinsert).
+            if (
+                _unique_violation_constraint(e) == _EXTERNAL_ID_INDEX
+                and platform
+                and external_id
+            ):
+                raise ExternalIdConflictError(
+                    platform=platform, external_id=external_id
+                )
             if attempt == max_retries - 1:
                 logger.error(
                     f"thread_index conflict after {max_retries} attempts for workspace {workspace_id}"
@@ -416,6 +505,65 @@ async def lookup_thread_by_external_id(
     except Exception as e:
         logger.error(f"Error looking up thread by external_id: {e}")
         return None
+
+
+async def update_thread_external_id(
+    thread_id: str, platform: str, external_id: str
+) -> Optional[Dict[str, Any]]:
+    """Stamp ``platform`` + ``external_id`` onto an already-created thread.
+
+    Post-creation counterpart to passing external linkage into ``create_thread``:
+    lets a client attach a channel identity to an existing thread. A blind
+    ``UPDATE ... WHERE conversation_thread_id = %s`` mirroring
+    ``update_thread_title`` — ownership is enforced by the route
+    (``require_thread_owner``) before this is called, or intentionally skipped for
+    the privileged service backfill, so no ownership join is re-checked here.
+
+    Re-stamping the same values is idempotent: the row already holds them, so the
+    unique index sees no conflicting peer. If ANOTHER thread already holds this
+    ``(platform, external_id)`` the UPDATE violates
+    ``idx_conversation_threads_external``; that is caught and re-raised as
+    ``ExternalIdConflictError`` instead of escaping as a 500.
+
+    Returns the updated thread dict, or ``None`` when no matching thread was found.
+    """
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    UPDATE conversation_threads
+                    SET platform = %s, external_id = %s, updated_at = NOW()
+                    WHERE conversation_thread_id = %s
+                    RETURNING conversation_thread_id, workspace_id, current_status, msg_type, thread_index, title, platform, created_at, updated_at
+                """,
+                    (platform, external_id, thread_id),
+                )
+                result = await cur.fetchone()
+                if result:
+                    logger.info(
+                        f"[conversation_db] update_thread_external_id "
+                        f"thread_id={thread_id} platform={platform} external_id={external_id}"
+                    )
+                    return dict(result)
+                return None
+
+    except psycopg.errors.UniqueViolation as e:
+        # Another thread already holds this (platform, external_id). Surface a
+        # typed conflict the router maps to 409 rather than a raw 500. Guard on
+        # the index name so an unrelated unique violation still bubbles as-is.
+        if _unique_violation_constraint(e) == _EXTERNAL_ID_INDEX:
+            logger.info(
+                f"[conversation_db] update_thread_external_id conflict "
+                f"platform={platform} external_id={external_id}"
+            )
+            raise ExternalIdConflictError(platform=platform, external_id=external_id)
+        logger.error(f"Error updating thread external_id: {e}")
+        raise
+
+    except Exception as e:
+        logger.error(f"Error updating thread external_id: {e}")
+        raise
 
 
 async def update_thread_status(
@@ -1831,7 +1979,7 @@ async def update_thread_title(
                     UPDATE conversation_threads
                     SET title = %s, updated_at = NOW()
                     WHERE conversation_thread_id = %s
-                    RETURNING conversation_thread_id, workspace_id, current_status, msg_type, thread_index, title, created_at, updated_at
+                    RETURNING conversation_thread_id, workspace_id, current_status, msg_type, thread_index, title, platform, created_at, updated_at
                 """,
                     (title, conversation_thread_id),
                 )
