@@ -4317,6 +4317,7 @@ except OSError as e:
             excluded_dirs = sorted(ALWAYS_HIDDEN_DIR_NAMES | {"__pycache__"})
 
             glob_code = textwrap.dedent(f"""\
+                import fnmatch
                 import glob
                 import os
 
@@ -4324,19 +4325,37 @@ except OSError as e:
                 search_path = {search_path!r}
                 excluded_dirs = set({excluded_dirs!r})
 
-                full_pattern = os.path.join(search_path, pattern)
-                matches = glob.glob(full_pattern, recursive=True, include_hidden=True)
-                # Exclude only the directory components *between* the search root and
-                # the file: never the search-root prefix (so globbing directly into an
-                # excluded dir still works) and never the basename (so a regular file
-                # that happens to share a noise-dir name is not dropped).
-                files = []
-                for f in matches:
-                    if not os.path.isfile(f):
-                        continue
-                    inner_dirs = os.path.relpath(f, search_path).split(os.sep)[:-1]
-                    if not (set(inner_dirs) & excluded_dirs):
-                        files.append(f)
+                # Fast path: '**/<tail>' with a basename-only tail — the recursive
+                # patterns ('**/*', '**/*.py', …) that would otherwise walk the whole
+                # tree. Prune excluded dirs *during* the walk so we never descend into
+                # node_modules/.git/etc. instead of enumerating them and filtering
+                # afterward. For these patterns this is equivalent to glob's recursive
+                # match: a case-sensitive basename match at any non-excluded depth.
+                tail = pattern[3:] if pattern.startswith("**/") else None
+                if tail is not None and "/" not in tail and "**" not in tail:
+                    files = []
+                    for dirpath, dirnames, filenames in os.walk(search_path):
+                        dirnames[:] = [d for d in dirnames if d not in excluded_dirs]
+                        for fn in filenames:
+                            if fnmatch.fnmatchcase(fn, tail):
+                                full = os.path.join(dirpath, fn)
+                                if os.path.isfile(full):
+                                    files.append(full)
+                else:
+                    # General path: exact glob semantics, then drop matches whose
+                    # *intermediate* dir components intersect the excluded set — never
+                    # the search-root prefix (so globbing directly into an excluded dir
+                    # still works) and never the basename (so a regular file that shares
+                    # a noise-dir name is not dropped).
+                    full_pattern = os.path.join(search_path, pattern)
+                    matches = glob.glob(full_pattern, recursive=True, include_hidden=True)
+                    files = []
+                    for f in matches:
+                        if not os.path.isfile(f):
+                            continue
+                        inner_dirs = os.path.relpath(f, search_path).split(os.sep)[:-1]
+                        if not (set(inner_dirs) & excluded_dirs):
+                            files.append(f)
 
                 try:
                     files_with_mtime = [(f, os.path.getmtime(f)) for f in files]

@@ -59,13 +59,12 @@ def create_glob_tool(backend: FilesystemBackend) -> BaseTool:
                 logger.info("No files found", pattern=pattern, path=search_path)
                 return f"No files matching pattern '{pattern}' found in '{search_path}'"
 
-            # Virtualize paths in output (strip working directory prefix)
-            virtual_matches = [backend.virtualize_path(m) for m in matches]
-
-            # Cap the number of paths returned to the model (see GLOB_MATCH_LIMIT).
-            total = len(virtual_matches)
+            # Cap the number of paths returned to the model (see GLOB_MATCH_LIMIT),
+            # virtualizing only the shown slice so a pathological match set doesn't pay
+            # full virtualization cost before truncation. The header keeps the true total.
+            total = len(matches)
             truncated = total > GLOB_MATCH_LIMIT
-            shown = virtual_matches[:GLOB_MATCH_LIMIT]
+            shown = [backend.virtualize_path(m) for m in matches[:GLOB_MATCH_LIMIT]]
 
             lines = [f"Found {total} file(s) matching '{pattern}':", *shown]
             if truncated:
