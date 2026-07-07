@@ -130,6 +130,23 @@ def _build_fiscal_period_lookup(income_stmt: List[Dict]) -> Dict[str, str]:
     return lookup
 
 
+def _margin(stmt: Dict, ratio_key: str, numerator_key: str) -> Optional[float]:
+    """Margin fraction for an income-statement row.
+
+    Prefers the provider's ratio field when present; FMP's stable API dropped
+    the v3-era ``*Ratio`` fields, so otherwise it is derived from the raw
+    dollar fields still in the payload (``numerator / revenue``).
+    """
+    ratio = stmt.get(ratio_key)
+    if ratio is not None:
+        return ratio
+    revenue = stmt.get("revenue")
+    numerator = stmt.get(numerator_key)
+    if revenue and numerator is not None:
+        return numerator / revenue
+    return None
+
+
 def _infer_fiscal_period(
     fiscal_ending: str, fiscal_period_lookup: Dict[str, str]
 ) -> Optional[str]:
@@ -1150,9 +1167,9 @@ async def fetch_company_overview_data(symbol: str) -> Dict[str, Any]:
                 "operatingIncome": stmt.get("operatingIncome"),
                 "ebitda": stmt.get("ebitda"),
                 "epsDiluted": stmt.get("epsdiluted"),
-                "grossMargin": stmt.get("grossProfitRatio"),
-                "operatingMargin": stmt.get("operatingIncomeRatio"),
-                "netMargin": stmt.get("netIncomeRatio"),
+                "grossMargin": _margin(stmt, "grossProfitRatio", "grossProfit"),
+                "operatingMargin": _margin(stmt, "operatingIncomeRatio", "operatingIncome"),
+                "netMargin": _margin(stmt, "netIncomeRatio", "netIncome"),
             }
             for stmt in reversed(income_stmt)
         ]
@@ -2248,9 +2265,9 @@ No data found for symbol {symbol}"""
                     "operatingIncome": stmt.get("operatingIncome"),
                     "ebitda": stmt.get("ebitda"),
                     "epsDiluted": stmt.get("epsdiluted"),
-                    "grossMargin": stmt.get("grossProfitRatio"),
-                    "operatingMargin": stmt.get("operatingIncomeRatio"),
-                    "netMargin": stmt.get("netIncomeRatio"),
+                    "grossMargin": _margin(stmt, "grossProfitRatio", "grossProfit"),
+                    "operatingMargin": _margin(stmt, "operatingIncomeRatio", "operatingIncome"),
+                    "netMargin": _margin(stmt, "netIncomeRatio", "netIncome"),
                 }
                 for stmt in reversed(income_stmt)
             ]
