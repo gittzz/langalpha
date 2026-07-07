@@ -36,6 +36,15 @@ interface StockSearchResult {
 }
 
 /**
+ * Normalize a symbol to its cache/lookup key spelling: trim, strip a leading
+ * `^` index caret, uppercase. The single source for the caret-stripping
+ * normalizer that MarketView/Dashboard/quote-layer all need.
+ */
+export function normalizeIndexKey(symbol: string): string {
+  return String(symbol ?? '').trim().replace(/^\^/, '').toUpperCase();
+}
+
+/**
  * Compute extended-hours display info from market status and a data row.
  * Accepts both camelCase (snapshot-enriched rows) and snake_case (raw snapshot) field names.
  */
