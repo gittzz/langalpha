@@ -38,6 +38,35 @@ describe('fetchStockData — metadata passthrough', () => {
     });
   });
 
+  it('reads metadata from the nested cache block (the live wire shape)', async () => {
+    apiMock.get.mockResolvedValueOnce({
+      data: {
+        symbol: 'AAPL',
+        data: [bar],
+        count: 1,
+        cache: {
+          cached: true,
+          cache_key: 'ohlcv:AAPL.XNAS:ohlcv-1d',
+          watermark: 1700000000000,
+          complete: true,
+          market_phase: 'closed',
+          next_change_at: 1700050000000,
+          truncated: false,
+        },
+      },
+    });
+
+    const res = await fetchStockData('AAPL', '1day', undefined, undefined);
+
+    expect(res.meta).toMatchObject({
+      watermark: 1700000000000,
+      marketPhase: 'closed',
+      nextChangeAt: 1700050000000,
+      truncated: false,
+      cached: true,
+    });
+  });
+
   it('defaults complete=true and marketPhase=null when the envelope omits them', async () => {
     apiMock.get.mockResolvedValueOnce({ data: { data: [bar] } });
     const res = await fetchStockData('AAPL', '1min', undefined, undefined);

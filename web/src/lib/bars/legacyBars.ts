@@ -26,11 +26,16 @@ export interface StockDataResult {
 }
 
 /** Parse the (previously discarded) cache metadata off a bars response envelope. */
-function parseLoaderMeta(envelope: Record<string, unknown> | null | undefined): LoaderMeta {
+function parseLoaderMeta(body: Record<string, unknown> | null | undefined): LoaderMeta {
+  // The wire nests cache metadata under `cache` ({symbol, data, count, cache:
+  // {watermark, market_phase, ...}}); fall back to the body itself for older
+  // backends that shipped the fields flat.
+  const envelope = (body?.cache ?? body) as Record<string, unknown> | null | undefined;
   return {
     watermark: coerceWatermark(envelope?.watermark),
     complete: envelope?.complete !== false,
     marketPhase: (envelope?.market_phase as string) ?? null,
+    nextChangeAt: typeof envelope?.next_change_at === 'number' ? envelope.next_change_at : null,
     truncated: typeof envelope?.truncated === 'boolean' ? envelope.truncated : undefined,
     cached: typeof envelope?.cached === 'boolean' ? envelope.cached : undefined,
     currency: (envelope?.price_currency as string) || undefined,
