@@ -74,6 +74,14 @@ class TestXNYSLegacyParity:
             legacy = market_hours.seconds_until_next_open(at)
             assert abs(cal.seconds_until_next_open(at) - legacy) <= 1, at.isoformat()
 
+    def test_next_phase_change_parity(self):
+        # Full-day boundaries only — early-close divergence (13:00 vs the
+        # hand-rolled 16:00) is a known deferred limitation of market_hours.
+        cal = get_calendar("XNYS")
+        for at in self.MATRIX:
+            legacy = market_hours.next_phase_change_ms(at)
+            assert cal.next_phase_change_ms(at) == legacy, at.isoformat()
+
 
 class TestXHKG:
     def test_lunch_break(self):
@@ -102,6 +110,22 @@ class TestXHKG:
         at = datetime(2026, 7, 4, 12, 0, tzinfo=HKT)
         assert cal.expected_latest_daily_date(at) == date(2026, 7, 3)
 
+    def test_next_phase_change_walks_lunch_close_and_weekend(self):
+        cal = get_calendar("XHKG")
+
+        def ms(dt):
+            return int(dt.timestamp() * 1000)
+
+        # Morning session → lunch start; lunch → lunch end; after Friday's
+        # close → Monday's 09:30 open (no extended hours to cross first).
+        cases = [
+            (datetime(2026, 7, 3, 10, 0, tzinfo=HKT), datetime(2026, 7, 3, 12, 0, tzinfo=HKT)),
+            (datetime(2026, 7, 3, 12, 15, tzinfo=HKT), datetime(2026, 7, 3, 13, 0, tzinfo=HKT)),
+            (datetime(2026, 7, 3, 17, 0, tzinfo=HKT), datetime(2026, 7, 6, 9, 30, tzinfo=HKT)),
+        ]
+        for at, expected in cases:
+            assert cal.next_phase_change_ms(at) == ms(expected), at.isoformat()
+
 
 class TestHandRolled:
     def test_crypto_sunday_regular(self):
@@ -120,6 +144,19 @@ class TestHandRolled:
         assert cal.phase_at(monday) == MarketPhase.REGULAR
         # Saturday noon → Monday 00:00 UTC is 36h.
         assert cal.seconds_until_next_open(saturday) == 36 * 3600
+
+    def test_crypto_phase_never_changes(self):
+        cal = Always24x7()
+        assert cal.next_phase_change_ms(datetime(2026, 7, 5, 12, 0, tzinfo=timezone.utc)) is None
+
+    def test_fx_next_change_is_the_weekend_boundary(self):
+        cal = Weekdays24x5()
+        wednesday = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+        saturday_open = datetime(2026, 7, 4, 0, 0, tzinfo=timezone.utc)
+        assert cal.next_phase_change_ms(wednesday) == int(saturday_open.timestamp() * 1000)
+        sunday = datetime(2026, 7, 5, 10, 0, tzinfo=timezone.utc)
+        monday_open = datetime(2026, 7, 6, 0, 0, tzinfo=timezone.utc)
+        assert cal.next_phase_change_ms(sunday) == int(monday_open.timestamp() * 1000)
 
 
 class TestRegistry:

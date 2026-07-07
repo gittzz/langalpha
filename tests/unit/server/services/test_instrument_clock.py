@@ -92,6 +92,16 @@ class TestXhkgClock:
         assert self.clock.is_closed(us_midday) is True
         assert clock_for("AAPL").is_closed(us_midday) is False
 
+    def test_next_phase_change_diverges_from_us(self):
+        # Mid HK morning session: HK's next boundary is the 12:00 lunch start;
+        # the same instant on the US clock (22:32 ET Tue) points at the next
+        # day's 04:00 pre-open.
+        now = datetime(2026, 4, 15, 10, 32, tzinfo=HKT)
+        hk_next = self.clock.next_phase_change_ms(now)
+        assert _bar_dt(hk_next, HKT).strftime("%H:%M") == "12:00"
+        us_next = clock_for("AAPL").next_phase_change_ms(now)
+        assert _bar_dt(us_next, ET).strftime("%Y-%m-%d %H:%M") == "2026-04-15 04:00"
+
     def test_seconds_until_next_open_positive_when_closed(self):
         now = datetime(2026, 4, 18, 12, 0, tzinfo=HKT)  # Saturday
         secs = self.clock.seconds_until_next_open(now)

@@ -244,7 +244,11 @@ async def get_bars(
     if result.error:
         raise HTTPException(status_code=500, detail=result.error)
 
-    phase = result.market_phase or "closed"
+    # The clock is the phase authority when the cache result doesn't carry one
+    # (windowed fetches) — the old `or "closed"` default could stamp a closed
+    # phase on an open venue.
+    clock = clock_for(legacy_symbol, is_index)
+    phase = result.market_phase or clock.market_phase()
     bars = result.data or []
     if mode == "after":
         # Inclusive of the cursor bar: the bar AT `after` was the forming bar
@@ -270,13 +274,19 @@ async def get_bars(
     elif mode == "after":
         page = {"next_cursor": None, "has_more": False}
     elif bars:
-        tz = clock_for(legacy_symbol, is_index).tz
-        page = {"next_cursor": _local_date(_bar_time(bars[0]), tz), "has_more": True}
+        page = {"next_cursor": _local_date(_bar_time(bars[0]), tz=clock.tz), "has_more": True}
     else:
         page = {"next_cursor": None, "has_more": False}
 
     return {
         "series": series,
         "page": page,
-        "cache": {"cached": bool(result.cached), "cache_key": result.cache_key},
+        # next_change_at (Unix ms, null for 24/7 venues) is the phase's next
+        # calendar boundary, letting clients flip presentation exactly at the
+        # bell instead of on the next poll.
+        "cache": {
+            "cached": bool(result.cached),
+            "cache_key": result.cache_key,
+            "next_change_at": clock.next_phase_change_ms(),
+        },
     }

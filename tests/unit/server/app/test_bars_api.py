@@ -158,6 +158,9 @@ async def test_default_mode_returns_header_and_records(client):
 
     assert body["cache"]["cached"] is True
     assert body["cache"]["cache_key"] == "ohlcv:AAPL.XNAS:ohlcv-1m"
+    # US venues always have a next calendar boundary (wall-clock derived).
+    assert isinstance(body["cache"]["next_change_at"], int)
+    assert body["cache"]["next_change_at"] > 0
     assert body["page"]["has_more"] is True
     assert isinstance(body["page"]["next_cursor"], str)
     # live path: no historical window passed to the service
@@ -305,6 +308,24 @@ async def test_invalid_cursor_is_422(client):
         )
     assert resp.status_code == 422
     assert "Invalid cursor" in resp.json()["detail"]
+
+
+async def test_phaseless_result_falls_back_to_the_clock(client):
+    # Windowed fetches don't carry a market_phase; the router must answer
+    # from the instrument clock, never a hardcoded "closed" default.
+    stub_clock = MagicMock()
+    stub_clock.market_phase.return_value = "open"
+    stub_clock.next_phase_change_ms.return_value = 1_800_000_000_000
+    with (
+        _stub(intraday_result=_intraday_result([_bar(_MS)], phase=None, cache_key="hist")),
+        patch("src.server.app.bars.clock_for", return_value=stub_clock),
+    ):
+        resp = await client.get(
+            "/api/v1/market-data/bars/AAPL?schema=ohlcv-1m&before=2026-06-29"
+        )
+    assert resp.status_code == 200
+    cache = resp.json()["cache"]
+    assert cache["next_change_at"] == 1_800_000_000_000
 
 
 # ---------------------------------------------------------------------------

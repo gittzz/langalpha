@@ -176,6 +176,28 @@ def expected_latest_daily_date(now: datetime | None = None) -> str:
     return (found or now.date()).strftime("%Y-%m-%d")
 
 
+def next_phase_change_ms(now: datetime | None = None) -> int | None:
+    """Unix ms of the next phase boundary (04:00 / 09:30 / 16:00 / 20:00 ET, holiday-aware).
+
+    Non-trading days contribute no boundaries; the scan walks forward across
+    them, so a Friday post-close answer lands on Monday's 04:00 pre-open.
+    """
+    if now is None:
+        now = datetime.now(ET)
+    else:
+        now = now.astimezone(ET)
+
+    for i in range(11):
+        d = now.date() + timedelta(days=i)
+        if not _is_trading_day(d):
+            continue
+        for t in (_PRE_OPEN, _MARKET_OPEN, _MARKET_CLOSE, _POST_CLOSE):
+            edge = datetime.combine(d, t, tzinfo=ET)
+            if edge > now:
+                return int(edge.timestamp() * 1000)
+    return None  # defensive; no 10-day US closure exists
+
+
 def seconds_until_next_open(now: datetime | None = None) -> int:
     """Seconds until the next pre-market open (04:00 ET on a trading day).
 

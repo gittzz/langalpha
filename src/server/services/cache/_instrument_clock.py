@@ -74,6 +74,9 @@ class UsClock:
     def seconds_until_next_open(self, now: datetime | None = None) -> int:
         return market_hours.seconds_until_next_open(now)
 
+    def next_phase_change_ms(self, now: datetime | None = None) -> int | None:
+        return market_hours.next_phase_change_ms(now)
+
     def today_market_open_ms(self) -> int | None:
         return market_hours.today_market_open_ms()
 
@@ -139,6 +142,9 @@ class CalendarClock:
 
     def seconds_until_next_open(self, now: datetime | None = None) -> int:
         return self._cal.seconds_until_next_open(self._now(now))
+
+    def next_phase_change_ms(self, now: datetime | None = None) -> int | None:
+        return self._cal.next_phase_change_ms(self._now(now))
 
     def today_market_open_ms(self) -> int | None:
         """Today's session open (exchange-local date), None before it opens."""

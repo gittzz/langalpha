@@ -36,6 +36,10 @@ class MarketCalendar(Protocol):
 
     def phase_at(self, at: datetime) -> MarketPhase: ...
 
+    def next_phase_change_ms(self, at: datetime) -> int | None:
+        """Unix ms of the next ``phase_at`` transition, or None if the phase never changes."""
+        ...
+
     def is_trading_day(self, d: date) -> bool: ...
 
     def latest_trading_date(self, at: datetime) -> date:
@@ -163,6 +167,29 @@ class XcalsCalendar:
                 return MarketPhase.POST
         return MarketPhase.CLOSED
 
+    def _phase_edges_ms(self, d: date) -> list[int]:
+        """Every phase-transition instant of session *d*, ascending ([] if no session)."""
+        bounds = self._bounds(d)
+        if bounds is None:
+            return []
+        open_ms, close_ms, break_start, break_end = bounds
+        edges = [open_ms, close_ms]
+        if break_start is not None and break_end is not None:
+            edges += [break_start, break_end]
+        if self._extended:
+            for t in self._extended:
+                edges.append(int(datetime.combine(d, t, tzinfo=self.tz).timestamp() * 1000))
+        return sorted(edges)
+
+    def next_phase_change_ms(self, at: datetime) -> int | None:
+        ms = int(at.timestamp() * 1000)
+        local_date = at.astimezone(self.tz).date()
+        for i in range(15):
+            for edge in self._phase_edges_ms(local_date + timedelta(days=i)):
+                if edge > ms:
+                    return edge
+        return None  # defensive; every xcals venue has a session within 15 days
+
     def latest_trading_date(self, at: datetime) -> date:
         ms = int(at.timestamp() * 1000)
         candidate = at.astimezone(self.tz).date()
@@ -222,6 +249,9 @@ class Always24x7:
     def phase_at(self, at: datetime) -> MarketPhase:
         return MarketPhase.REGULAR
 
+    def next_phase_change_ms(self, at: datetime) -> int | None:
+        return None  # always open — the phase never changes
+
     def is_trading_day(self, d: date) -> bool:
         return True
 
@@ -250,6 +280,13 @@ class Weekdays24x5:
     def phase_at(self, at: datetime) -> MarketPhase:
         d = at.astimezone(_UTC)
         return MarketPhase.REGULAR if d.weekday() < 5 else MarketPhase.CLOSED
+
+    def next_phase_change_ms(self, at: datetime) -> int | None:
+        d = at.astimezone(_UTC)
+        # Weekday → the Saturday 00:00 close; weekend → the Monday 00:00 open.
+        days_ahead = (5 if d.weekday() < 5 else 7) - d.weekday()
+        edge = datetime.combine(d.date() + timedelta(days=days_ahead), time(0, 0), tzinfo=_UTC)
+        return int(edge.timestamp() * 1000)
 
     def is_trading_day(self, d: date) -> bool:
         return d.weekday() < 5
