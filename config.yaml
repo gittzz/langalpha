@@ -124,7 +124,6 @@ redis:
     # Per-interval OHLCV cache TTLs (≈ interval_seconds × 1.5)
     # SWR soft threshold stays at 50% of these values
     ohlcv:
-      "1s": 30
       "1min": 90
       "5min": 360
       "15min": 1080
@@ -148,12 +147,19 @@ redis:
 # MARKET DATA CONFIGURATION
 # =============================================================================
 # Ordered provider chain — requests try each provider in order.
-# Each provider declares which markets it covers.
-# "all" is a catch-all that matches any market.
+# Each provider declares which markets it covers, optionally overridden per
+# capability (intraday_markets / daily_markets / snapshot_markets).
+# "all" matches any market; "non-us" matches everything except us.
+# A provider may appear twice to hold different chain positions per
+# capability — its entries share one underlying client and are only tried
+# once per request.
 market_data:
   providers:
     - name: ginlix-data
       markets: [us]          # US equities only
+    - name: yfinance
+      markets: []                 # priority slot: non-US intraday only —
+      intraday_markets: [non-us]  # native session anchors incl. lunch gaps
     - name: fmp
       markets: [all]         # FMP — global coverage, catch-all fallback
     - name: yfinance

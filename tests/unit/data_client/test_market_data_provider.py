@@ -18,9 +18,10 @@ from src.data_client.market_data_provider import (
 class FakeSource:
     """Configurable fake MarketDataSource for testing."""
 
-    def __init__(self, name: str = "fake", *, fail: bool = False):
+    def __init__(self, name: str = "fake", *, fail: bool = False, empty: bool = False):
         self.name = name
         self.fail = fail
+        self.empty = empty
         self.calls: list[tuple[str, dict]] = []
         self.closed = False
 
@@ -28,6 +29,8 @@ class FakeSource:
         self.calls.append(("get_intraday", kwargs))
         if self.fail:
             raise RuntimeError(f"{self.name} intraday error")
+        if self.empty:
+            return []
         return [{"date": "2025-01-01", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 100}]
 
     async def get_daily(self, **kwargs):
@@ -152,6 +155,32 @@ class TestMarketDataProvider:
         assert len(result) == 1
         assert len(us_only.calls) == 0  # skipped — no HK market coverage
         assert len(global_src.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_result_falls_through_to_next_source(self):
+        # A source may cover the market but return no bars for this
+        # symbol/window (e.g. Yahoo lookback caps) — the chain must try the
+        # rest instead of accepting the empty list. Caught live: yfinance
+        # returned [] for HK 1h and the chain never reached the next provider.
+        empty = FakeSource("empty-first", empty=True)
+        full = FakeSource("full-second")
+        provider = MarketDataProvider([
+            ProviderEntry(source=empty, name="empty-first", markets={"all"}),
+            ProviderEntry(source=full, name="full-second", markets={"all"}),
+        ])
+        bars, source, _ = await provider.get_intraday_with_source("0700.HK", "1hour")
+        assert bars and source == "full-second"
+        assert len(empty.calls) == 1 and len(full.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_sources_empty_returns_first_empty(self):
+        e1, e2 = FakeSource("e1", empty=True), FakeSource("e2", empty=True)
+        provider = MarketDataProvider([
+            ProviderEntry(source=e1, name="e1", markets={"all"}),
+            ProviderEntry(source=e2, name="e2", markets={"all"}),
+        ])
+        bars, source, truncated = await provider.get_intraday_with_source("AAPL", "1hour")
+        assert bars == [] and source == "e1" and truncated is False
 
     @pytest.mark.asyncio
     async def test_all_providers_fail_raises_last_exception(self):
@@ -472,6 +501,26 @@ class TestMarketDataProvider:
         with pytest.raises(RuntimeError, match="b snapshots error"):
             await provider.get_snapshots(["AAPL"])
 
+    @pytest.mark.asyncio
+    async def test_get_snapshots_empty_priority_slot_does_not_block_catch_all(self):
+        # yfinance appears twice sharing one source: an intraday-only priority
+        # slot (empty snapshot coverage) then a catch-all. The empty first slot
+        # must not mark the name "tried", or snapshot fallback to the catch-all
+        # never runs and the US symbol is dropped.
+        primary = SnapshotSource("primary")  # covers US but resolves nothing
+        yf = SnapshotSource("yfinance", {"AAPL": {"symbol": "AAPL", "price": 190.0}})
+        provider = MarketDataProvider([
+            ProviderEntry("primary", primary, {"all"}),
+            ProviderEntry("yfinance", yf, set(), intraday_markets={"non-us"}),
+            ProviderEntry("yfinance", yf, {"all"}),
+        ])
+
+        result = await provider.get_snapshots(["AAPL"])
+
+        assert result == [{"symbol": "AAPL", "price": 190.0}]
+        assert len(yf.calls) == 1
+        assert yf.calls[0][1]["symbols"] == ["AAPL"]
+
 
 # ---------------------------------------------------------------------------
 # FMPDataSource interval guard tests
@@ -523,3 +572,127 @@ class TestConfigAccessor:
         assert len(providers) >= 1
         names = [p["name"] for p in providers]
         assert "fmp" in names
+
+
+# ---------------------------------------------------------------------------
+# Per-capability routing tests
+# ---------------------------------------------------------------------------
+
+class TestCapabilityRouting:
+    """intraday/daily/snapshot market overrides + duplicate priority entries."""
+
+    def _chain(self):
+        ginlix = FakeSource("ginlix")
+        yf = FakeSource("yf")
+        fmp = FakeSource("fmp")
+        provider = MarketDataProvider([
+            ProviderEntry("ginlix-data", ginlix, {"us"}),
+            ProviderEntry("yfinance", yf, set(), intraday_markets={"non-us"}),
+            ProviderEntry("fmp", fmp, {"all"}),
+            ProviderEntry("yfinance", yf, {"all"}),
+        ])
+        return provider, ginlix, yf, fmp
+
+    @pytest.mark.asyncio
+    async def test_non_us_intraday_prefers_yfinance(self):
+        provider, ginlix, yf, fmp = self._chain()
+        _, source, _ = await provider.get_intraday_with_source("0700.HK", interval="1hour")
+        assert source == "yfinance"
+        assert not fmp.calls and not ginlix.calls
+
+    @pytest.mark.asyncio
+    async def test_us_intraday_routing_unchanged(self):
+        provider, ginlix, yf, fmp = self._chain()
+        _, source, _ = await provider.get_intraday_with_source("AAPL", interval="1hour")
+        assert source == "ginlix-data"
+        assert not yf.calls and not fmp.calls
+
+    @pytest.mark.asyncio
+    async def test_non_us_daily_still_fmp_first(self):
+        """The empty base `markets` keeps the priority slot out of daily routing."""
+        provider, _, yf, _ = self._chain()
+        _, source, _ = await provider.get_daily_with_source("0700.HK")
+        assert source == "fmp"
+        assert not yf.calls
+
+    @pytest.mark.asyncio
+    async def test_non_us_intraday_falls_back_to_fmp(self):
+        yf = FakeSource("yf", fail=True)
+        fmp = FakeSource("fmp")
+        provider = MarketDataProvider([
+            ProviderEntry("yfinance", yf, set(), intraday_markets={"non-us"}),
+            ProviderEntry("fmp", fmp, {"all"}),
+            ProviderEntry("yfinance", yf, {"all"}),
+        ])
+        _, source, _ = await provider.get_intraday_with_source("0700.HK", interval="1hour")
+        assert source == "fmp"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_provider_tried_once_per_request(self):
+        yf = FakeSource("yf", fail=True)
+        provider = MarketDataProvider([
+            ProviderEntry("yfinance", yf, set(), intraday_markets={"non-us"}),
+            ProviderEntry("yfinance", yf, {"all"}),
+        ])
+        with pytest.raises(RuntimeError):
+            await provider.get_intraday("0700.HK", interval="1hour")
+        assert len(yf.calls) == 1
+
+    def test_source_names_deduplicated_in_order(self):
+        provider, *_ = self._chain()
+        assert provider.source_names == ["ginlix-data", "yfinance", "fmp"]
+
+    def test_source_names_for_intraday_prefers_yfinance_over_catch_all(self):
+        """Non-US intraday: the priority slot puts yfinance ahead of fmp."""
+        provider, *_ = self._chain()
+        assert provider.source_names_for("0700.HK", "intraday") == ["yfinance", "fmp"]
+
+    def test_source_names_for_snapshot_excludes_empty_coverage_slot(self):
+        """US snapshot: the empty-coverage priority slot is skipped, so yfinance
+        appears once in its catch-all position (last), not ahead of fmp."""
+        provider, *_ = self._chain()
+        names = provider.source_names_for("AAPL", "snapshot")
+        assert names == ["ginlix-data", "fmp", "yfinance"]
+        assert names.count("yfinance") == 1
+
+    def test_non_us_token_never_matches_us(self):
+        from src.data_client.market_data_provider import _market_matches
+        assert _market_matches({"non-us"}, "hk")
+        assert _market_matches({"non-us"}, "other")
+        assert not _market_matches({"non-us"}, "us")
+        assert not _market_matches(set(), "hk")
+
+
+# ---------------------------------------------------------------------------
+# Null-field snapshot recovery (Phase 2)
+# ---------------------------------------------------------------------------
+
+class TestNullRowRecovery:
+    @pytest.mark.asyncio
+    async def test_null_row_falls_through_to_next_provider(self):
+        null_row = {"symbol": "AAPL", "name": None, "price": None, "change": None,
+                    "change_percent": None, "previous_close": None, "open": None,
+                    "high": None, "low": None, "volume": None}
+        first = SnapshotSource("first", {"AAPL": null_row})
+        second = SnapshotSource("second", {"AAPL": {"symbol": "AAPL", "price": 190.0}})
+        provider = MarketDataProvider([
+            ProviderEntry("first", first, {"all"}),
+            ProviderEntry("second", second, {"all"}),
+        ])
+        out = await provider.get_snapshots(["AAPL"])
+        assert out == [{"symbol": "AAPL", "price": 190.0}]
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_symbol_absent_from_results(self):
+        null_row = {"symbol": "ZZZFAKE", "price": None, "change": None,
+                    "change_percent": None, "previous_close": None, "open": None,
+                    "high": None, "low": None, "volume": None}
+        first = SnapshotSource("first", {"AAPL": {"symbol": "AAPL", "price": 190.0},
+                                         "ZZZFAKE": null_row})
+        second = SnapshotSource("second", {})
+        provider = MarketDataProvider([
+            ProviderEntry("first", first, {"all"}),
+            ProviderEntry("second", second, {"all"}),
+        ])
+        out = await provider.get_snapshots(["AAPL", "ZZZFAKE"])
+        assert [r["symbol"] for r in out] == ["AAPL"]

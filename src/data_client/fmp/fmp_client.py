@@ -16,6 +16,18 @@ import httpx
 _CACHE_MAX_SIZE = 512
 
 
+class FMPRequestError(Exception):
+    """FMP request failure with a sanitized message and optional HTTP status.
+
+    ``str(exc)`` is safe to surface to callers/agents: it never embeds the
+    request URL, which carries the API key as a query parameter.
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _today_utc() -> date:
     """UTC equivalent of ``date.today()`` — the server runs in UTC; local-clock dates drift."""
     return datetime.now(timezone.utc).date()
@@ -126,11 +138,16 @@ class FMPClient:
             return data
 
         except httpx.HTTPStatusError as e:
-            raise Exception(f"FMP API request failed: {str(e)}")
-        except httpx.TimeoutException as e:
-            raise Exception(f"FMP API request timed out: {str(e)}")
-        except httpx.RequestError as e:
-            raise Exception(f"FMP API request failed: {str(e)}")
+            # Never stringify the httpx error: its message embeds the request
+            # URL, which carries the API key as a query parameter.
+            raise FMPRequestError(
+                f"FMP API request failed ({e.response.status_code})",
+                status_code=e.response.status_code,
+            )
+        except httpx.TimeoutException:
+            raise FMPRequestError("FMP API request timed out")
+        except httpx.RequestError:
+            raise FMPRequestError("FMP API request failed")
 
     # =====================================================================
     # Financial Statements
