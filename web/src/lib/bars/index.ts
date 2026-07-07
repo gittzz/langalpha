@@ -80,6 +80,7 @@ export type { IntervalConfig } from './chartConstants';
 export {
   applyQuoteToDailyBar,
   foldMinuteBar,
+  isSettledDailyHead,
 } from './formingBar';
 export type { QuoteLike } from './formingBar';
 

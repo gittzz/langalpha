@@ -175,6 +175,9 @@ export const OVERLAY_LABELS: Record<string, string> = {
 // --- Extended-hours detection ---
 export const EXT_COLOR_PRE = '#fbbf24';   // amber — pre-market
 export const EXT_COLOR_POST = '#3b82f6';  // blue  — after-hours
+// Neutral grey for lines that mark a SETTLED close — must never look like a
+// live price (the ext colors above are the UI's "live extended price" hues).
+export const CLOSE_LINE_COLOR = 'rgba(139,143,163,0.7)';
 export const EXTENDED_HOURS_INTERVALS = new Set(['1min', '5min', '15min', '30min', '1hour']);
 
 export type ExtendedHoursType = 'pre' | 'post';

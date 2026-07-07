@@ -11,7 +11,7 @@ import {
   dedupeMergeByTime,
   rangeBeforeOldest,
 } from '../utils/chartDataLoaders';
-import { applyQuoteToDailyBar, foldMinuteBar, formatPrice, useCurrencyDisplay, useLiveBars } from '@/lib/bars';
+import { applyQuoteToDailyBar, foldMinuteBar, formatPrice, isSettledDailyHead, useCurrencyDisplay, useLiveBars } from '@/lib/bars';
 import { timezoneForSymbol } from '@/lib/bars/exchanges';
 import { RANGE_PRESETS, rangeStartChartSec } from '@/lib/bars/rangePresets';
 import type { RangePreset } from '@/lib/bars/rangePresets';
@@ -29,7 +29,7 @@ import {
   INTERVAL_SECONDS, WS_FOLD_INTERVALS,
   OVERLAY_COLORS, OVERLAY_LABELS,
   EXTENDED_HOURS_INTERVALS, getExtendedHoursType, computeExtendedHoursRegions,
-  EXT_COLOR_PRE, EXT_COLOR_POST,
+  EXT_COLOR_PRE, EXT_COLOR_POST, CLOSE_LINE_COLOR,
   isUSEquity,
 } from '../utils/chartConstants';
 import type { ChartDataPoint as ChartConstDataPoint } from '../utils/chartConstants';
@@ -806,13 +806,9 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     // Pre-market and on weekends the head bar is the PREVIOUS session's
     // settled candle — folding a live quote into it corrupts its close/volume
     // and then fights the 60s poll (which restores it) in a visible
-    // oscillation. The gate compares the head bar's venue date (chart times
-    // encode venue wall clock as fake UTC — decode by reading in UTC) against
-    // "today" on the venue's clock; a mismatch just skips the fold and the
-    // poll alone keeps the bar current.
-    const prevHead = prev[prev.length - 1];
-    const venueToday = dateStrInTz(new Date(), timezoneForSymbol(symbolRef.current));
-    if (!prevHead || chartSecToDateStr(prevHead.time) !== venueToday) return;
+    // oscillation. A settled head skips the fold (the settled-close effect
+    // below relabels its price line) and the poll alone keeps the bar current.
+    if (!prev.length || isSettledDailyHead(prev, timezoneForSymbol(symbolRef.current))) return;
     const folded = applyQuoteToDailyBar(prev, dayQuote);
     if (folded === prev) return; // no price / empty series → no-op
     allDataRef.current = folded;
@@ -826,6 +822,27 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
       volumeSeriesRef.current.update({ time: head.time, value: head.volume, color: up ? ct.upColor : ct.downColor });
     }
   }, [dayQuote, interval, effectiveChartMode]);
+
+  // --- Settled-close label for the 1day interval ---
+  // Pre-market and on weekends the head daily bar is the previous session's
+  // settled candle, so the series' last-value line marks yesterday's close
+  // while the header shows the live extended price — unlabeled and in the
+  // default bar color it reads as a live price. Restyle it as a neutral grey
+  // "Close" whenever the head bar is settled; restore live defaults once
+  // today's bar exists. dayQuote in the deps re-evaluates this sub-minute so
+  // the label flips at session boundaries without waiting for a data reload.
+  const settledCloseAppliedRef = useRef(false);
+  useEffect(() => {
+    if (interval !== '1day' || effectiveChartMode !== 'custom') return;
+    const series = candlestickSeriesRef.current;
+    if (!series || !chartDataForHooks.length) return;
+    const settled = isSettledDailyHead(chartDataForHooks, timezoneForSymbol(symbolRef.current));
+    if (settled === settledCloseAppliedRef.current) return;
+    settledCloseAppliedRef.current = settled;
+    series.applyOptions(settled
+      ? { priceLineColor: CLOSE_LINE_COLOR, title: 'Close' }
+      : { priceLineColor: undefined, title: '' });
+  }, [chartDataForHooks, dayQuote, interval, effectiveChartMode]);
 
   // Temporarily reveal the hidden Light chart for capture, then restore.
   // Since it's behind the TV widget (z-index: -1), no visual flash occurs.
@@ -983,7 +1000,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
           extCloseLineRef.current = series.createPriceLine({
             price: closePrice,
             title: 'Close',
-            color: 'rgba(139,143,163,0.7)',
+            color: CLOSE_LINE_COLOR,
             lineWidth: 1,
             lineStyle: LineStyle.Dashed,
             axisLabelVisible: true,
@@ -1615,6 +1632,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     }
     extCloseLineRef.current = null;
     currentExtTypeRef.current = null;
+    settledCloseAppliedRef.current = false;
     if (candlestickSeriesRef.current) {
       // Reset the title too: it carries the "Pre"/"After" axis label, and with
       // the ref nulled no later sync sees a transition to clear it — a US

@@ -12,6 +12,7 @@
  * error these introduce. All functions return a NEW array and never mutate.
  */
 import type { ChartBar } from './marketProtocol';
+import { chartSecToDateStr, dateStrInTz } from '@/lib/utils';
 
 /**
  * The subset of a snapshot quote row {@link applyQuoteToDailyBar} reads. Kept
@@ -98,6 +99,23 @@ export function foldMinuteBar(
  * quote-unavailable row, never a real trade.
  * Returns a new array; never mutates `bars`.
  */
+/**
+ * True when the head bar of a daily series is a SETTLED prior-session candle
+ * (pre-market, weekends, holidays) rather than the current venue day's live
+ * bar. Chart times encode venue wall clock as fake UTC, so the head bar's date
+ * decodes via a UTC read and compares against "today" on the venue clock.
+ * False for an empty/missing series.
+ */
+export function isSettledDailyHead(
+  bars: readonly { time: number }[] | null | undefined,
+  tz: string,
+  now: Date = new Date(),
+): boolean {
+  const head = bars?.[bars.length - 1];
+  if (!head) return false;
+  return chartSecToDateStr(head.time) !== dateStrInTz(now, tz);
+}
+
 export function applyQuoteToDailyBar(
   bars: ChartBar[],
   quote: QuoteLike | null | undefined,

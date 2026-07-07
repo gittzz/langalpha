@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { applyQuoteToDailyBar, foldMinuteBar } from '../formingBar';
+import { applyQuoteToDailyBar, foldMinuteBar, isSettledDailyHead } from '../formingBar';
 import type { ChartBar } from '../marketProtocol';
 
 const bar = (b: Partial<ChartBar> & { time: number }): ChartBar => ({
@@ -157,5 +157,46 @@ describe('applyQuoteToDailyBar', () => {
     const snapshot = JSON.parse(JSON.stringify(input));
     applyQuoteToDailyBar(input, { price: 115, high: 116, low: 103, volume: 800 });
     expect(input).toEqual(snapshot);
+  });
+});
+
+describe('isSettledDailyHead', () => {
+  const ET = 'America/New_York';
+  // Daily chart times encode the venue-local date as fake UTC midnight.
+  const dayBar = (isoDate: string) => ({ time: Date.parse(`${isoDate}T00:00:00Z`) / 1000 });
+
+  it('true during pre-market: head bar is still yesterday on the venue clock', () => {
+    const preMarket = new Date('2024-03-12T11:50:00Z'); // 07:50 ET Tuesday
+    expect(isSettledDailyHead([dayBar('2024-03-11')], ET, preMarket)).toBe(true);
+  });
+
+  it('false during the session: head bar is the venue-today forming bar', () => {
+    const midSession = new Date('2024-03-12T15:00:00Z'); // 11:00 ET Tuesday
+    expect(isSettledDailyHead([dayBar('2024-03-12')], ET, midSession)).toBe(false);
+  });
+
+  it('true on weekends: head bar is Friday, now is Saturday', () => {
+    const saturday = new Date('2024-03-16T16:00:00Z');
+    expect(isSettledDailyHead([dayBar('2024-03-15')], ET, saturday)).toBe(true);
+  });
+
+  it('uses the venue clock, not the viewer clock', () => {
+    // 21:30 ET Tuesday == 09:30 HKT Wednesday: an HK head bar dated Wednesday
+    // is live on the venue clock while an ET read would still say Tuesday.
+    const usEvening = new Date('2024-03-13T01:30:00Z');
+    expect(isSettledDailyHead([dayBar('2024-03-13')], 'Asia/Hong_Kong', usEvening)).toBe(false);
+    expect(isSettledDailyHead([dayBar('2024-03-13')], ET, usEvening)).toBe(true);
+  });
+
+  it('only the head bar matters', () => {
+    const midSession = new Date('2024-03-12T15:00:00Z');
+    const bars = [dayBar('2024-03-08'), dayBar('2024-03-11'), dayBar('2024-03-12')];
+    expect(isSettledDailyHead(bars, ET, midSession)).toBe(false);
+  });
+
+  it('false for an empty or missing series', () => {
+    expect(isSettledDailyHead([], ET)).toBe(false);
+    expect(isSettledDailyHead(null, ET)).toBe(false);
+    expect(isSettledDailyHead(undefined, ET)).toBe(false);
   });
 });
