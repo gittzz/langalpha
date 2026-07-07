@@ -8,8 +8,9 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-# Supported intervals for intraday data
-SUPPORTED_INTERVALS = ("1s", "1min", "5min", "15min", "30min", "1hour", "4hour")
+# Supported intervals for intraday data. 1s was removed from the REST API —
+# second-level data exists only as the WS forming-bar stream (ohlcv-1s records).
+SUPPORTED_INTERVALS = ("1min", "5min", "15min", "30min", "1hour", "4hour")
 STOCK_INTERVALS = SUPPORTED_INTERVALS
 INDEX_INTERVALS = SUPPORTED_INTERVALS
 
@@ -63,7 +64,7 @@ class IntradayResponse(BaseModel):
             "count": 1,
             "cache": {
                 "cached": True,
-                "cache_key": "ohlcv:stock:AAPL:1min",
+                "cache_key": "ohlcv:AAPL.XNAS:ohlcv-1m",
                 "ttl_remaining": 45,
                 "refreshed_in_background": False
             }
@@ -96,7 +97,7 @@ class DailyResponse(BaseModel):
             "count": 1,
             "cache": {
                 "cached": True,
-                "cache_key": "ohlcv:stock:AAPL:day",
+                "cache_key": "ohlcv:AAPL.XNAS:ohlcv-1d",
                 "ttl_remaining": 3200,
                 "refreshed_in_background": False
             }

@@ -2,7 +2,7 @@
 WebSocket proxy for ginlix-data real-time market aggregates.
 
 Authenticates the frontend WebSocket via Supabase JWT, then registers
-the client as a consumer of the SharedWSConnectionManager.  Messages
+the client as a consumer of the MarketDataFeed.  Messages
 from the shared upstream connection are forwarded to each client based
 on their symbol subscriptions.
 
@@ -20,12 +20,16 @@ import time as _time
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from src.server.auth.ws_auth import authenticate_websocket
-from src.server.services.cache._ohlcv_envelope import _build_envelope, _parse_envelope
-from src.server.services.cache.intraday_cache_service import IntradayCacheKeyBuilder
-from src.server.services.shared_ws_manager import SharedWSConnectionManager
+from src.server.services.cache._ohlcv_envelope import (
+    _build_envelope,
+    _parse_envelope,
+    canonical_series_key,
+    series_identity,
+)
+from src.server.services.market_data_feed import MarketDataFeed, to_protocol_record
 from src.utils.cache.redis_cache import get_cache_client
 from src.utils.market_hours import current_trading_date
 from src.observability import (
@@ -63,11 +67,14 @@ _pending_bars: dict[str, list[dict]] = {}  # cache_key → bars since last flush
 _backfill_done: dict[str, str] = {}  # cache_key → data_date
 _backfill_in_progress: set[str] = set()
 
-# Intervals where REST backfill is supported (ginlix-data supports both)
-_BACKFILL_INTERVALS = {"1min", "1s"}
+# Intervals whose cache gets a REST backfill on the first WS tick. The 1s
+# cache is deliberately NOT backfilled: with the 1s chart interval removed,
+# no REST provider serves second bars — the 1s key is a live tick buffer only.
+_BACKFILL_INTERVALS = {"1min"}
 
 # Periodic cleanup of stale entries in module-level dicts
 _CLEANUP_INTERVAL = 60.0  # seconds between cleanup sweeps
+_FLUSH_RETENTION = 24 * 3600.0  # drop idle _last_flush entries after a day
 _last_cleanup: float = 0.0
 
 
@@ -85,23 +92,39 @@ def _cleanup_stale_entries() -> None:
         _backfill_done.pop(k, None)
         _last_flush.pop(k, None)
 
+    # 1s-interval keys never enter _backfill_done (backfill is 1min-only), so
+    # prune _last_flush by its own idle age too or it grows one entry per
+    # distinct 1s-streamed instrument for the process lifetime.
+    idle = [k for k, t in _last_flush.items() if now - t > _FLUSH_RETENTION]
+    for k in idle:
+        _last_flush.pop(k, None)
+
 
 
 def _cache_key_for(symbol: str, market: str, cache_interval: str) -> str:
-    if market == "index":
-        return IntradayCacheKeyBuilder.index_key(symbol, cache_interval, source=_WS_SOURCE)
-    return IntradayCacheKeyBuilder.stock_key(symbol, cache_interval, source=_WS_SOURCE)
+    # Canonical Phase 3 key — the same one REST reads, so WS ticks and REST
+    # backfill/refresh converge on a single series per instrument (this also
+    # ends the old WS-writes-SPX / REST-reads-GSPC index split).
+    return canonical_series_key(symbol, cache_interval, is_index=market == "index")
 
 
-def _bar_fields(bar: dict) -> dict:
-    return {
-        "time": bar["time"],
-        "open": bar["open"],
-        "high": bar["high"],
-        "low": bar["low"],
-        "close": bar["close"],
-        "volume": bar["volume"],
-    }
+def _series_ids(symbol: str, market: str, cache_interval: str) -> tuple[str, str]:
+    return series_identity(symbol, cache_interval, is_index=market == "index")
+
+
+def _outbound_frame(raw_msg: str, entry: Optional[dict], cmdp: bool) -> str:
+    """Per-client outbound serializer (WS role 3).
+
+    Default (``cmdp=False``) is the legacy raw upstream passthrough —
+    byte-identical. ``cmdp=True`` wraps each aggregate bar as a protocol frame
+    ``{"type": "ohlcv", **entry}`` from the precomputed ``to_protocol_record``
+    entry; non-aggregate messages (``entry is None``: status, keepalive, or an
+    un-canonicalizable bar) pass through raw in both modes. The choice is
+    per-connection, so mixed clients on one feed each get their own format.
+    """
+    if cmdp and entry is not None:
+        return json.dumps({"type": "ohlcv", **entry})
+    return raw_msg
 
 
 async def _backfill_from_rest(
@@ -153,7 +176,11 @@ async def _backfill_from_rest(
 
             from src.utils.market_hours import current_market_phase
             phase = current_market_phase()
-            new_envelope = _build_envelope(merged, phase, complete=False, stored_ttl=_WS_CACHE_TTL, truncated=False)
+            instrument_key, schema = _series_ids(symbol, market, cache_interval)
+            new_envelope = _build_envelope(
+                merged, phase, complete=False, stored_ttl=_WS_CACHE_TTL, truncated=False,
+                instrument_key=instrument_key, schema=schema, publisher=_WS_SOURCE,
+            )
             await cache.set(cache_key, new_envelope, ttl=_WS_CACHE_TTL)
 
         _backfill_done[cache_key] = current_trading_date()
@@ -204,7 +231,12 @@ async def _flush_to_redis(cache_key: str, bars: list[dict]) -> None:
                 merged = bars
 
             phase = envelope.get("market_phase", "open") if envelope else "open"
-            new_envelope = _build_envelope(merged, phase, complete=False, stored_ttl=_WS_CACHE_TTL, truncated=False)
+            # Identity is embedded in the canonical key: ohlcv:{instrument_key}:{schema}
+            _, instrument_key, schema = cache_key.split(":", 2)
+            new_envelope = _build_envelope(
+                merged, phase, complete=False, stored_ttl=_WS_CACHE_TTL, truncated=False,
+                instrument_key=instrument_key, schema=schema, publisher=_WS_SOURCE,
+            )
             await cache.set(cache_key, new_envelope, ttl=_WS_CACHE_TTL)
     except asyncio.CancelledError:
         return
@@ -213,12 +245,21 @@ async def _flush_to_redis(cache_key: str, bars: list[dict]) -> None:
 
 
 def _buffer_tick(
-    bar: dict, market: str, cache_interval: str, user_id: Optional[str] = None,
+    bar: dict, market: str, cache_interval: str, entry: Optional[dict],
+    user_id: Optional[str] = None,
 ) -> None:
-    """Buffer a tick in memory; schedule a flush if throttle interval elapsed."""
+    """Buffer a tick's canonical record in memory; schedule a flush if the
+    throttle interval elapsed.
+
+    ``entry`` is the precomputed ``to_protocol_record`` result — shared with the
+    outbound serializer so the mapping runs once per tick. ``None`` means the
+    symbol couldn't be canonicalized and the tick is dropped, never buffered raw.
+    """
     _cleanup_stale_entries()
+    if entry is None:
+        return  # un-canonicalizable symbol — drop the tick, never buffer raw
     cache_key = _cache_key_for(bar["symbol"], market, cache_interval)
-    new_bar = _bar_fields(bar)
+    new_bar = entry["record"]
 
     # Accumulate in pending buffer (update-in-place or append)
     if cache_key not in _pending_bars:
@@ -269,9 +310,18 @@ async def market_data_ws_status():
 
 @router.websocket("/ws/v1/market-data/aggregates/{market}")
 async def ws_market_data_proxy(
-    websocket: WebSocket, market: str, interval: str = "second", tier: str = "realtime",
+    websocket: WebSocket,
+    market: str,
+    interval: str = "second",
+    tier: str = "realtime",
+    fmt: str = Query("raw", alias="format"),
 ):
-    """Proxy frontend WS via SharedWSConnectionManager."""
+    """Proxy frontend WS via MarketDataFeed.
+
+    ``?format=cmdp`` switches THIS client's outbound frames to CMDP protocol
+    frames; the default is the legacy raw upstream passthrough. The Redis cache
+    write is unaffected by this choice — it is always the canonical record.
+    """
 
     if market not in _ALLOWED_MARKETS:
         await websocket.close(code=1008, reason=f"Invalid market: {market}")
@@ -283,6 +333,12 @@ async def ws_market_data_proxy(
 
     if tier not in ("delayed", "realtime"):
         await websocket.close(code=1008, reason=f"Invalid tier: {tier}")
+        return
+
+    if interval not in _WS_INTERVAL_TO_CACHE:
+        # Also bounds MarketDataFeed._instances — arbitrary interval strings
+        # would mint unbounded, never-started feed objects.
+        await websocket.close(code=1008, reason=f"Invalid interval: {interval}")
         return
 
     # Authenticate before accepting
@@ -299,15 +355,20 @@ async def ws_market_data_proxy(
     _disconnect_reason = "client_close"
     safe_add(ws_connections_active, 1, _ws_labels)
 
-    shared_ws = SharedWSConnectionManager.get_instance(market=market, interval=interval, tier=tier)
+    shared_ws = MarketDataFeed.get_instance(market=market, interval=interval, tier=tier)
+    # Feeds outside DEFAULT_WS_FEEDS are minted lazily and were never started —
+    # without this a valid ?interval=minute client connects and silently gets
+    # zero data. start() is idempotent for already-running feeds.
+    await shared_ws.start()
     consumer_id = f"ws_proxy_{uuid4().hex[:12]}"
     cache_interval = _WS_INTERVAL_TO_CACHE.get(interval)
+    cmdp = fmt.lower() == "cmdp"  # per-connection outbound format
     connection_keys: set[str] = set()
     _msg_count = 0
     disconnected = asyncio.Event()
 
     async def on_message(raw_msg: str, bar: Optional[dict]) -> None:
-        """Callback from SharedWSConnectionManager — forward to frontend client."""
+        """Callback from MarketDataFeed — forward to frontend client."""
         nonlocal _msg_count
         try:
             _msg_count += 1
@@ -317,14 +378,20 @@ async def ws_market_data_proxy(
                     consumer_id, _msg_count,
                     raw_msg[:300] if isinstance(raw_msg, str) else str(raw_msg)[:300],
                 )
-            await websocket.send_text(raw_msg)
+            # Map the bar once; both the outbound frame (cmdp clients) and the
+            # Redis cache write derive from this single protocol entry.
+            entry = to_protocol_record(bar, market, interval) if bar is not None else None
+            await websocket.send_text(_outbound_frame(raw_msg, entry, cmdp))
             safe_add(ws_messages_sent, 1, _ws_labels)
 
-            # Buffer tick for throttled cache write
-            if cache_interval and bar:
+            # Buffer tick for throttled cache write — always the canonical
+            # record, independent of this client's outbound format. Gated on
+            # entry: an un-canonicalizable symbol (entry None) must be dropped,
+            # not raise out of _cache_key_for and tear down the connection.
+            if cache_interval and bar and entry is not None:
                 key = _cache_key_for(bar["symbol"], market, cache_interval)
                 connection_keys.add(key)
-                _buffer_tick(bar, market, cache_interval, user_id)
+                _buffer_tick(bar, market, cache_interval, entry, user_id)
         except Exception:
             # Client likely disconnected — signal cleanup
             disconnected.set()
@@ -361,8 +428,12 @@ async def ws_market_data_proxy(
             # Parse client subscribe/unsubscribe and route through handle
             try:
                 parsed = json.loads(msg)
+                if not isinstance(parsed, dict):
+                    continue  # valid JSON but not a control object — ignore
                 action = parsed.get("action", "")
                 symbols = parsed.get("symbols", [])
+                if not isinstance(symbols, list):
+                    continue  # a string here would subscribe its characters
                 if action == "subscribe" and symbols:
                     await handle.subscribe(symbols)
                 elif action == "unsubscribe" and symbols:
