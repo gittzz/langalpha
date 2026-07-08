@@ -196,7 +196,8 @@ class WorkflowTracker:
                 "metadata": metadata or {}
             }
 
-            # No TTL for active workflows - will be cleaned up on completion
+            # Cleaned up on completion; the cache client's safety TTL (7d)
+            # backstops a crash that skips the cleanup.
             success = await self.cache.set(key, status_obj)
 
             if success:
