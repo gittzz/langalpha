@@ -12,6 +12,7 @@ Starlette ``TestClient`` websocket handshake: pre-accept auth denial, the
 interval allowlist, and control-frame robustness in the client message loop.
 """
 
+import asyncio
 import json
 import time as _time
 from unittest.mock import AsyncMock, Mock
@@ -144,6 +145,7 @@ class _FakeHandle:
         self.subscribe = AsyncMock()
         self.unsubscribe = AsyncMock()
         self.close = AsyncMock()
+        self.subscribed_symbols: set[str] = set()  # read by the subscribe cap
 
 
 class _FakeFeed:
@@ -270,3 +272,169 @@ class TestWsControlFrames:
             ws.send_json({"action": "ping"})
             assert ws.receive_json() == {"type": "pong"}
         feed.handle.subscribe.assert_awaited_once_with(["AAPL"])
+
+
+# ---------------------------------------------------------------------------
+# cache flush resilience — requeue, delayed flush, lineage, subscribe cap
+# ---------------------------------------------------------------------------
+
+
+def _flush_bar(t: int, close: float = 100.0) -> dict:
+    return {
+        "symbol": "AAPL", "time": t, "open": close,
+        "high": close, "low": close, "close": close, "volume": 10,
+    }
+
+
+class _FlushStubCache:
+    def __init__(self, store=None):
+        self.store = dict(store or {})
+        self.sets: list[tuple[str, dict, int | None]] = []
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ttl=None):
+        self.sets.append((key, value, ttl))
+        self.store[key] = value
+
+
+class TestRequeuePending:
+    def test_requeue_into_empty_buffer(self):
+        key = "ohlcv:AAPL.XNAS:ohlcv-1s"
+        mod._pending_bars.pop(key, None)
+        batch = [_flush_bar(1000), _flush_bar(2000)]
+        mod._requeue_pending(key, batch)
+        assert mod._pending_bars.pop(key) == batch
+
+    def test_requeue_prepends_and_buffered_version_wins_shared_time(self):
+        key = "ohlcv:AAPL.XNAS:ohlcv-1s"
+        mod._pending_bars[key] = [_flush_bar(2000, close=201.0), _flush_bar(3000)]
+        mod._requeue_pending(key, [_flush_bar(1000), _flush_bar(2000, close=200.0)])
+        merged = mod._pending_bars.pop(key)
+        assert [b["time"] for b in merged] == [1000, 2000, 3000]
+        assert merged[1]["close"] == 201.0  # ticks buffered after the pop are newer
+
+
+class TestFlushResilience:
+    @pytest.mark.asyncio
+    async def test_lock_held_requeues_batch_and_schedules_retry(self, monkeypatch):
+        """A delta refresh holding the shared lock must not cost the popped
+        batch — the old early-return silently dropped every racing tick."""
+        from src.server.services.cache.intraday_cache_service import IntradayCacheService
+
+        key = "ohlcv:AAPL.XNAS:ohlcv-1s"
+        mod._pending_bars.pop(key, None)
+        mod._scheduled_flushes.pop(key, None)
+
+        lock = asyncio.Lock()
+        await lock.acquire()
+        svc = Mock()
+        svc._get_refresh_lock = Mock(return_value=lock)
+        monkeypatch.setattr(IntradayCacheService, "get_instance", Mock(return_value=svc))
+
+        batch = [_flush_bar(1000)]
+        try:
+            await mod._flush_to_redis(key, batch)
+            assert mod._pending_bars.get(key) == batch  # requeued, not dropped
+            task = mod._scheduled_flushes.get(key)
+            assert task is not None  # retry scheduled
+        finally:
+            lock.release()
+            task = mod._scheduled_flushes.pop(key, None)
+            if task:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            mod._pending_bars.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_flush_preserves_rest_lineage(self, monkeypatch):
+        """A WS tick over a REST-filled envelope keeps the REST publisher and
+        revision — stamping it ginlix-data would pin future delta refreshes to
+        the wrong provider."""
+        from src.server.services.cache.intraday_cache_service import IntradayCacheService
+
+        key = "ohlcv:AAPL.XNAS:ohlcv-1m"
+        existing = mod._build_envelope(
+            [_flush_bar(1000)], "open", complete=False, stored_ttl=30, truncated=False,
+            instrument_key="AAPL.XNAS", schema="ohlcv-1m", publisher="fmp", revision=3,
+        )
+        cache = _FlushStubCache({key: existing})
+        monkeypatch.setattr(mod, "get_cache_client", lambda: cache)
+        svc = Mock()
+        svc._get_refresh_lock = Mock(return_value=asyncio.Lock())
+        monkeypatch.setattr(IntradayCacheService, "get_instance", Mock(return_value=svc))
+
+        await mod._flush_to_redis(key, [_flush_bar(2000, close=101.0)])
+
+        written = mod._parse_envelope(cache.sets[-1][1])
+        assert written["header"]["publisher"] == "fmp"
+        assert written["header"]["revision"] == 3
+        assert [b["time"] for b in written["bars"]] == [1000, 2000]
+
+    @pytest.mark.asyncio
+    async def test_flush_without_prior_envelope_is_ws_published(self, monkeypatch):
+        from src.server.services.cache.intraday_cache_service import IntradayCacheService
+
+        key = "ohlcv:AAPL.XNAS:ohlcv-1s"
+        cache = _FlushStubCache()
+        monkeypatch.setattr(mod, "get_cache_client", lambda: cache)
+        svc = Mock()
+        svc._get_refresh_lock = Mock(return_value=asyncio.Lock())
+        monkeypatch.setattr(IntradayCacheService, "get_instance", Mock(return_value=svc))
+
+        await mod._flush_to_redis(key, [_flush_bar(1000)])
+
+        written = mod._parse_envelope(cache.sets[-1][1])
+        assert written["header"]["publisher"] == mod._WS_SOURCE
+        assert written["header"]["revision"] == 0
+
+    @pytest.mark.asyncio
+    async def test_throttled_tick_gets_delayed_flush(self, monkeypatch):
+        """A tick inside the throttle window must still reach Redis via the
+        one-shot delayed flush — a quiet symbol gets no next tick to carry it."""
+        key = mod._cache_key_for("AAPL", "stock", "1s")
+        mod._pending_bars.pop(key, None)
+        mod._scheduled_flushes.pop(key, None)
+        monkeypatch.setattr(mod, "_FLUSH_INTERVAL", 0.01)
+        mod._last_flush[key] = _time.monotonic()  # hold the throttle
+
+        flushed = asyncio.Event()
+        calls: list[tuple[str, list]] = []
+
+        async def fake_flush(cache_key, bars):
+            calls.append((cache_key, bars))
+            flushed.set()
+
+        monkeypatch.setattr(mod, "_flush_to_redis", fake_flush)
+
+        entry = mod.to_protocol_record(_PARSED, "stock", "second")
+        try:
+            mod._buffer_tick(_PARSED, "stock", "1s", entry)
+            assert key in mod._scheduled_flushes
+            await asyncio.wait_for(flushed.wait(), timeout=1.0)
+            assert calls[0][0] == key and len(calls[0][1]) == 1
+            assert key not in mod._pending_bars  # delivered, not stranded
+        finally:
+            mod._pending_bars.pop(key, None)
+            mod._last_flush.pop(key, None)
+            task = mod._scheduled_flushes.pop(key, None)
+            if task:
+                task.cancel()
+
+
+class TestCapSubscribe:
+    def test_malformed_and_oversize_entries_dropped(self):
+        out = mod._cap_subscribe(set(), ["AAPL", 42, "", "X" * 25, None])
+        assert out == ["AAPL"]
+
+    def test_per_connection_budget_enforced(self, monkeypatch):
+        monkeypatch.setattr(mod, "_MAX_WS_SYMBOLS", 3)
+        out = mod._cap_subscribe({"A", "B"}, ["C", "D"])
+        assert out == ["C"]
+
+    def test_already_subscribed_symbols_cost_no_budget(self, monkeypatch):
+        monkeypatch.setattr(mod, "_MAX_WS_SYMBOLS", 2)
+        out = mod._cap_subscribe({"A", "B"}, ["a", "C"])
+        assert out == ["a"]  # a re-subscribe passes at cap; the new symbol drops

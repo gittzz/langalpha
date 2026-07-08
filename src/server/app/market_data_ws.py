@@ -29,6 +29,7 @@ from src.server.services.cache._ohlcv_envelope import (
     canonical_series_key,
     series_identity,
 )
+from src.server.services.cache._series_cache_core import spawn_bg_task
 from src.server.services.market_data_feed import MarketDataFeed, to_protocol_record
 from src.utils.cache.redis_cache import get_cache_client
 from src.utils.market_hours import current_trading_date
@@ -62,6 +63,12 @@ _WS_SOURCE = "ginlix-data"  # must match config.yaml provider name
 _FLUSH_INTERVAL = 2.0  # seconds between Redis writes per cache key
 _last_flush: dict[str, float] = {}  # cache_key → last flush time
 _pending_bars: dict[str, list[dict]] = {}  # cache_key → bars since last flush
+_scheduled_flushes: dict[str, asyncio.Task] = {}  # cache_key → pending delayed flush
+
+# Per-connection hardening: bound subscribe frames so an authenticated client
+# can't inflate feed refcounts or upstream subscription frames without limit.
+_MAX_WS_SYMBOLS = 200
+_MAX_SYMBOL_LEN = 24
 
 # Track completed backfills to avoid re-triggering after TTL expiry
 _backfill_done: dict[str, str] = {}  # cache_key → data_date
@@ -99,6 +106,72 @@ def _cleanup_stale_entries() -> None:
     for k in idle:
         _last_flush.pop(k, None)
 
+
+
+def _requeue_pending(cache_key: str, bars: list[dict]) -> None:
+    """Put an unflushed batch back at the head of the pending buffer.
+
+    Ticks buffered while the batch was in flight are newer — on a shared bar
+    time the buffered version wins.
+    """
+    pending = _pending_bars.get(cache_key)
+    if not pending:
+        _pending_bars[cache_key] = bars
+        return
+    _pending_bars[cache_key] = [b for b in bars if b["time"] < pending[0]["time"]] + pending
+
+
+def _schedule_flush(cache_key: str) -> None:
+    """One-shot delayed flush for deferred ticks (throttle window, refresh-lock
+    contention). Without it a quiet symbol's last buffered bars strand in
+    ``_pending_bars`` waiting for a next tick that may never come."""
+    if cache_key in _scheduled_flushes:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop (sync caller) — the bars stay pending for the next
+        # tick or the connection-close flush.
+        return
+
+    async def _later() -> None:
+        try:
+            await asyncio.sleep(_FLUSH_INTERVAL)
+        finally:
+            _scheduled_flushes.pop(cache_key, None)
+        bars = _pending_bars.pop(cache_key, [])
+        if bars:
+            _last_flush[cache_key] = _time.monotonic()
+            await _flush_to_redis(cache_key, bars)
+
+    # The dict entry doubles as the strong reference keeping the task alive.
+    _scheduled_flushes[cache_key] = loop.create_task(_later())
+
+
+def _cap_subscribe(current: set[str], symbols: list) -> list[str]:
+    """Bound one subscribe frame: drop malformed entries and enforce the
+    per-connection symbol cap."""
+    valid = [
+        s for s in symbols
+        if isinstance(s, str) and 0 < len(s.strip()) <= _MAX_SYMBOL_LEN
+    ]
+    seen = set(current)
+    budget = _MAX_WS_SYMBOLS - len(seen)
+    allowed: list[str] = []
+    for s in valid:
+        upper = s.strip().upper()
+        if upper in seen:
+            allowed.append(s)  # already subscribed — no budget cost
+        elif budget > 0:
+            allowed.append(s)
+            seen.add(upper)
+            budget -= 1
+    if len(allowed) < len(symbols):
+        logger.warning(
+            "WS subscribe frame capped: %d requested, %d accepted (cap %d)",
+            len(symbols), len(allowed), _MAX_WS_SYMBOLS,
+        )
+    return allowed
 
 
 def _cache_key_for(symbol: str, market: str, cache_interval: str) -> str:
@@ -143,7 +216,7 @@ async def _backfill_from_rest(
         provider = await get_market_data_provider()
         is_index = market == "index"
 
-        data, _source, _truncated = await provider.get_intraday_with_source(
+        data, source, truncated = await provider.get_intraday_with_source(
             symbol=symbol,
             interval=cache_interval,
             from_date=None,
@@ -177,9 +250,15 @@ async def _backfill_from_rest(
             from src.utils.market_hours import current_market_phase
             phase = current_market_phase()
             instrument_key, schema = _series_ids(symbol, market, cache_interval)
+            # The merged base is REST data — declare its real publisher so
+            # delta refresh pins refills to the same provider; only a pure
+            # WS series carries the WS source. Revision survives the merge.
+            prior = (envelope.get("header") or {}) if envelope else {}
             new_envelope = _build_envelope(
-                merged, phase, complete=False, stored_ttl=_WS_CACHE_TTL, truncated=False,
-                instrument_key=instrument_key, schema=schema, publisher=_WS_SOURCE,
+                merged, phase, complete=False, stored_ttl=_WS_CACHE_TTL, truncated=truncated,
+                instrument_key=instrument_key, schema=schema,
+                publisher=source or _WS_SOURCE,
+                revision=prior.get("revision", 0),
             )
             await cache.set(cache_key, new_envelope, ttl=_WS_CACHE_TTL)
 
@@ -200,9 +279,9 @@ async def _flush_to_redis(cache_key: str, bars: list[dict]) -> None:
     """Write buffered bars to Redis, merging with existing envelope.
 
     Coordinates with ``IntradayCacheService._delta_refresh`` via a shared
-    per-key ``asyncio.Lock``.  If a delta refresh is in progress we skip
-    this write — the REST result is at least as current as the WS buffer,
-    and the ticks will be re-flushed on the next 2 s cycle.
+    per-key ``asyncio.Lock``.  If a delta refresh is in progress the batch
+    is requeued and retried after the throttle interval — returning without
+    requeueing would silently drop every tick that raced the refresh.
     """
     try:
         from src.server.services.cache.intraday_cache_service import IntradayCacheService
@@ -210,7 +289,9 @@ async def _flush_to_redis(cache_key: str, bars: list[dict]) -> None:
         svc = IntradayCacheService.get_instance()
         lock = svc._get_refresh_lock(cache_key)
         if lock.locked():
-            logger.debug("WS flush skipped for %s: delta refresh in progress", cache_key)
+            _requeue_pending(cache_key, bars)
+            _schedule_flush(cache_key)
+            logger.debug("WS flush deferred for %s: delta refresh in progress", cache_key)
             return
 
         async with lock:
@@ -233,9 +314,16 @@ async def _flush_to_redis(cache_key: str, bars: list[dict]) -> None:
             phase = envelope.get("market_phase", "open") if envelope else "open"
             # Identity is embedded in the canonical key: ohlcv:{instrument_key}:{schema}
             _, instrument_key, schema = cache_key.split(":", 2)
+            # Lineage survives a WS update: a REST-filled series keeps its
+            # publisher (delta refresh pins refills on it) and its revision
+            # counter — stamping the whole envelope as WS-published would pin
+            # future refreshes to ginlix-data and mix conventions silently.
+            prior = (envelope.get("header") or {}) if envelope else {}
             new_envelope = _build_envelope(
                 merged, phase, complete=False, stored_ttl=_WS_CACHE_TTL, truncated=False,
-                instrument_key=instrument_key, schema=schema, publisher=_WS_SOURCE,
+                instrument_key=instrument_key, schema=schema,
+                publisher=prior.get("publisher") or _WS_SOURCE,
+                revision=prior.get("revision", 0),
             )
             await cache.set(cache_key, new_envelope, ttl=_WS_CACHE_TTL)
     except asyncio.CancelledError:
@@ -275,7 +363,10 @@ def _buffer_tick(
     now = _time.monotonic()
     last = _last_flush.get(cache_key, 0)
     if now - last < _FLUSH_INTERVAL:
-        return  # throttled — will be flushed on next tick past the interval
+        # Throttled. A delayed flush guarantees delivery even if this was the
+        # symbol's last tick for a while (lull, session close).
+        _schedule_flush(cache_key)
+        return
 
     _last_flush[cache_key] = now
     bars_to_flush = _pending_bars.pop(cache_key, [])
@@ -298,7 +389,7 @@ def _buffer_tick(
         if is_first_write and cache_interval in _BACKFILL_INTERVALS:
             await _backfill_from_rest(cache_key, bar["symbol"], market, cache_interval, user_id)
 
-    asyncio.create_task(_do_flush())
+    spawn_bg_task(_do_flush())
 
 
 @router.get("/ws/v1/market-data/status")
@@ -435,9 +526,11 @@ async def ws_market_data_proxy(
                 if not isinstance(symbols, list):
                     continue  # a string here would subscribe its characters
                 if action == "subscribe" and symbols:
-                    await handle.subscribe(symbols)
+                    symbols = _cap_subscribe(handle.subscribed_symbols, symbols)
+                    if symbols:
+                        await handle.subscribe(symbols)
                 elif action == "unsubscribe" and symbols:
-                    await handle.unsubscribe(symbols)
+                    await handle.unsubscribe([s for s in symbols if isinstance(s, str)])
                 elif action == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
             except (json.JSONDecodeError, TypeError):
