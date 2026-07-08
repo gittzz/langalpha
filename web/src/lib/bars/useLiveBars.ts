@@ -14,6 +14,8 @@ export interface LiveBarsMeta {
   currency?: string;
   displayDecimals?: number;
   watermark?: number | null;
+  marketPhase?: string | null;
+  nextChangeAt?: number | null;
 }
 
 export interface UseLiveBarsOptions {
@@ -44,6 +46,13 @@ export interface UseLiveBarsOptions {
    * `useCurrencyDisplay`'s `onCurrencyMeta`.
    */
   onMeta?: (meta: LiveBarsMeta) => void;
+  /**
+   * Venue market phase (`pre|open|post|closed`) from the loader seed or a
+   * delta poll — calendar-derived server-side. Fires only when a payload
+   * carries one; drives closed-market presentation (price-line label,
+   * header badge).
+   */
+  onPhase?: (phase: string) => void;
 }
 
 export interface LiveBarsController {
@@ -74,13 +83,19 @@ export interface LiveBarsController {
 export function useLiveBars(
   symbol: string,
   interval: string,
-  { enabled, dataRef, lastWsTickRef, onBars, onMeta }: UseLiveBarsOptions,
+  { enabled, dataRef, lastWsTickRef, onBars, onMeta, onPhase }: UseLiveBarsOptions,
 ): LiveBarsController {
   // Backend epoch-ms high-water mark for delta polls (`after=`).
   const watermarkRef = useRef<number | null>(null);
   // Wall-clock ms of the last delta poll that actually ran (authoritative REST
   // sync) — drives the periodic reconcile through the WS-healthy skip.
   const lastReconcileRef = useRef(0);
+  // Epoch ms of the venue's next phase boundary (server calendar). A one-shot
+  // timer polls right past it so presentation flips at the bell, not on the
+  // next cadence tick. The arm closure lives on a ref because seedMeta (called
+  // from the loader, outside the poll effect) must be able to re-arm it.
+  const nextChangeAtRef = useRef<number | null>(null);
+  const armBoundaryRef = useRef<(() => void) | null>(null);
 
   // Live symbol/interval, synced during render, for the post-await staleness
   // re-check (see the poll body).
@@ -95,6 +110,8 @@ export function useLiveBars(
   onBarsRef.current = onBars;
   const onMetaRef = useRef(onMeta);
   onMetaRef.current = onMeta;
+  const onPhaseRef = useRef(onPhase);
+  onPhaseRef.current = onPhase;
 
   // Reset the delta cursor when the symbol/interval changes — independent of
   // `enabled` so a chart-mode toggle neither strands nor resets it. The initial
@@ -102,6 +119,7 @@ export function useLiveBars(
   // post-await (after this synchronous reset).
   useEffect(() => {
     watermarkRef.current = null;
+    nextChangeAtRef.current = null;
   }, [symbol, interval]);
 
   const seedMeta = useCallback((meta: LoaderMeta | LiveBarsMeta | null | undefined) => {
@@ -112,6 +130,11 @@ export function useLiveBars(
       displayDecimals: meta.displayDecimals,
       watermark: meta.watermark,
     });
+    if (meta.marketPhase) onPhaseRef.current?.(meta.marketPhase);
+    if (meta.nextChangeAt != null) {
+      nextChangeAtRef.current = meta.nextChangeAt;
+      armBoundaryRef.current?.();
+    }
   }, []);
 
   useEffect(() => {
@@ -159,6 +182,11 @@ export function useLiveBars(
             watermark: delta.meta.watermark,
           });
         }
+        if (delta.meta.marketPhase) onPhaseRef.current?.(delta.meta.marketPhase);
+        if (delta.meta.nextChangeAt != null) {
+          nextChangeAtRef.current = delta.meta.nextChangeAt;
+          armBoundaryRef.current?.();
+        }
 
         const bars = delta.bars;
         if (bars.length === 0) return;
@@ -199,6 +227,27 @@ export function useLiveBars(
     const pollMs = DELTA_POLL_CADENCE_MS[interval] ?? 30000;
     const timer = setInterval(poll, pollMs);
 
+    // One-shot poll just past the venue's next phase boundary, so the phase
+    // (and everything derived from it) flips at the bell instead of lagging a
+    // cadence tick. Bypasses the WS-healthy skip like the visibility handler.
+    let boundaryTimer: ReturnType<typeof setTimeout> | null = null;
+    const armBoundary = () => {
+      if (boundaryTimer != null) clearTimeout(boundaryTimer);
+      boundaryTimer = null;
+      const at = nextChangeAtRef.current;
+      if (at == null) return;
+      const delay = at - Date.now() + 1_000; // land 1s past the boundary
+      // Stale boundary → the cadence covers it. Far boundary (>36h, e.g. over
+      // a weekend) → don't hold a long timer; a later poll re-arms anyway.
+      if (delay <= 0 || delay > 36 * 3_600_000) return;
+      boundaryTimer = setTimeout(() => {
+        lastReconcileRef.current = 0;
+        poll();
+      }, delay);
+    };
+    armBoundaryRef.current = armBoundary;
+    armBoundary();
+
     // A tab returning from suspension polls immediately: WS resumes ticking
     // right away (masking the hole from the skip check), and waiting out the
     // reconcile window would leave missed buckets on screen for up to a minute.
@@ -212,6 +261,8 @@ export function useLiveBars(
     return () => {
       aborted = true;
       clearInterval(timer);
+      if (boundaryTimer != null) clearTimeout(boundaryTimer);
+      armBoundaryRef.current = null;
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [symbol, interval, enabled, dataRef, lastWsTickRef]);

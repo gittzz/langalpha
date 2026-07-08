@@ -43,3 +43,29 @@ describe('StockHeader source tooltip', () => {
     expect(screen.getByText('Source: Ginlix Data, yfinance, FMP')).toBeInTheDocument();
   });
 });
+
+describe('StockHeader market status badge', () => {
+  it('shows Closed with the venue prefix when the market phase is closed', () => {
+    render(<StockHeader {...baseProps} symbol="0700.HK" marketPhase="closed" />);
+    expect(screen.getByText('HK Closed')).toBeInTheDocument();
+  });
+
+  it('shows a bare Closed for US symbols', () => {
+    render(<StockHeader {...baseProps} marketPhase="closed" />);
+    expect(screen.getByText('Closed')).toBeInTheDocument();
+  });
+
+  it('stays on Delayed during pre/post phases and when the phase is unknown', () => {
+    const { rerender } = render(<StockHeader {...baseProps} symbol="0700.HK" marketPhase="post" />);
+    expect(screen.getByText('HK Delayed')).toBeInTheDocument();
+    rerender(<StockHeader {...baseProps} symbol="0700.HK" marketPhase={null} />);
+    expect(screen.getByText('HK Delayed')).toBeInTheDocument();
+  });
+
+  it('a live WS feed wins over a stale closed phase', () => {
+    render(
+      <StockHeader {...baseProps} wsStatus="connected" wsHasData wsDataLevel="second" marketPhase="closed" />,
+    );
+    expect(screen.getByText('Live')).toBeInTheDocument();
+  });
+});

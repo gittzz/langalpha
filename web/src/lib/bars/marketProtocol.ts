@@ -97,6 +97,10 @@ export interface BarsPage {
 export interface BarsCache {
   cached: boolean;
   cache_key: string | null;
+  /** Venue market phase (`pre|open|post|closed`), calendar-derived server-side. */
+  market_phase?: string | null;
+  /** Epoch ms of the phase's next calendar boundary; null for 24/7 venues. */
+  next_change_at?: number | null;
   [key: string]: unknown;
 }
 
@@ -133,6 +137,8 @@ export interface LoaderMeta {
   watermark: number | null;
   complete: boolean;
   marketPhase: string | null;
+  /** Epoch ms of the phase's next calendar boundary (protocol endpoint only). */
+  nextChangeAt?: number | null;
   truncated?: boolean;
   cached?: boolean;
   currency?: string;

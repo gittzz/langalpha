@@ -23,6 +23,8 @@ export {
 } from '@/lib/bars/chartConstants';
 export type { IntervalConfig } from '@/lib/bars/chartConstants';
 export { FOREIGN_EXCHANGES, isUSEquity } from '@/lib/bars/exchanges';
+import { getExtendedHoursType } from '@/lib/bars/marketSession';
+import type { ExtendedHoursType } from '@/lib/bars/marketSession';
 
 // --- Chart theme constants ---
 /** @deprecated Use getChartTheme(theme).bg instead */
@@ -172,34 +174,16 @@ export const OVERLAY_LABELS: Record<string, string> = {
   priceTargets: 'PT',
 };
 
-// --- Extended-hours detection ---
+// --- Extended-hours presentation ---
+// Session semantics (window math, ext interval set) live in the session model
+// (@/lib/bars/marketSession); this file keeps the page's colors + shading.
 export const EXT_COLOR_PRE = '#fbbf24';   // amber — pre-market
 export const EXT_COLOR_POST = '#3b82f6';  // blue  — after-hours
 // Neutral grey for lines that mark a SETTLED close — must never look like a
 // live price (the ext colors above are the UI's "live extended price" hues).
 export const CLOSE_LINE_COLOR = 'rgba(139,143,163,0.7)';
-export const EXTENDED_HOURS_INTERVALS = new Set(['1min', '5min', '15min', '30min', '1hour']);
-
-export type ExtendedHoursType = 'pre' | 'post';
-
-/**
- * Check if a unix timestamp (seconds) falls outside regular market hours.
- * Times are ET wall-clock stored as UTC (the 'Z' trick).
- * Regular session: 9:30 – 16:00 ET.
- * Returns 'pre' (pre-market), 'post' (after-hours), or null (regular).
- */
-export function getExtendedHoursType(timeSec: number): ExtendedHoursType | null {
-  const d = new Date(timeSec * 1000);
-  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-  if (mins < 570) return 'pre';   // before 9:30
-  if (mins >= 960) return 'post'; // 16:00 or later
-  return null;
-}
-
-/** @deprecated Use getExtendedHoursType(t) !== null */
-export function isExtendedHours(timeSec: number): boolean {
-  return getExtendedHoursType(timeSec) !== null;
-}
+export { EXTENDED_HOURS_INTERVALS, getExtendedHoursType } from '@/lib/bars/marketSession';
+export type { ExtendedHoursType } from '@/lib/bars/marketSession';
 
 export interface ExtendedHoursRegion {
   start: number;

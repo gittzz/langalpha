@@ -42,20 +42,22 @@ interface StockHeaderProps {
   quoteData: QuoteData | null;
   marketStatus: Record<string, unknown> | null;
   snapshot: SnapshotData | null;
+  /** Venue market phase (`pre|open|post|closed`) from the chart's bars responses. */
+  marketPhase?: string | null;
 }
 
 const EXCHANGE_LABELS: Record<string, string> = { HK: 'HK', SS: 'SH', SZ: 'SZ', L: 'LON', T: 'TYO', TO: 'TSX', AX: 'ASX' };
 const PROVIDER_LABELS: Record<string, string> = { 'ginlix-data': 'Ginlix Data', fmp: 'FMP', yfinance: 'yfinance' };
 
-function getDelayedLabel(sym: string | null | undefined): string {
-  if (!sym) return 'Delayed';
+function getVenueStatusLabel(sym: string | null | undefined, status: 'Delayed' | 'Closed'): string {
+  if (!sym) return status;
   const dotIdx = sym.lastIndexOf('.');
-  if (dotIdx === -1) return 'Delayed';
+  if (dotIdx === -1) return status;
   const suffix = sym.slice(dotIdx + 1).toUpperCase();
-  return EXCHANGE_LABELS[suffix] ? `${EXCHANGE_LABELS[suffix]} Delayed` : 'Delayed';
+  return EXCHANGE_LABELS[suffix] ? `${EXCHANGE_LABELS[suffix]} ${status}` : status;
 }
 
-const StockHeader = ({ symbol, stockInfo, realTimePrice, chartMeta: _chartMeta, displayOverride, onToggleOverview, onOpenWatchlist, wsStatus, wsHasData = false, wsDataLevel = null, ginlixDataEnabled: _ginlixDataEnabled = true, quoteData, marketStatus, snapshot }: StockHeaderProps) => {
+const StockHeader = ({ symbol, stockInfo, realTimePrice, chartMeta: _chartMeta, displayOverride, onToggleOverview, onOpenWatchlist, wsStatus, wsHasData = false, wsDataLevel = null, ginlixDataEnabled: _ginlixDataEnabled = true, quoteData, marketStatus, snapshot, marketPhase = null }: StockHeaderProps) => {
   const formatNumber = (num: number | null | undefined): string => {
     if (num == null || (num !== 0 && !num)) return '—';
     if (num >= 1e12) return (num / 1e12).toFixed(2) + 'T';
@@ -138,10 +140,15 @@ const StockHeader = ({ symbol, stockInfo, realTimePrice, chartMeta: _chartMeta, 
                   <span className="data-source-label">Live</span>
                   {tickTime && <span className="data-source-time">{formatTickTime(tickTime)}</span>}
                 </>
+              ) : marketPhase === 'closed' ? (
+                <>
+                  <span className="data-source-dot data-source-dot--closed" />
+                  <span className="data-source-label">{getVenueStatusLabel(symbol, 'Closed')}</span>
+                </>
               ) : (
                 <>
                   <span className="data-source-dot data-source-dot--delayed" />
-                  <span className="data-source-label">{getDelayedLabel(symbol)}</span>
+                  <span className="data-source-label">{getVenueStatusLabel(symbol, 'Delayed')}</span>
                 </>
               )}
               <span className="data-source-tooltip">

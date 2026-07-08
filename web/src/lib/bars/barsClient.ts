@@ -151,7 +151,8 @@ export function headerToMeta(
   return {
     watermark: coerceWatermark(header?.watermark),
     complete: true,
-    marketPhase: (header?.market_phase as string) ?? null,
+    marketPhase: (header?.market_phase as string) ?? cache?.market_phase ?? null,
+    nextChangeAt: typeof cache?.next_change_at === 'number' ? cache.next_change_at : null,
     currency: (header?.price_currency as string) || undefined,
     displayDecimals: typeof header?.display_decimals === 'number' ? header.display_decimals : undefined,
     revision: typeof header?.revision === 'number' ? header.revision : undefined,

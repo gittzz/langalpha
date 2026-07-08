@@ -23,14 +23,21 @@ function bar(time: number, over: Partial<ChartBar> = {}): ChartBar {
 
 function delta(
   bars: ChartBar[],
-  extra: { watermark?: number | null; currency?: string; displayDecimals?: number } = {},
+  extra: {
+    watermark?: number | null;
+    currency?: string;
+    displayDecimals?: number;
+    marketPhase?: string | null;
+    nextChangeAt?: number | null;
+  } = {},
 ): BarsDeltaResult {
   return {
     bars,
     meta: {
       watermark: extra.watermark ?? null,
       complete: true,
-      marketPhase: null,
+      marketPhase: extra.marketPhase ?? null,
+      nextChangeAt: extra.nextChangeAt ?? null,
       currency: extra.currency,
       displayDecimals: extra.displayDecimals,
     },
@@ -43,12 +50,13 @@ function setup(overrides: Partial<{ symbol: string; interval: string; enabled: b
   const lastWsTickRef = { current: 0 };
   const onBars = vi.fn();
   const onMeta = vi.fn();
+  const onPhase = vi.fn();
   const view = renderHook(
     ({ symbol, interval, enabled }) =>
-      useLiveBars(symbol, interval, { enabled, dataRef, lastWsTickRef, onBars, onMeta }),
+      useLiveBars(symbol, interval, { enabled, dataRef, lastWsTickRef, onBars, onMeta, onPhase }),
     { initialProps: { symbol: 'AAPL', interval: '5min', enabled: true, ...overrides } },
   );
-  return { dataRef, lastWsTickRef, onBars, onMeta, ...view };
+  return { dataRef, lastWsTickRef, onBars, onMeta, onPhase, ...view };
 }
 
 async function tick(ms = POLL_MS) {
@@ -133,6 +141,26 @@ describe('useLiveBars', () => {
     expect(onMeta).toHaveBeenCalledWith({ currency: 'HKD', displayDecimals: 3, watermark: null });
   });
 
+  it('seedMeta forwards the market phase to onPhase, skipping phase-less meta', () => {
+    const { onPhase, result } = setup();
+    act(() => {
+      result.current.seedMeta({ watermark: 1, marketPhase: 'closed' });
+    });
+    expect(onPhase).toHaveBeenCalledWith('closed');
+    act(() => {
+      result.current.seedMeta({ watermark: 2 });
+    });
+    expect(onPhase).toHaveBeenCalledTimes(1);
+  });
+
+  it('forwards the market phase from a poll to onPhase, even without currency', async () => {
+    const { dataRef, onPhase } = setup();
+    dataRef.current = [bar(100)];
+    mockFetch.mockResolvedValue(delta([bar(100)], { marketPhase: 'closed' }));
+    await tick();
+    expect(onPhase).toHaveBeenCalledWith('closed');
+  });
+
   it('resets the watermark when the symbol changes', async () => {
     const { dataRef, result, rerender } = setup();
     act(() => {
@@ -179,5 +207,63 @@ describe('useLiveBars', () => {
       await Promise.resolve();
     });
     expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  describe('phase-boundary poll', () => {
+    it('seedMeta arms a one-shot poll just past next_change_at, ahead of the cadence', async () => {
+      const { dataRef, result } = setup();
+      dataRef.current = [bar(100)];
+      mockFetch.mockResolvedValue(delta([bar(100)]));
+      act(() => {
+        result.current.seedMeta({ watermark: 1, nextChangeAt: Date.now() + 5_000 });
+      });
+      await tick(6_500); // boundary + 1s buffer land at 6s; cadence not due until 30s
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('the boundary poll bypasses the WS-healthy skip', async () => {
+      const { dataRef, lastWsTickRef, result } = setup();
+      dataRef.current = [bar(100)];
+      lastWsTickRef.current = Date.now(); // healthy WS would normally skip the poll
+      mockFetch.mockResolvedValue(delta([bar(100)]));
+      act(() => {
+        result.current.seedMeta({ watermark: 1, nextChangeAt: Date.now() + 5_000 });
+      });
+      await tick(6_500);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('a delta poll re-arms the boundary from its own meta', async () => {
+      const { dataRef } = setup();
+      dataRef.current = [bar(100)];
+      mockFetch.mockResolvedValue(delta([bar(100)], { nextChangeAt: BASE + POLL_MS + 5_000 }));
+      await tick(); // cadence poll at 30s carries the boundary
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      await tick(7_000); // boundary fires at ~36s, well before the 60s cadence tick
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not arm for a boundary already in the past', async () => {
+      const { dataRef, result } = setup();
+      dataRef.current = [bar(100)];
+      mockFetch.mockResolvedValue(delta([bar(100)]));
+      act(() => {
+        result.current.seedMeta({ watermark: 1, nextChangeAt: Date.now() - 1_000 });
+      });
+      await tick(POLL_MS - 1_000); // nothing before the first cadence tick
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('a symbol switch clears the pending boundary', async () => {
+      const { dataRef, result, rerender } = setup();
+      dataRef.current = [bar(100)];
+      mockFetch.mockResolvedValue(delta([bar(100)]));
+      act(() => {
+        result.current.seedMeta({ watermark: 1, nextChangeAt: Date.now() + 5_000 });
+      });
+      rerender({ symbol: 'MSFT', interval: '5min', enabled: true });
+      await tick(6_500);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
   });
 });

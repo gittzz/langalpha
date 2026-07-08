@@ -113,7 +113,16 @@ export function isSettledDailyHead(
 ): boolean {
   const head = bars?.[bars.length - 1];
   if (!head) return false;
-  return chartSecToDateStr(head.time) !== dateStrInTz(now, tz);
+  return isSettledDailyHeadTime(head.time, tz, now);
+}
+
+/** Head-bar-time core of {@link isSettledDailyHead} for callers that hold a bare time. */
+export function isSettledDailyHeadTime(
+  headTimeSec: number,
+  tz: string,
+  now: Date = new Date(),
+): boolean {
+  return chartSecToDateStr(headTimeSec) !== dateStrInTz(now, tz);
 }
 
 export function applyQuoteToDailyBar(

@@ -158,6 +158,7 @@ async def test_default_mode_returns_header_and_records(client):
 
     assert body["cache"]["cached"] is True
     assert body["cache"]["cache_key"] == "ohlcv:AAPL.XNAS:ohlcv-1m"
+    assert body["cache"]["market_phase"] == "open"
     # US venues always have a next calendar boundary (wall-clock derived).
     assert isinstance(body["cache"]["next_change_at"], int)
     assert body["cache"]["next_change_at"] > 0
@@ -173,8 +174,9 @@ async def test_closed_market_last_bar_is_final(client):
     bars = [_bar(_MS), _bar(_MS + 60_000)]
     with _stub(intraday_result=_intraday_result(bars, phase="closed")):
         resp = await client.get("/api/v1/market-data/bars/AAPL?schema=ohlcv-1m")
-    records = resp.json()["series"]["records"]
-    assert all(r["is_final"] is True for r in records)
+    body = resp.json()
+    assert all(r["is_final"] is True for r in body["series"]["records"])
+    assert body["cache"]["market_phase"] == "closed"
 
 
 async def test_header_defaults_when_envelope_absent(client):
@@ -325,6 +327,7 @@ async def test_phaseless_result_falls_back_to_the_clock(client):
         )
     assert resp.status_code == 200
     cache = resp.json()["cache"]
+    assert cache["market_phase"] == "open"
     assert cache["next_change_at"] == 1_800_000_000_000
 
 

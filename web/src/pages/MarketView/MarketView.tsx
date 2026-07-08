@@ -126,6 +126,9 @@ function MarketViewInner() {
   });
 
   const [chartMeta, setChartMeta] = useState<Record<string, unknown> | null>(null);
+  // Venue market phase reported by the chart's bars responses (calendar-derived
+  // server-side); drives the header's Closed badge. Null until the first load.
+  const [marketPhase, setMarketPhase] = useState<string | null>(null);
   const [selectedInterval, setSelectedInterval] = useState<string>(() => {
     // Sanitize the stored pref: a since-removed interval (e.g. '1s') falls
     // back to the default instead of leaving the chart on an unknown key.
@@ -602,6 +605,7 @@ function MarketViewInner() {
             quoteData={(overviewData as OverviewData | null)?.quote || null}
             marketStatus={marketStatus}
             snapshot={snapshotData}
+            marketPhase={marketPhase}
           />
 
           {/* Chart fills remaining space */}
@@ -614,6 +618,7 @@ function MarketViewInner() {
               onIntervalChange={handleIntervalChange}
               onCapture={handleCaptureChart}
               onStockMeta={handleStockMeta as any}
+              onMarketPhase={setMarketPhase}
               onLatestBar={handleLatestBar}
               quoteData={(overviewData as OverviewData | null)?.quote || null}
               earningsData={(overviewData as OverviewData | null)?.earningsSurprises || null}
@@ -724,6 +729,7 @@ function MarketViewInner() {
                 quoteData={(overviewData as OverviewData | null)?.quote || null}
                 marketStatus={marketStatus}
                 snapshot={snapshotData}
+                marketPhase={marketPhase}
               />
               <div className="market-chart-area">
                 {showOverview && (
@@ -743,6 +749,7 @@ function MarketViewInner() {
                   onIntervalChange={handleIntervalChange}
                   onCapture={handleCaptureChart}
                   onStockMeta={handleStockMeta as any}
+                  onMarketPhase={setMarketPhase}
                   onLatestBar={handleLatestBar}
                   quoteData={(overviewData as OverviewData | null)?.quote || null}
                   earningsData={(overviewData as OverviewData | null)?.earningsSurprises || null}

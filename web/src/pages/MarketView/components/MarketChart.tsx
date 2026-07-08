@@ -11,7 +11,7 @@ import {
   dedupeMergeByTime,
   rangeBeforeOldest,
 } from '../utils/chartDataLoaders';
-import { applyQuoteToDailyBar, foldMinuteBar, formatPrice, isSettledDailyHead, useCurrencyDisplay, useLiveBars } from '@/lib/bars';
+import { applyQuoteToDailyBar, deriveMarketSession, foldMinuteBar, formatPrice, useCurrencyDisplay, useLiveBars } from '@/lib/bars';
 import { timezoneForSymbol } from '@/lib/bars/exchanges';
 import { RANGE_PRESETS, rangeStartChartSec } from '@/lib/bars/rangePresets';
 import type { RangePreset } from '@/lib/bars/rangePresets';
@@ -97,6 +97,8 @@ interface MarketChartProps {
   onCapture?: () => void;
   onStockMeta?: (meta: unknown) => void;
   onLatestBar?: (bar: ChartDataBar) => void;
+  /** Venue market phase (`pre|open|post|closed`) from the bars responses; null until known. */
+  onMarketPhase?: (phase: string | null) => void;
   quoteData: Record<string, unknown> | null;
   earningsData: unknown;
   overlayData: Record<string, unknown> | null;
@@ -123,6 +125,15 @@ const MAX_SELECTION_BARS = 300;
 const MIN_DRAG_PX = 4;
 
 /**
+ * Restore the series' default last-value styling. lightweight-charts'
+ * applyOptions merge SKIPS undefined values, so the reset must pass '' —
+ * priceLineColor's true default, which falls back to the last-bar color.
+ * Passing undefined leaves the previous color stuck (a grey "Close" pill
+ * surviving a symbol switch).
+ */
+const PRICE_LINE_RESET = { priceLineColor: '', title: '' } as const;
+
+/**
  * Container widths (px, descending) at which the toolbar sheds actions into the
  * overflow menu. `toolbarLevel` is the count of breakpoints the width is below:
  * 0 = widest (all inline) … 4 = narrowest. Driven by a ResizeObserver.
@@ -137,6 +148,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   onCapture: _onCapture,
   onStockMeta,
   onLatestBar,
+  onMarketPhase,
   quoteData,
   earningsData,
   overlayData,
@@ -166,7 +178,12 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   const extHoursBgRef = useRef<ExtendedHoursBgPrimitive | null>(null);
   const selectionPrimitiveRef = useRef<SelectionPrimitive | null>(null);
   const extCloseLineRef = useRef<any>(null);
-  const currentExtTypeRef = useRef<string | null>(null);
+  // Signature of the last-applied session presentation (priceMark + close-line
+  // price) — makes applySessionPresentation idempotent across its call sites.
+  const appliedSessionRef = useRef<string | null>(null);
+  // Server market phase mirrored into a ref so the imperative data paths
+  // (WS ticks, updateSeriesData) read the freshest phase between renders.
+  const marketPhaseRef = useRef<string | null>(null);
   const quoteDataRef = useRef(quoteData);
   const snapshotRef = useRef(snapshot);
 
@@ -580,6 +597,65 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     selectionPrimitiveRef.current?.setDraft(null);
   }, []);
 
+  // --- Session presentation (the one writer) ---
+  // deriveMarketSession (lib/bars/marketSession) makes every "what does the
+  // price on screen represent" decision; this callback is the only writer of
+  // the series' last-value line styling and the after-hours official-close
+  // reference line. Idempotent via appliedSessionRef, so state-driven effects
+  // and the imperative data paths can all call it freely.
+  const applySessionPresentation = useCallback((lastBarTime: number | null) => {
+    const series = candlestickSeriesRef.current;
+    if (!series) return;
+
+    const session = deriveMarketSession({
+      symbol: symbolRef.current,
+      interval: intervalRef.current,
+      phase: marketPhaseRef.current,
+      headBarTime: lastBarTime,
+    });
+
+    // After-hours reference line at today's regular close: previous_close
+    // (yesterday) + regular_trading_change. Pre-market shows no line — the
+    // "Prev Close" annotation already marks the same value.
+    const snap = snapshotRef.current;
+    const prevClose = snap?.previous_close;
+    const regChange = snap?.regular_trading_change as number | undefined;
+    const closePrice = session.showRegularCloseLine && prevClose != null && regChange != null
+      ? (prevClose as number) + regChange
+      : null;
+
+    const signature = `${session.priceMark}|${closePrice ?? ''}`;
+    if (signature === appliedSessionRef.current) return;
+    appliedSessionRef.current = signature;
+
+    if (session.priceMark === 'ext-pre' || session.priceMark === 'ext-post') {
+      const pre = session.priceMark === 'ext-pre';
+      series.applyOptions({
+        priceLineColor: pre ? EXT_COLOR_PRE : EXT_COLOR_POST,
+        title: pre ? 'Pre' : 'After',
+      });
+    } else if (session.priceMark === 'settled-close') {
+      series.applyOptions({ priceLineColor: CLOSE_LINE_COLOR, title: 'Close' });
+    } else {
+      series.applyOptions(PRICE_LINE_RESET);
+    }
+
+    if (extCloseLineRef.current) {
+      try { series.removePriceLine(extCloseLineRef.current); } catch (_) { /* ok */ }
+      extCloseLineRef.current = null;
+    }
+    if (closePrice != null) {
+      extCloseLineRef.current = series.createPriceLine({
+        price: closePrice,
+        title: 'Close',
+        color: CLOSE_LINE_COLOR,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+      });
+    }
+  }, []);
+
   // --- Live tick updates from WS (custom/Light mode only) ---
   // 1min aggregates the second-level WS ticks into its forming bar natively;
   // 5min–4hour fold the finer WS aggregate into the coarser forming bucket.
@@ -761,8 +837,8 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
       extHoursBgRef.current.setRegions(computeExtendedHoursRegions(data as unknown as ChartConstDataPoint[]));
     }
 
-    // Keep extended-hours price lines in sync with live bars
-    syncExtendedHoursLines(barTime);
+    // Keep the session presentation in sync with live bars
+    applySessionPresentation(barTime);
 
     // Incremental RSI update
     if (rsiSmoothingRef.current && rsiSeriesRef.current) {
@@ -785,7 +861,19 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
         setRsiValue(value.toFixed(0));
       }
     }
-  }, [liveTick, interval, effectiveChartMode]);
+  }, [liveTick, interval, effectiveChartMode, applySessionPresentation]);
+
+  // --- Venue market phase (server calendar authority) ---
+  // Seeded by the initial load, refreshed by every delta poll (plus the
+  // next_change_at boundary poll, so it flips at the bell). Mirrored into
+  // marketPhaseRef for the imperative data paths and lifted to the parent for
+  // the header badge.
+  const [marketPhase, setMarketPhase] = useState<string | null>(null);
+  useEffect(() => {
+    marketPhaseRef.current = null;
+    setMarketPhase(null);
+  }, [symbol]);
+  useEffect(() => { onMarketPhase?.(marketPhase); }, [marketPhase, onMarketPhase]);
 
   // --- Live quote fold for the 1day interval ---
   // Daily bars have no WS aggregate feed, so the head daily bar is kept live by
@@ -802,13 +890,20 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     if (interval !== '1day' || effectiveChartMode !== 'custom') return;
     if (!dayQuote || !candlestickSeriesRef.current) return;
     const prev = allDataRef.current;
-    // Only fold when the head bar IS the current venue session's bar.
-    // Pre-market and on weekends the head bar is the PREVIOUS session's
-    // settled candle — folding a live quote into it corrupts its close/volume
-    // and then fights the 60s poll (which restores it) in a visible
-    // oscillation. A settled head skips the fold (the settled-close effect
-    // below relabels its price line) and the poll alone keeps the bar current.
-    if (!prev.length || isSettledDailyHead(prev, timezoneForSymbol(symbolRef.current))) return;
+    if (!prev.length) return;
+    // The session model gates the fold: only while the venue is actually
+    // trading. A settled head bar (pre-market, weekends) must not absorb a
+    // live quote — it corrupts the settled candle and fights the 60s poll in
+    // a visible oscillation — and after the close the quote tracks the
+    // after-hours tape, which must not enter the daily candle either (its
+    // close stays the official close).
+    const session = deriveMarketSession({
+      symbol: symbolRef.current,
+      interval,
+      phase: marketPhase,
+      headBarTime: prev[prev.length - 1].time,
+    });
+    if (!session.foldDailyQuote) return;
     const folded = applyQuoteToDailyBar(prev, dayQuote);
     if (folded === prev) return; // no price / empty series → no-op
     allDataRef.current = folded;
@@ -821,28 +916,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
       const up = head.close >= head.open;
       volumeSeriesRef.current.update({ time: head.time, value: head.volume, color: up ? ct.upColor : ct.downColor });
     }
-  }, [dayQuote, interval, effectiveChartMode]);
-
-  // --- Settled-close label for the 1day interval ---
-  // Pre-market and on weekends the head daily bar is the previous session's
-  // settled candle, so the series' last-value line marks yesterday's close
-  // while the header shows the live extended price — unlabeled and in the
-  // default bar color it reads as a live price. Restyle it as a neutral grey
-  // "Close" whenever the head bar is settled; restore live defaults once
-  // today's bar exists. dayQuote in the deps re-evaluates this sub-minute so
-  // the label flips at session boundaries without waiting for a data reload.
-  const settledCloseAppliedRef = useRef(false);
-  useEffect(() => {
-    if (interval !== '1day' || effectiveChartMode !== 'custom') return;
-    const series = candlestickSeriesRef.current;
-    if (!series || !chartDataForHooks.length) return;
-    const settled = isSettledDailyHead(chartDataForHooks, timezoneForSymbol(symbolRef.current));
-    if (settled === settledCloseAppliedRef.current) return;
-    settledCloseAppliedRef.current = settled;
-    series.applyOptions(settled
-      ? { priceLineColor: CLOSE_LINE_COLOR, title: 'Close' }
-      : { priceLineColor: undefined, title: '' });
-  }, [chartDataForHooks, dayQuote, interval, effectiveChartMode]);
+  }, [dayQuote, interval, marketPhase, effectiveChartMode]);
 
   // Temporarily reveal the hidden Light chart for capture, then restore.
   // Since it's behind the TV widget (z-index: -1), no visual flash occurs.
@@ -959,71 +1033,22 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     },
   }));
 
-  // --- Extended-hours price lines (close line + colored current-price line) ---
-  // `force` re-applies even when the ext type hasn't changed (snapshot updates
-  // move the Close line). Never null currentExtTypeRef externally *to force a
-  // re-sync* — that eats the post→null transition and strands the "Pre"/"After"
-  // title (sticky-pill bug); pass force=true instead. The symbol-switch reset
-  // that nulls it is fine: it does its own full styling + title reset inline.
-  const syncExtendedHoursLines = useCallback((lastBarTime: number, force = false) => {
-    const series = candlestickSeriesRef.current;
-    if (!series) return;
-
-    const isExtInterval = isUSEquity(symbolRef.current) && EXTENDED_HOURS_INTERVALS.has(intervalRef.current);
-    const extType = isExtInterval ? getExtendedHoursType(lastBarTime) : null;
-    const prevType = currentExtTypeRef.current;
-
-    if (!force && extType === prevType) return;
-    currentExtTypeRef.current = extType;
-
-    if (extType) {
-      const color = extType === 'pre' ? EXT_COLOR_PRE : EXT_COLOR_POST;
-      const label = extType === 'pre' ? 'Pre' : 'After';
-      // Color the last-value price line amber/blue and label it "Pre"/"After"
-      series.applyOptions({ priceLineColor: color, title: label });
-
-      // After-hours: show today's regular session close (prev_close + regular_trading_change).
-      // Pre-market: skip — the "Prev Close" annotation already shows the same value.
-      if (extCloseLineRef.current) {
-        try { series.removePriceLine(extCloseLineRef.current); } catch (_) { /* ok */ }
-        extCloseLineRef.current = null;
-      }
-      if (extType === 'post') {
-        const snap = snapshotRef.current;
-        // Derive today's 4 PM close: previous_close (yesterday) + regular_trading_change
-        const prevClose = snap?.previous_close;
-        const regChange = snap?.regular_trading_change as number | undefined;
-        const closePrice = (prevClose != null && regChange != null)
-          ? (prevClose as number) + regChange
-          : null;
-        if (closePrice != null) {
-          extCloseLineRef.current = series.createPriceLine({
-            price: closePrice,
-            title: 'Close',
-            color: CLOSE_LINE_COLOR,
-            lineWidth: 1,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-          });
-        }
-      }
-    } else {
-      // Regular hours — reset to defaults
-      series.applyOptions({ priceLineColor: undefined, title: '' });
-      if (extCloseLineRef.current) {
-        try { series.removePriceLine(extCloseLineRef.current); } catch (_) { /* ok */ }
-        extCloseLineRef.current = null;
-      }
-    }
-  }, []);
-
-  // Re-sync extended-hours close line when quoteData or snapshot changes
+  // Re-apply when the snapshot's official-close inputs move — the signature
+  // carries the close-line price, so an unchanged snapshot is a no-op.
   useEffect(() => {
-    if (currentExtTypeRef.current) {
-      const data = allDataRef.current;
-      if (data.length > 0) syncExtendedHoursLines(data[data.length - 1].time, true);
-    }
-  }, [snapshot?.previous_close, snapshot?.regular_trading_change, syncExtendedHoursLines]);
+    const data = allDataRef.current;
+    if (data.length > 0) applySessionPresentation(data[data.length - 1].time);
+  }, [snapshot?.previous_close, snapshot?.regular_trading_change, applySessionPresentation]);
+
+  // State-driven re-derivation: phase updates (delta/boundary polls), REST
+  // reloads, and the sub-minute dayQuote cadence (which flips the 1day settled
+  // label at session boundaries without a data reload). The imperative data
+  // paths (WS ticks, updateSeriesData) cover the moments between renders.
+  useEffect(() => {
+    if (effectiveChartMode !== 'custom') return;
+    const data = allDataRef.current;
+    if (data.length > 0) applySessionPresentation(data[data.length - 1].time);
+  }, [chartDataForHooks, dayQuote, marketPhase, interval, symbol, effectiveChartMode, applySessionPresentation]);
 
   // --- Update series data helper (used by both initial load and scroll load) ---
   const updateSeriesData = useCallback((data: ChartDataBar[]) => {
@@ -1060,9 +1085,9 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
       }
     }
 
-    // Extended-hours price lines (close + colored current price)
+    // Session presentation (last-value line + after-hours close line)
     if (data.length > 0) {
-      syncExtendedHoursLines(data[data.length - 1].time);
+      applySessionPresentation(data[data.length - 1].time);
     }
 
     // All MAs — compute all enabled, clear disabled
@@ -1109,7 +1134,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
 
     // Update chart data state for overlay hooks
     setChartDataForHooks(data);
-  }, []);
+  }, [applySessionPresentation]);
 
   // --- Live forming-bar delta-poll (shared controller) ---
   // The hook owns the watermark + reconcile cursors; the component owns bar
@@ -1122,6 +1147,12 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     dataRef: allDataRef,
     lastWsTickRef: lastLiveTickTimeRef,
     onMeta: onCurrencyMeta,
+    onPhase: (phase) => {
+      // Ref first: the imperative data paths must read the fresh phase
+      // before React commits the state update.
+      marketPhaseRef.current = phase;
+      setMarketPhase(phase);
+    },
     onBars: (merged) => {
       updateSeriesData(merged);
       // Don't re-zoom on poll updates — preserve the user's scroll/zoom.
@@ -1425,7 +1456,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
 
       extHoursBgRef.current = null;
       extCloseLineRef.current = null;
-      currentExtTypeRef.current = null;
+      appliedSessionRef.current = null;
       candlestickSeriesRef.current = null;
       volumeSeriesRef.current = null;
       baselineSeriesRef.current = null;
@@ -1626,18 +1657,17 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
     // Reset baseline on symbol/interval change
     if (showBaseline) setShowBaseline(false);
 
-    // Reset extended-hours price lines on symbol/interval change
+    // Reset the session presentation on symbol/interval change
     if (extCloseLineRef.current && candlestickSeriesRef.current) {
       try { candlestickSeriesRef.current.removePriceLine(extCloseLineRef.current); } catch (_) { /* ok */ }
     }
     extCloseLineRef.current = null;
-    currentExtTypeRef.current = null;
-    settledCloseAppliedRef.current = false;
+    appliedSessionRef.current = null;
     if (candlestickSeriesRef.current) {
-      // Reset the title too: it carries the "Pre"/"After" axis label, and with
-      // the ref nulled no later sync sees a transition to clear it — a US
-      // after-hours label would stick to the next symbol (sticky-pill bug).
-      candlestickSeriesRef.current.applyOptions({ priceLineColor: undefined, title: '' });
+      // Apply the reset inline (not via the applier): until the new symbol's
+      // data lands there is no head bar to derive from, and the previous
+      // symbol's "Pre"/"After" axis label must not linger (sticky-pill bug).
+      candlestickSeriesRef.current.applyOptions(PRICE_LINE_RESET);
     }
 
     // Clear stale chart data so previous interval/symbol doesn't linger under an error

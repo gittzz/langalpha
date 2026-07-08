@@ -281,12 +281,15 @@ async def get_bars(
     return {
         "series": series,
         "page": page,
+        # market_phase mirrors the legacy CacheMetadata field: the venue's
+        # calendar-derived phase, driving closed-market presentation client-side.
         # next_change_at (Unix ms, null for 24/7 venues) is the phase's next
         # calendar boundary, letting clients flip presentation exactly at the
         # bell instead of on the next poll.
         "cache": {
             "cached": bool(result.cached),
             "cache_key": result.cache_key,
+            "market_phase": phase,
             "next_change_at": clock.next_phase_change_ms(),
         },
     }

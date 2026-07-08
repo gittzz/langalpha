@@ -147,4 +147,19 @@ describe('headerToMeta', () => {
     expect(headerToMeta({ watermark: '123' }).watermark).toBe(123);
     expect(headerToMeta(null).watermark).toBeNull();
   });
+
+  it('reads the market phase from the cache block (the /bars wire location)', () => {
+    const meta = headerToMeta({ watermark: 1 }, { cached: false, cache_key: null, market_phase: 'closed' });
+    expect(meta.marketPhase).toBe('closed');
+    expect(headerToMeta({ watermark: 1 }, { cached: false, cache_key: null }).marketPhase).toBeNull();
+  });
+
+  it('reads next_change_at from the cache block, null when absent or non-numeric', () => {
+    const cache = { cached: false, cache_key: null, next_change_at: 1_800_000_000_000 };
+    expect(headerToMeta({ watermark: 1 }, cache).nextChangeAt).toBe(1_800_000_000_000);
+    expect(headerToMeta({ watermark: 1 }, { cached: false, cache_key: null }).nextChangeAt).toBeNull();
+    expect(
+      headerToMeta({ watermark: 1 }, { cached: false, cache_key: null, next_change_at: null }).nextChangeAt,
+    ).toBeNull();
+  });
 });

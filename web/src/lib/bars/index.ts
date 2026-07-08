@@ -81,8 +81,22 @@ export {
   applyQuoteToDailyBar,
   foldMinuteBar,
   isSettledDailyHead,
+  isSettledDailyHeadTime,
 } from './formingBar';
 export type { QuoteLike } from './formingBar';
+
+export {
+  EXTENDED_HOURS_INTERVALS,
+  deriveMarketSession,
+  getExtendedHoursType,
+} from './marketSession';
+export type {
+  ExtendedHoursType,
+  MarketSession,
+  MarketSessionInputs,
+  PriceMark,
+  VenueBadge,
+} from './marketSession';
 
 export { useCurrencyDisplay } from './useCurrencyDisplay';
 export type {
