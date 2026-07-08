@@ -42,8 +42,20 @@ const TABLE: Row[] = [
     out: { priceMark: 'ext-post' },
   },
   {
-    name: 'US 1min overnight (venue closed) → settles grey, ext line removed',
+    // The head bar is the last AH print, not the official close — the settled
+    // label must say so, and the official close keeps its reference line.
+    name: 'US 1min overnight (venue closed, AH head bar) → settled AH close + official-close line',
     in: { symbol: 'AMD', interval: '1min', phase: 'closed', headBarTime: chartSec('2026-07-06T19:59:00'), now: US_NIGHT },
+    out: { priceMark: 'settled-ext-post', showRegularCloseLine: true },
+  },
+  {
+    name: 'US 1min closed with a pre-market head bar → settled PM close, no close line',
+    in: { symbol: 'AMD', interval: '1min', phase: 'closed', headBarTime: chartSec('2026-07-06T09:15:00'), now: US_NIGHT },
+    out: { priceMark: 'settled-ext-pre', showRegularCloseLine: false },
+  },
+  {
+    name: 'US 1min closed with a regular-session head bar → settled official close',
+    in: { symbol: 'AMD', interval: '1min', phase: 'closed', headBarTime: chartSec('2026-07-06T15:59:00'), now: US_NIGHT },
     out: { priceMark: 'settled-close', showRegularCloseLine: false },
   },
   {

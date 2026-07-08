@@ -40,10 +40,18 @@ export function getExtendedHoursType(timeSec: number): ExtendedHoursType | null 
 /**
  * What the series' last value represents, driving the last-value price-line
  * styling: live extended-session tape (amber/blue "Pre"/"After"), a settled
- * close (neutral grey "Close"), or a live regular-session price (null →
- * default bar-colored styling).
+ * close (neutral grey — `settled-ext-*` when the head bar is an extended-hours
+ * bar, so the label reads "AH Close"/"PM Close" instead of claiming the
+ * official close), or a live regular-session price (null → default
+ * bar-colored styling).
  */
-export type PriceMark = 'ext-pre' | 'ext-post' | 'settled-close' | null;
+export type PriceMark =
+  | 'ext-pre'
+  | 'ext-post'
+  | 'settled-close'
+  | 'settled-ext-pre'
+  | 'settled-ext-post'
+  | null;
 
 /** Header venue-status badge. `live` = WS delivering; phase never overrides it. */
 export type VenueBadge = 'live' | 'closed' | 'delayed';
@@ -75,7 +83,9 @@ export interface MarketSession {
  * Derive the session presentation state for one (symbol, interval) series.
  *
  * Price-mark precedence: a `closed` phase settles everything (a closed venue
- * must never read as live, whatever window the head bar sits in); otherwise
+ * must never read as live, whatever window the head bar sits in) — but the
+ * head bar's window still picks WHICH settled label applies: an ext-hours
+ * head bar settles as the extended close, not the official one. Otherwise
  * the head bar's own timestamp picks the extended-hours label on US ext
  * intervals; otherwise a daily series whose head bar predates the venue's
  * current date is a settled close. A null phase falls back to the date-based
@@ -97,8 +107,9 @@ export function deriveMarketSession({
 
   let priceMark: PriceMark = null;
   if (headBarTime != null) {
-    if (phase === 'closed') priceMark = 'settled-close';
-    else if (extType) priceMark = extType === 'pre' ? 'ext-pre' : 'ext-post';
+    if (phase === 'closed') {
+      priceMark = extType ? (extType === 'pre' ? 'settled-ext-pre' : 'settled-ext-post') : 'settled-close';
+    } else if (extType) priceMark = extType === 'pre' ? 'ext-pre' : 'ext-post';
     else if (settledDailyHead) priceMark = 'settled-close';
   }
 
@@ -111,6 +122,9 @@ export function deriveMarketSession({
     // A null phase keeps the pre-CMDP date-only gate.
     foldDailyQuote:
       daily && headBarTime != null && !settledDailyHead && (phase == null || phase === 'open'),
-    showRegularCloseLine: extType === 'post' && phase !== 'closed',
+    // Whenever the head bar is an after-hours bar — live or settled — the
+    // last-value line marks the extended tape, so the official close gets
+    // its own reference line.
+    showRegularCloseLine: extType === 'post',
   };
 }

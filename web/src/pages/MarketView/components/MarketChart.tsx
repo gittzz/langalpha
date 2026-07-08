@@ -612,15 +612,17 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
       headBarTime: lastBarTime,
     });
 
-    // After-hours reference line at today's regular close: previous_close
-    // (yesterday) + regular_trading_change. Pre-market shows no line — the
-    // "Prev Close" annotation already marks the same value.
+    // Official-close reference line while the head bar is after-hours (live
+    // or settled): the provider-exact regular_close, falling back to
+    // previous_close + regular_trading_change (1dp-rounded, cents off).
+    // Pre-market shows no line — the "Prev Close" annotation already marks
+    // the same value.
     const snap = snapshotRef.current;
     const prevClose = snap?.previous_close;
     const regChange = snap?.regular_trading_change as number | undefined;
-    const closePrice = session.showRegularCloseLine && prevClose != null && regChange != null
-      ? (prevClose as number) + regChange
-      : null;
+    const regularClose = (snap?.regular_close as number | undefined)
+      ?? (prevClose != null && regChange != null ? (prevClose as number) + regChange : undefined);
+    const closePrice = session.showRegularCloseLine && regularClose != null ? regularClose : null;
 
     const signature = `${session.priceMark}|${closePrice ?? ''}`;
     if (signature === appliedSessionRef.current) return;
@@ -632,8 +634,17 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
         priceLineColor: pre ? EXT_COLOR_PRE : EXT_COLOR_POST,
         title: pre ? 'Pre' : 'After',
       });
-    } else if (session.priceMark === 'settled-close') {
-      series.applyOptions({ priceLineColor: CLOSE_LINE_COLOR, title: 'Close' });
+    } else if (
+      session.priceMark === 'settled-close'
+      || session.priceMark === 'settled-ext-pre'
+      || session.priceMark === 'settled-ext-post'
+    ) {
+      // A settled ext-hours head bar is NOT the official close — say which
+      // tape ended here, and let the reference line carry the real close.
+      const title = session.priceMark === 'settled-ext-post' ? 'AH Close'
+        : session.priceMark === 'settled-ext-pre' ? 'PM Close'
+          : 'Close';
+      series.applyOptions({ priceLineColor: CLOSE_LINE_COLOR, title });
     } else {
       series.applyOptions(PRICE_LINE_RESET);
     }
