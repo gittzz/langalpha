@@ -197,6 +197,78 @@ async def test_leader_cancellation_clears_inflight_and_recovers(service):
 
 
 @pytest.mark.asyncio
+async def test_follower_survives_leader_cancellation(service):
+    """A follower awaiting the leader's shared future must not die with the
+    leader — one client disconnect would otherwise fail every concurrent
+    request that deduped onto the same symbol."""
+    svc, cache, install = service
+    gate = asyncio.Event()
+    provider = _StubProvider({"AAPL": _row("AAPL")}, gate=gate)
+    install(provider)
+
+    leader = asyncio.create_task(svc.get_quotes(["AAPL"]))
+    await provider.started.wait()  # leader is blocked inside the provider call
+    follower = asyncio.create_task(svc.get_quotes(["AAPL"]))
+    await asyncio.sleep(0.01)  # follower admitted, awaiting the shared future
+
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    # Miss for this cycle (next poll refetches) — not a CancelledError.
+    assert await follower == []
+
+
+@pytest.mark.asyncio
+async def test_follower_survives_leader_provider_error(service):
+    """The leader's upstream failure is the leader's error to raise; a
+    follower treats the errored shared future as a miss."""
+    svc, cache, install = service
+    started = asyncio.Event()
+    gate = asyncio.Event()
+
+    class _BlockingBoom:
+        async def get_snapshots(self, symbols, asset_type="stocks", user_id=None):
+            started.set()
+            await gate.wait()
+            raise RuntimeError("upstream down")
+
+    install(_BlockingBoom())
+    leader = asyncio.create_task(svc.get_quotes(["AAPL"]))
+    await started.wait()
+    follower = asyncio.create_task(svc.get_quotes(["AAPL"]))
+    await asyncio.sleep(0.01)
+    gate.set()
+
+    with pytest.raises(RuntimeError):
+        await leader
+    assert await follower == []
+
+
+@pytest.mark.asyncio
+async def test_follower_own_cancellation_still_propagates(service):
+    """Shield semantics: cancelling the FOLLOWER request must cancel it (the
+    leader keeps fetching) — the miss fallback is only for a dead leader."""
+    svc, cache, install = service
+    gate = asyncio.Event()
+    provider = _StubProvider({"AAPL": _row("AAPL")}, gate=gate)
+    install(provider)
+
+    leader = asyncio.create_task(svc.get_quotes(["AAPL"]))
+    await provider.started.wait()
+    follower = asyncio.create_task(svc.get_quotes(["AAPL"]))
+    await asyncio.sleep(0.01)
+
+    follower.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await follower
+
+    gate.set()
+    out = await leader
+    assert out[0]["symbol"] == "AAPL"
+
+
+@pytest.mark.asyncio
 async def test_caret_index_via_stocks_fetches_index_endpoint(service):
     """A caret-spelled index requested as stocks fetches via the index endpoint
     (resolved asset class), so a miss there can't negative-cache its own key."""

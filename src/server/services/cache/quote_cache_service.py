@@ -161,7 +161,17 @@ class QuoteCacheService:
                     fut.set_result(row)
 
         for key, fut in followers:
-            row = await asyncio.shield(fut)
+            # The leader's failure is the leader's problem: a follower treats a
+            # cancelled or errored shared future as a miss for this cycle (the
+            # next poll refetches) instead of 500-ing its own request.
+            try:
+                row = await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                if not fut.cancelled():
+                    raise  # this request was cancelled, not the leader's
+                continue
+            except Exception:
+                continue
             if row is not None:
                 rows[key] = row
 
