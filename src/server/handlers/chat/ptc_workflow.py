@@ -67,7 +67,6 @@ from ._common import (
     _is_plan_interrupt_pending,
     _resolve_timezone,
     _setup_fork_and_persistence,
-    admission_conflict_detail,
     apply_fetch_override,
     build_graph_config,
     ensure_thread,
@@ -181,27 +180,21 @@ async def astream_ptc_workflow(
         # cold-start cleanup cancels the very run it is about to start.
         if needs_startup:
             await manager.cancel_stale_workflow(thread_id, exclude_run_id=run_id)
-        # Dispatched flow owns the BTM placeholder ``threads.py`` already
-        # reserved for it under the same ``(thread_id, run_id)`` key.
-        # We still must guarantee at most one in-flight LangGraph ``astream``
-        # per ``thread_id`` (the checkpointer is thread-keyed), so admit only
-        # when no OTHER run is active on the thread. ``exclude_run_id`` skips
-        # our own placeholder; a running or still-stopping peer means 409
-        # (dispatched flows can't steer).
-        if dispatched:
-            state = await manager.wait_for_admission(
-                thread_id, exclude_run_id=run_id
-            )
-            if state != "fresh":
-                raise HTTPException(
-                    status_code=409,
-                    detail=admission_conflict_detail(thread_id, state),
-                )
-            ready, steering_event = True, None
-        else:
-            ready, steering_event = await wait_or_steer(
-                manager, thread_id, user_input, user_id
-            )
+        # Admit a fresh turn, steer the running one, or 409 — see
+        # ``wait_or_steer``. Dispatched flows own the pre-registered
+        # ``(thread_id, run_id)`` placeholder, so they pass it as
+        # ``exclude_run_id`` (ignore it in the admission scan) and
+        # ``can_steer=False`` (any OTHER in-flight run is a hard conflict,
+        # never a steer). Foreground turns steer.
+        ready, steering_event = await wait_or_steer(
+            manager,
+            thread_id,
+            user_input,
+            user_id,
+            steer_only=request.steer_only,
+            can_steer=not dispatched,
+            exclude_run_id=run_id if dispatched else None,
+        )
         if not ready:
             slot_owned = False
             await release_burst_slot(user_id)

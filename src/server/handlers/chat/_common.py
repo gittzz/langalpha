@@ -668,19 +668,28 @@ def build_graph_config(
 # keys its skip-persist/skip-mark_failed path on these so a non-admission 409
 # can't be mistaken for one. ``request_cancelled`` (from the cancellation
 # wrapper) is included defensively though it does not currently reach this path.
-ADMISSION_CONFLICT_CODES = {"stopping", "compacting", "running", "request_cancelled"}
+# ``not_running`` (steer_only probe against a fresh thread) is likewise an
+# admission outcome, not a workflow failure — nothing was admitted to persist
+# or mark failed.
+ADMISSION_CONFLICT_CODES = {
+    "stopping",
+    "compacting",
+    "running",
+    "not_running",
+    "request_cancelled",
+}
 
 
-def admission_conflict_detail(thread_id: str, state: str) -> dict:
-    """Map a non-fresh admission state to the dispatched-flow 409 detail.
+def admission_conflict_detail(state: str) -> dict:
+    """Map an admission outcome to its 409 ``{"code", "message"}`` detail.
 
-    Dispatched (X-Dispatch=background) turns can't steer, so any non-fresh peer
-    is a conflict. Returns a structured ``{"code", "message"}`` dict so
-    ``handle_workflow_error`` can tag the SSE error with the code and the client
-    can recognize the transient state; ``thread_id`` is kept out of the
-    user-facing message so it can't leak into the UI on a client-state desync.
-    Shared by the PTC and Flash handlers so the per-state wording lives in one
-    place.
+    The single wording source for every in-generator admission 409 (see
+    ``ADMISSION_CONFLICT_CODES``): the ``stopping``/``compacting``/``running``
+    conflicts and the ``steer_only`` probe's ``not_running`` refusal. Returns a
+    structured dict so ``handle_workflow_error`` can tag the SSE error with the
+    code and the client can recognize the state; the thread_id is deliberately
+    absent from the user-facing message so it can't leak into the UI on a
+    client-state desync.
     """
     if state == "stopping":
         return {
@@ -692,9 +701,17 @@ def admission_conflict_detail(thread_id: str, state: str) -> dict:
             "code": "compacting",
             "message": "The assistant is compacting its context. Wait a moment, then retry.",
         }
+    if state == "not_running":
+        return {
+            "code": "not_running",
+            "message": "No workflow is running to steer. Resubmit as a new message.",
+        }
     return {
         "code": "running",
-        "message": "The workflow is still running; the follow-up could not be admitted.",
+        "message": (
+            "The workflow is still running. Wait a moment, then retry — "
+            "or use /reconnect to continue streaming, or /cancel to stop it."
+        ),
     }
 
 
@@ -703,81 +720,98 @@ async def wait_or_steer(
     thread_id: str,
     user_input: str,
     user_id: str,
+    *,
+    steer_only: bool = False,
+    can_steer: bool = True,
+    exclude_run_id: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Admit a new turn, or steer the genuinely-running one.
+    """Admit a new turn, steer the running one, or 409.
 
-    Returns ``(ready, steering_event)`` where ``ready=True`` means the caller
-    should proceed with a new workflow.  If ``ready=False`` and
-    ``steering_event`` is not None, the caller should yield that SSE string
-    and return.  If neither succeeds, raises HTTP 409.
+    The single admission decision for both the foreground and dispatched
+    paths. Returns ``(ready, steering_event)``: ``ready=True`` → start a new
+    workflow; ``ready=False`` with a non-None ``steering_event`` → yield that
+    SSE string and return. A non-admissible state raises HTTP 409 whose detail
+    carries a structured ``admission_conflict_detail`` code (surfaced as an SSE
+    ``error`` event once the stream has started).
+
+    ``steer_only=True`` (gateway steer probes) forbids the fresh-admission
+    fallback: the probe's SSE reader only understands ``steering_accepted``/
+    ``error``, so admitting a full turn on that connection streams the whole
+    response — interrupts included — into a client that ignores it. A steer
+    that finds no running turn gets ``not_running`` and the gateway resubmits
+    it as a normal message. A steer accepted just before the workflow's exit
+    may still go unconsumed — the final drain returns it via
+    ``steering_returned`` on the turn stream, not this connection.
+
+    ``can_steer=False`` (dispatched X-Dispatch=background flows) forbids
+    steering entirely: they own a pre-registered ``(thread_id, run_id)``
+    placeholder — passed as ``exclude_run_id`` so the admission scan ignores
+    it — and any OTHER in-flight run is a hard conflict, never a steer.
 
     Admission states (see ``BackgroundTaskManager.wait_for_admission``):
-    - ``"fresh"``    → start a new turn ``(True, None)``.
-    - ``"stopping"`` → an explicitly-cancelled turn is still tearing down;
-      409 "stopping, retry" (never start a second checkpoint writer).
-    - ``"running"``  → steer immediately (no wait); 409 only if steering fails.
+    - ``"fresh"``     → start a new turn ``(True, None)``; with ``steer_only``,
+      409 ``not_running`` instead.
+    - ``"stopping"``/``"compacting"`` → 409 (never start a second checkpoint
+      writer, never steer mid-summarize).
+    - ``"running"``   → steer immediately (no wait); an accept that raced the
+      workflow's exit is reclaimed and re-routed as "fresh"; 409 only if
+      steering fails. With ``can_steer=False`` a running peer is a 409 too.
     """
     # Deferred to avoid circular import: steering imports _common at
     # module level, so _common must not import steering at module level.
-    from src.server.handlers.chat.steering import steer_thread
+    from src.server.handlers.chat.steering import steer_thread, unsteer_thread
 
-    state = await manager.wait_for_admission(thread_id)
+    state = await manager.wait_for_admission(thread_id, exclude_run_id=exclude_run_id)
     if state == "fresh":
+        if steer_only:
+            raise HTTPException(
+                status_code=409, detail=admission_conflict_detail("not_running")
+            )
         return True, None
 
-    if state == "stopping":
+    # Only a genuinely-running turn on a steerable path can be steered; every
+    # other non-fresh state — and every dispatched peer (``can_steer=False``) —
+    # is a conflict. Steering mid-stopping would start a second checkpoint
+    # writer; mid-compaction would corrupt the context rewrite.
+    if state != "running" or not can_steer:
         raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "stopping",
-                "message": (
-                    "The workflow is stopping. "
-                    "Wait a moment, then retry your message."
-                ),
-            },
+            status_code=409, detail=admission_conflict_detail(state)
         )
 
-    # An in-progress compaction outlasted the admission wait. Must come BEFORE
-    # the steer fallback — steering mid-summarize corrupts the context rewrite,
-    # and a manual compaction has no turn to steer into. Structured detail
-    # (code) so the client can recognize this as a transient/retryable state and
-    # re-queue rather than surfacing a hard error banner; no thread_id in the
-    # user-facing message (it would leak into the UI on a client-state desync).
-    if state == "compacting":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "compacting",
-                "message": (
-                    "The assistant is compacting its context. "
-                    "Wait a moment, then resend your message."
-                ),
-            },
-        )
-
-    # state == "running" → steer the running workflow immediately.
+    # state == "running" and steerable → steer the running workflow immediately.
     result = await steer_thread(thread_id, user_input, user_id)
-    if result:
-        event_data = json.dumps(
-            {
-                "thread_id": thread_id,
-                "content": user_input,
-                "position": result["position"],
-            }
+    if not result:
+        # Steering failed (e.g. Redis unavailable) on a running turn.
+        raise HTTPException(
+            status_code=409, detail=admission_conflict_detail("running")
         )
-        return False, f"event: steering_accepted\ndata: {event_data}\n\n"
 
-    # Fallback: raise 409 if steering failed
-    raise HTTPException(
-        status_code=409,
-        detail={
-            "code": "running",
-            "message": (
-                "The workflow is still running. Wait a moment, then retry — "
-                "or use /reconnect to continue streaming, or /cancel to stop it."
-            ),
-        },
+    # Close the accept-after-exit race: the admission snapshot said "running",
+    # but the workflow may have exited — and run its final steering drain —
+    # between that snapshot and the Redis push. If the thread has no live task
+    # anymore, try to reclaim the message: a successful reclaim proves nothing
+    # consumed it, so route as if admission had said "fresh". Reclaim failure is
+    # the best-effort branch: almost always the exit drain got there first and
+    # ``steering_returned`` carried the text back on the turn stream, so report
+    # accepted — but a Redis fault on the reclaim also lands here, so "accepted"
+    # is the graceful default, not a hard delivery guarantee.
+    if not await manager.has_active_task_for_thread(thread_id):
+        reclaimed = await unsteer_thread(thread_id, result["payload"])
+        if reclaimed:
+            if steer_only:
+                raise HTTPException(
+                    status_code=409,
+                    detail=admission_conflict_detail("not_running"),
+                )
+            return True, None
+    event_data = json.dumps(
+        {
+            "thread_id": thread_id,
+            "content": user_input,
+            "position": result["position"],
+        }
     )
+    return False, f"event: steering_accepted\ndata: {event_data}\n\n"
 
 
 def _emit_sse_error(handler, payload: dict) -> str:
@@ -816,12 +850,13 @@ async def handle_workflow_error(
     ``timezone_str`` is the resolved timezone; falls back to ``request.timezone``.
     """
     # An admission-conflict 409 is a deliberate protocol response (raised
-    # in-generator by ``wait_or_steer`` or the dispatched gate), not a workflow
-    # execution failure. Surface it to the client as an SSE error, but never
-    # persist it as a conversation error or call ``mark_failed``: this path runs
-    # with ``run_id=None``, the run_id guard is skipped when run_id is None, so
-    # marking failed would clobber a concurrently-running peer turn's status
-    # (defeating the guard). Keyed on the structured admission CODE, not the bare
+    # in-generator by ``wait_or_steer`` for both the foreground and dispatched
+    # paths), not a workflow execution failure. Surface it to the client as an
+    # SSE error, but never persist it as a conversation error or call
+    # ``mark_failed``: this path runs with ``run_id=None``, the run_id guard is
+    # skipped when run_id is None, so marking failed would clobber a
+    # concurrently-running peer turn's status (defeating the guard). Keyed on
+    # the structured admission CODE, not the bare
     # 409 status: every admission 409 now carries ``detail={"code", ...}`` (see
     # ``admission_conflict_detail`` / ``wait_or_steer``), so any other
     # HTTPException — a 503, or even a future non-admission 409 from middleware —
