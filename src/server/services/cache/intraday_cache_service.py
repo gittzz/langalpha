@@ -29,7 +29,11 @@ from src.server.services.cache._ohlcv_envelope import (
     is_watermark_stale,
     series_identity,
 )
-from src.server.services.cache._series_cache_core import _SeriesCacheCore, is_live_window
+from src.server.services.cache._series_cache_core import (
+    _SeriesCacheCore,
+    is_live_window,
+    spawn_bg_task,
+)
 from src.utils.cache.redis_cache import get_cache_client
 
 
@@ -262,11 +266,12 @@ class IntradayCacheService(_SeriesCacheCore):
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         user_id: Optional[str] = None,
+        live: Optional[bool] = None,
     ) -> IntradayFetchResult:
         return await self._get_intraday(
             symbol=symbol, is_index=False,
             interval=interval, from_date=from_date, to_date=to_date,
-            user_id=user_id,
+            user_id=user_id, live=live,
         )
 
     async def get_index_intraday(
@@ -276,11 +281,12 @@ class IntradayCacheService(_SeriesCacheCore):
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         user_id: Optional[str] = None,
+        live: Optional[bool] = None,
     ) -> IntradayFetchResult:
         return await self._get_intraday(
             symbol=symbol, is_index=True,
             interval=interval, from_date=from_date, to_date=to_date,
-            user_id=user_id,
+            user_id=user_id, live=live,
         )
 
     async def _get_intraday(
@@ -291,6 +297,7 @@ class IntradayCacheService(_SeriesCacheCore):
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         user_id: Optional[str] = None,
+        live: Optional[bool] = None,
     ) -> IntradayFetchResult:
         normalized = symbol.removeprefix("I:").lstrip("^").upper()
 
@@ -301,9 +308,9 @@ class IntradayCacheService(_SeriesCacheCore):
 
         # --- Try cache (across all known sources) ---
         cache_key, envelope = await self._find_cached(
-            normalized, interval, from_date, to_date, is_index,
+            normalized, interval, from_date, to_date, is_index, live=live,
         )
-        is_live = IntradayCacheKeyBuilder._is_live(to_date)
+        is_live = IntradayCacheKeyBuilder._is_live(to_date) if live is None else live
 
         if envelope is not None:
             bars = envelope["bars"]
@@ -333,7 +340,7 @@ class IntradayCacheService(_SeriesCacheCore):
                     # Re-check cache — another request may have refreshed it
                     refreshed = False
                     _, fresh = await self._find_cached(
-                        normalized, interval, from_date, to_date, is_index,
+                        normalized, interval, from_date, to_date, is_index, live=live,
                     )
                     if fresh is not None:
                         fresh_elapsed = time.time() - fresh.get("fetched_at", 0)
@@ -351,12 +358,19 @@ class IntradayCacheService(_SeriesCacheCore):
                         )
                         envelope = None
             elif _needs_refresh(envelope, base_ttl, interval=interval, is_live=is_live, symbol=normalized, is_index=is_index, clock=clock):
-                # Normal SWR: return stale bars, refresh in background.
-                bg_triggered = True
-                logger.info("Cache %s %s: SWR delta refresh triggered", normalized, interval)
-                asyncio.create_task(
-                    self._delta_refresh(cache_key, normalized, interval, is_index, user_id)
-                )
+                if is_live:
+                    # Normal SWR: return stale bars, refresh in background.
+                    bg_triggered = True
+                    logger.info("Cache %s %s: SWR delta refresh triggered", normalized, interval)
+                    spawn_bg_task(
+                        self._delta_refresh(cache_key, normalized, interval, is_index, user_id)
+                    )
+                else:
+                    # Historical window wants a retry (truncated / soft TTL) —
+                    # re-fetch the bounded window synchronously. The unbounded
+                    # delta refresh would fetch to the present and grow the
+                    # windowed key past its requested range.
+                    envelope = None
 
             if envelope is not None:
                 return IntradayFetchResult(
@@ -380,7 +394,7 @@ class IntradayCacheService(_SeriesCacheCore):
             data, source, truncated = await self._pinned_fetch(
                 normalized, interval, from_date, to_date, is_index, user_id,
             )
-            cache_key = self._build_key(normalized, interval, from_date, to_date, is_index)
+            cache_key = self._build_key(normalized, interval, from_date, to_date, is_index, live=live)
             first_t = data[0].get("time") if data else None
             last_t = data[-1].get("time") if data else None
             logger.info(
@@ -505,9 +519,11 @@ class IntradayCacheService(_SeriesCacheCore):
                 results[normalized] = envelope["bars"]
                 resolved_keys[sym] = key
                 cache_hits += 1
-                if _needs_refresh(envelope, base_ttl, interval=interval, is_live=is_live, symbol=normalized, is_index=is_index, clock=clock):
+                # Historical windows never background-delta-refresh: the delta
+                # fetch runs to the present and would grow the windowed key.
+                if is_live and _needs_refresh(envelope, base_ttl, interval=interval, is_live=is_live, symbol=normalized, is_index=is_index, clock=clock):
                     background_refreshes += 1
-                    asyncio.create_task(
+                    spawn_bg_task(
                         self._delta_refresh(key, normalized, interval, is_index, user_id)
                     )
             else:

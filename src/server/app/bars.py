@@ -153,19 +153,26 @@ async def _fetch(
     user_id: str,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
+    live: Optional[bool] = None,
 ):
-    """Route to the intraday or daily cache service, live or windowed."""
+    """Route to the intraday or daily cache service, live or windowed.
+
+    ``live=False`` pins a paging window to a date-suffixed historical key.
+    Without it the cache's date heuristic classifies a right edge within
+    ~12h of today as live, and the page would read — and on a miss write —
+    the window-less live series key.
+    """
     if intraday:
         svc = IntradayCacheService.get_instance()
         method = svc.get_index_intraday if is_index else svc.get_stock_intraday
         return await method(
             symbol=symbol, interval=interval,
-            from_date=from_date, to_date=to_date, user_id=user_id,
+            from_date=from_date, to_date=to_date, user_id=user_id, live=live,
         )
     svc = DailyCacheService.get_instance()
     return await svc.get_stock_daily(
         symbol=symbol, from_date=from_date, to_date=to_date,
-        is_index=is_index, user_id=user_id,
+        is_index=is_index, user_id=user_id, live=live,
     )
 
 
@@ -233,7 +240,7 @@ async def get_bars(
         from_date, to_date = _paging_window(before, schema)
         result = await _fetch(
             intraday, is_index, legacy_symbol, interval, user_id,
-            from_date=from_date, to_date=to_date,
+            from_date=from_date, to_date=to_date, live=False,
         )
         mode = "before"
         next_cursor = from_date

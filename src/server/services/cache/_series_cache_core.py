@@ -48,6 +48,20 @@ _FetchResult = Tuple[List[Dict[str, Any]], Optional[str], bool]
 _MAX_REFRESH_LOCKS = 4096
 
 
+# Strong refs for fire-and-forget refresh tasks: the event loop keeps only
+# weak references to tasks, so an unreferenced background refresh can be
+# garbage-collected mid-flight.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def spawn_bg_task(coro) -> asyncio.Task:
+    """``create_task`` with a strong reference held until the task completes."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
 def is_live_window(to_date: Optional[str]) -> bool:
     """True when a series window ending at *to_date* may still grow.
 
@@ -143,10 +157,15 @@ class _SeriesCacheCore:
     def _build_key(
         self, symbol: str, interval: str,
         from_date: Optional[str], to_date: Optional[str], is_index: bool,
+        live: Optional[bool] = None,
     ) -> str:
+        """``live=None`` derives liveness from the date heuristic; an explicit
+        bool overrides it — a bounded paging window must never share the
+        window-less live key just because its right edge is near today."""
         return canonical_series_key(
             symbol, interval, from_date, to_date,
-            is_index=is_index, live=self._is_live(to_date),
+            is_index=is_index,
+            live=self._is_live(to_date) if live is None else live,
         )
 
     # -- dual-read --------------------------------------------------------
@@ -154,6 +173,7 @@ class _SeriesCacheCore:
     async def _find_cached(
         self, symbol: str, interval: str,
         from_date: Optional[str], to_date: Optional[str], is_index: bool,
+        live: Optional[bool] = None,
     ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """Canonical-key lookup with legacy v3 dual-read (adopt-on-read).
 
@@ -165,10 +185,17 @@ class _SeriesCacheCore:
         hit, ``(None, None)`` on miss.
         """
         cache = self._cache_client()
-        key = self._build_key(symbol, interval, from_date, to_date, is_index)
+        key = self._build_key(symbol, interval, from_date, to_date, is_index, live=live)
         envelope = _parse_envelope(await cache.get(key))
         if envelope is not None:
             return key, envelope
+
+        if live is False and self._is_live(to_date):
+            # Explicit-historical override disagrees with the date heuristic:
+            # old writers used the heuristic, so any legacy hit for this window
+            # sits under the legacy LIVE key — adopting it would graft a live
+            # series onto a bounded window. Skip dual-read.
+            return None, None
 
         provider = await self._provider()
         # Capability-aware order: adoption must prefer the same publisher the

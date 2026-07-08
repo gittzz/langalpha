@@ -29,7 +29,11 @@ from src.server.services.cache._ohlcv_envelope import (
     is_watermark_stale,
     series_identity,
 )
-from src.server.services.cache._series_cache_core import _SeriesCacheCore, is_live_window
+from src.server.services.cache._series_cache_core import (
+    _SeriesCacheCore,
+    is_live_window,
+    spawn_bg_task,
+)
 from src.utils.cache.redis_cache import get_cache_client
 
 logger = logging.getLogger(__name__)
@@ -160,6 +164,7 @@ class DailyCacheService(_SeriesCacheCore):
         to_date: Optional[str] = None,
         is_index: bool = False,
         user_id: Optional[str] = None,
+        live: Optional[bool] = None,
     ) -> DailyFetchResult:
         normalized = symbol.lstrip("^").upper()
 
@@ -168,8 +173,8 @@ class DailyCacheService(_SeriesCacheCore):
         phase = clock.market_phase()
 
         # --- Try cache (across all known sources) ---
-        cache_key, envelope = await self._find_cached(normalized, "1day", from_date, to_date, is_index)
-        is_live = DailyCacheKeyBuilder._is_live(to_date)
+        cache_key, envelope = await self._find_cached(normalized, "1day", from_date, to_date, is_index, live=live)
+        is_live = DailyCacheKeyBuilder._is_live(to_date) if live is None else live
 
         if envelope is not None:
             bg_triggered = False
@@ -192,12 +197,18 @@ class DailyCacheService(_SeriesCacheCore):
                     # reach the current request.
                     logger.info("Daily cache %s: stale/complete → sync re-fetch", normalized)
                     envelope = None
-                else:
+                elif is_live:
                     # Normal SWR: return stale bars, refresh in background.
                     bg_triggered = True
-                    asyncio.create_task(
+                    spawn_bg_task(
                         self._delta_refresh(cache_key, normalized, "1day", is_index=is_index, user_id=user_id)
                     )
+                else:
+                    # Historical window wants a retry (truncated / soft TTL) —
+                    # re-fetch the bounded window synchronously. The unbounded
+                    # delta refresh would fetch to the present and grow the
+                    # windowed key past its requested range.
+                    envelope = None
 
             if envelope is not None:
                 return self._cached_result(
@@ -208,6 +219,7 @@ class DailyCacheService(_SeriesCacheCore):
         # --- Cache miss / stale-discard: serialized full fetch ---
         return await self._full_fetch(
             normalized, from_date, to_date, is_index, user_id, phase, base_ttl, clock,
+            live=live,
         )
 
     @staticmethod
@@ -247,6 +259,7 @@ class DailyCacheService(_SeriesCacheCore):
         phase: str,
         base_ttl: int,
         clock=None,
+        live: Optional[bool] = None,
     ) -> DailyFetchResult:
         """Fetch the full series upstream, serialized per series.
 
@@ -260,10 +273,10 @@ class DailyCacheService(_SeriesCacheCore):
         lock = self._get_refresh_lock(f"full:{normalized}:{from_date}:{to_date}:{int(is_index)}")
         async with lock:
             # Double-check: the leader may have filled the cache while we waited.
-            cache_key, envelope = await self._find_cached(normalized, "1day", from_date, to_date, is_index)
+            cache_key, envelope = await self._find_cached(normalized, "1day", from_date, to_date, is_index, live=live)
             if envelope is not None and not _needs_refresh(
                 envelope, base_ttl, interval="1day",
-                is_live=DailyCacheKeyBuilder._is_live(to_date),
+                is_live=DailyCacheKeyBuilder._is_live(to_date) if live is None else live,
                 symbol=normalized, is_index=is_index, clock=clock,
             ):
                 return self._cached_result(normalized, envelope, cache_key, phase)
@@ -273,7 +286,7 @@ class DailyCacheService(_SeriesCacheCore):
                 data, source, truncated = await self._pinned_fetch(
                     normalized, "1day", from_date, to_date, is_index, user_id,
                 )
-                cache_key = self._build_key(normalized, "1day", from_date, to_date, is_index)
+                cache_key = self._build_key(normalized, "1day", from_date, to_date, is_index, live=live)
 
                 closed = phase == "closed"
                 complete = closed and len(data) > 0

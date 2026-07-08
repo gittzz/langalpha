@@ -166,7 +166,8 @@ async def test_default_mode_returns_header_and_records(client):
     assert isinstance(body["page"]["next_cursor"], str)
     # live path: no historical window passed to the service
     intraday.get_stock_intraday.assert_awaited_once_with(
-        symbol="AAPL", interval="1min", from_date=None, to_date=None, user_id="test-user-123",
+        symbol="AAPL", interval="1min", from_date=None, to_date=None,
+        user_id="test-user-123", live=None,
     )
 
 
@@ -207,7 +208,8 @@ async def test_after_filters_records(client):
     assert body["page"] == {"next_cursor": None, "has_more": False}
     # same live fetch as default — no extra upstream window
     intraday.get_stock_intraday.assert_awaited_once_with(
-        symbol="AAPL", interval="1min", from_date=None, to_date=None, user_id="test-user-123",
+        symbol="AAPL", interval="1min", from_date=None, to_date=None,
+        user_id="test-user-123", live=None,
     )
 
 
@@ -278,6 +280,9 @@ async def test_before_window_intraday(client, schema, expect_from, expect_to):
     call = intraday.get_stock_intraday.await_args
     assert call.kwargs["from_date"] == expect_from
     assert call.kwargs["to_date"] == expect_to
+    # A paging window is historical by definition — never the live cache key,
+    # even when its right edge falls inside the live-classification zone.
+    assert call.kwargs["live"] is False
 
 
 async def test_before_window_daily_is_calendar_year(client):
@@ -292,6 +297,7 @@ async def test_before_window_daily_is_calendar_year(client):
     call = daily.get_stock_daily.await_args
     assert call.kwargs["from_date"] == "2026-01-01"
     assert call.kwargs["to_date"] == "2026-06-28"
+    assert call.kwargs["live"] is False
 
 
 async def test_before_empty_page_stops_paging(client):

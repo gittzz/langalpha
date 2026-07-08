@@ -51,3 +51,55 @@ class TestIsLiveWindow:
     def test_unparseable_to_date_defaults_to_live(self, _frozen_clock):
         # Fail-open: a non-ISO string is never treated as narrower than live.
         assert is_live_window("not-a-date") is True
+
+
+class TestExplicitLiveOverride:
+    """``live=False`` pins a date-suffixed key even when the heuristic reads
+    the window as live — a /bars ``before=`` page whose right edge lands in
+    the UTC-12 zone must never read or fill the window-less live key."""
+
+    def _svc(self):
+        from src.server.services.cache.daily_cache_service import DailyCacheService
+
+        DailyCacheService._instance = None
+        return DailyCacheService.get_instance()
+
+    def test_build_key_default_follows_heuristic(self, _frozen_clock):
+        key = self._svc()._build_key("AAPL", "1day", "2026-01-01", _UTC_YESTERDAY, False)
+        assert key == "ohlcv:AAPL.XNAS:ohlcv-1d"  # heuristic: live
+
+    def test_build_key_live_false_forces_windowed_key(self, _frozen_clock):
+        key = self._svc()._build_key(
+            "AAPL", "1day", "2026-01-01", _UTC_YESTERDAY, False, live=False,
+        )
+        assert key == f"ohlcv:AAPL.XNAS:ohlcv-1d:2026-01-01:{_UTC_YESTERDAY}"
+
+    @pytest.mark.asyncio
+    async def test_find_cached_live_false_skips_legacy_dual_read(
+        self, _frozen_clock, monkeypatch,
+    ):
+        """In the disagreement zone (heuristic says live, caller says
+        historical) any legacy hit sits under the legacy LIVE key — adopting
+        it would graft a live series onto a bounded window."""
+        from src.server.services.cache import daily_cache_service as dcs
+
+        svc = self._svc()
+
+        class _EmptyCache:
+            async def get(self, key):
+                return None
+
+            async def mget(self, keys):
+                raise AssertionError("legacy dual-read must be skipped")
+
+        monkeypatch.setattr(dcs, "get_cache_client", lambda: _EmptyCache())
+
+        async def _no_provider():
+            raise AssertionError("legacy dual-read must be skipped")
+
+        monkeypatch.setattr(dcs, "get_market_data_provider", _no_provider)
+
+        key, envelope = await svc._find_cached(
+            "AAPL", "1day", "2026-01-01", _UTC_YESTERDAY, False, live=False,
+        )
+        assert (key, envelope) == (None, None)
