@@ -297,7 +297,6 @@ def is_cache_invalidate_on_write_enabled() -> bool:
 
 # Fallback TTLs matching config.yaml defaults (interval_seconds × 1.5)
 _DEFAULT_OHLCV_TTLS: Dict[str, int] = {
-    "1s": 5,
     "1min": 90,
     "5min": 360,
     "15min": 1080,

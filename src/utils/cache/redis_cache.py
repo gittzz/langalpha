@@ -27,6 +27,13 @@ from src.config.settings import (
 
 logger = logging.getLogger(__name__)
 
+# set() without a TTL used to write an immortal key (`if ttl:`), turning
+# every missed cleanup into a permanent Redis leak. Immortality is now
+# opt-in via ttl=PERSIST; an omitted TTL falls back to a generous safety
+# net that outlives any legitimate transient state.
+PERSIST = -1
+SAFETY_TTL = 7 * 24 * 3600
+
 
 class DateTimeEncoder(json.JSONEncoder):
     """JSON encoder that handles datetime and UUID objects."""
@@ -240,7 +247,9 @@ class RedisCacheClient:
         Args:
             key: Cache key
             value: Value to cache (will be JSON serialized)
-            ttl: Time-to-live in seconds (optional)
+            ttl: Time-to-live in seconds. Omitted → SAFETY_TTL (7 days), so a
+                missed cleanup can never leak a key forever; pass PERSIST for
+                a deliberately immortal key.
 
         Returns:
             True if successful, False otherwise
@@ -252,11 +261,10 @@ class RedisCacheClient:
             # Serialize to JSON with datetime support
             serialized = json.dumps(value, ensure_ascii=False, cls=DateTimeEncoder)
 
-            # Set with optional TTL
-            if ttl:
-                await self.client.setex(key, ttl, serialized)
-            else:
+            if ttl == PERSIST:
                 await self.client.set(key, serialized)
+            else:
+                await self.client.setex(key, ttl if ttl and ttl > 0 else SAFETY_TTL, serialized)
 
             self.stats["sets"] += 1
             logger.debug(f"Cache SET: {key} (TTL: {ttl}s)")
@@ -270,6 +278,35 @@ class RedisCacheClient:
             self._log_error(f"Cache set error for {key}", e)
             self.stats["errors"] += 1
             return False
+
+    async def mget(self, keys: list) -> list:
+        """Get many keys in one round trip; result aligns with *keys* (None = miss)."""
+        if not keys:
+            return []
+        if not self.enabled or not self.client:
+            return [None] * len(keys)
+
+        try:
+            values = await self.client.mget(keys)
+        except Exception as e:
+            self._log_error("Cache mget error", e)
+            self.stats["errors"] += 1
+            return [None] * len(keys)
+
+        out = []
+        for key, value in zip(keys, values):
+            if value is None:
+                self.stats["misses"] += 1
+                out.append(None)
+                continue
+            try:
+                out.append(json.loads(value))
+                self.stats["hits"] += 1
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to deserialize cache value for {key}: {e}")
+                self.stats["errors"] += 1
+                out.append(None)
+        return out
 
     async def delete(self, key: str) -> bool:
         """

@@ -89,6 +89,7 @@ dependencies = [
     "aiodocker>=0.23.0",
     "charset-normalizer>=3.4.0",
     "opentelemetry-api>=1.41.1",
+    "exchange-calendars>=4.13.2",
 ]
 
 [tool.uv.sources]
@@ -151,8 +152,9 @@ markers = [
     "slow: long-running tests (stress, concurrency) -- opt-in",
     "provider_docker: tests requiring Docker daemon",
     "provider_daytona: tests requiring Daytona API key",
+    "regression: locks live market-data API behavior against a running server + live providers — opt-in",
 ]
-addopts = "-m 'not integration and not slow'"
+addopts = "-m 'not integration and not slow and not regression'"
 
 [dependency-groups]
 dev = [

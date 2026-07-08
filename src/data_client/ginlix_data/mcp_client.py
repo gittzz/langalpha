@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 GINLIX_INTERVAL_MAP: dict[str, str] = {
-    "1s": "1/second",
     "1min": "1/minute",
     "5min": "5/minute",
     "15min": "15/minute",
@@ -155,6 +154,23 @@ class GinlixMCPClient:
             self._http = None
 
     # -- HTTP ----------------------------------------------------------------
+
+    @staticmethod
+    def _error_dict(action: str, e: Exception) -> dict:
+        """Sanitized error dict for tool output; never embeds raw exception text.
+
+        HTTP errors surface the status and response detail (parseable by the
+        MCP servers' status→code mapper); anything else only the exception
+        type — stringified httpx errors embed the request URL.
+        """
+        if isinstance(e, httpx.HTTPStatusError):
+            try:
+                detail = e.response.json().get("detail", e.response.text)
+            except Exception:  # noqa: BLE001
+                detail = e.response.text
+            detail = str(detail)[:300]  # length-cap: never relay a full upstream body
+            return {"error": f"ginlix-data error ({e.response.status_code}): {detail}"}
+        return {"error": f"{action} failed ({type(e).__name__})"}
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Make a ginlix-data request with auto-refresh on 401."""
@@ -338,7 +354,7 @@ class GinlixMCPClient:
             results = await paginate_cursor(_fetch_page, params, limit=limit)
             return {"results": results}
         except Exception as e:  # noqa: BLE001
-            return {"error": f"Failed to fetch options chain: {e}"}
+            return self._error_dict("Options chain fetch", e)
 
     async def fetch_options_prices(
         self,
@@ -379,14 +395,8 @@ class GinlixMCPClient:
             intraday = interval_lower not in DAILY_INTERVALS
             normalized = normalize_bars(all_bars, options_ticker, intraday=intraday)
             return normalized
-        except httpx.HTTPStatusError as e:
-            try:
-                detail = e.response.json().get("detail", e.response.text)
-            except Exception:
-                detail = e.response.text
-            return {"error": f"ginlix-data error ({e.response.status_code}): {detail}"}
         except Exception as e:  # noqa: BLE001
-            return {"error": f"Failed to fetch options prices: {e}"}
+            return self._error_dict("Options prices fetch", e)
 
     async def fetch_options_snapshot(
         self,
@@ -417,7 +427,7 @@ class GinlixMCPClient:
             ]
             return {"count": len(results), "data": results, "source": "ginlix-data"}
         except Exception as e:  # noqa: BLE001
-            return {"error": f"Failed to fetch options snapshot: {e}"}
+            return self._error_dict("Options snapshot fetch", e)
 
     async def fetch_short_data(
         self,
@@ -450,7 +460,7 @@ class GinlixMCPClient:
                 resp.raise_for_status()
                 result["short_interest"] = resp.json().get("results", [])
             except Exception as e:  # noqa: BLE001
-                result["short_interest_error"] = str(e)
+                result["short_interest_error"] = self._error_dict("Short interest fetch", e)["error"]
 
         if data_type in ("short_volume", "both"):
             params = {
@@ -469,6 +479,6 @@ class GinlixMCPClient:
                 resp.raise_for_status()
                 result["short_volume"] = resp.json().get("results", [])
             except Exception as e:  # noqa: BLE001
-                result["short_volume_error"] = str(e)
+                result["short_volume_error"] = self._error_dict("Short volume fetch", e)["error"]
 
         return result

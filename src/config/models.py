@@ -4,7 +4,7 @@ Pydantic models for infrastructure configuration.
 These models define the schema for config.yaml (infrastructure settings).
 """
 
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -189,10 +189,18 @@ class RedisConfig(BaseModel):
 
 
 class MarketDataProviderConfig(BaseModel):
-    """Configuration for a single market data provider."""
+    """Configuration for a single market data provider.
+
+    Per-capability market lists override ``markets`` for that capability
+    only (None = no override). Market tokens: region codes plus ``all``
+    and ``non-us``.
+    """
 
     name: str
     markets: List[str] = Field(default_factory=lambda: ["all"])
+    intraday_markets: Optional[List[str]] = None
+    daily_markets: Optional[List[str]] = None
+    snapshot_markets: Optional[List[str]] = None
 
 
 class MarketDataConfig(BaseModel):

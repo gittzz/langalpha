@@ -1,12 +1,43 @@
-"""Unit tests for the yfinance data source snapshots — no network."""
+"""Unit tests for the yfinance data source — no network."""
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.data_client.yfinance.data_source import YFinanceDataSource
+from src.data_client.yfinance.data_source import YFinanceDataSource, _fetch_history
+
+
+def _history_kwargs(**call_kwargs) -> dict:
+    """Run _fetch_history with a stubbed Ticker; return the kwargs it passed."""
+    ticker = MagicMock()
+    ticker.history.return_value = None  # empty result — we only care about kwargs
+    with patch("src.data_client.yfinance.data_source.yf.Ticker", return_value=ticker):
+        _fetch_history("0700.HK", "1m", **call_kwargs)
+    return ticker.history.call_args.kwargs
+
+
+def test_fetch_history_end_date_is_inclusive():
+    """to_date is inclusive per the provider contract, but yfinance's ``end``
+    is an exclusive exchange-local midnight. Without the +1-day shift, a window
+    ending on the current venue date silently drops today's live session —
+    non-US charts froze on the prior session (frozen 0700.HK chart bug).
+    """
+    kwargs = _history_kwargs(start="2026-07-03", end="2026-07-06")
+    assert kwargs["start"] == "2026-07-03"
+    assert kwargs["end"] == "2026-07-07"
+
+
+def test_fetch_history_open_ended_window_has_no_end_bound():
+    kwargs = _history_kwargs(start="2026-07-03", end=None)
+    assert kwargs["start"] == "2026-07-03"
+    assert "end" not in kwargs
+
+
+def test_fetch_history_unparseable_end_passes_through():
+    kwargs = _history_kwargs(start=None, end="garbage")
+    assert kwargs["end"] == "garbage"
 
 
 @pytest.mark.asyncio

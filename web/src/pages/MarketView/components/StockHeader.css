@@ -119,6 +119,11 @@
   opacity: 0.5;
 }
 
+.data-source-dot--closed {
+  background: var(--color-text-secondary);
+  opacity: 0.3;
+}
+
 .data-source-label {
   font-weight: 500;
   letter-spacing: 0.02em;

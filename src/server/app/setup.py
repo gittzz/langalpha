@@ -205,6 +205,15 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Redis cache initialization failed: {e}")
         logger.warning("Server will continue without caching")
 
+    # Pre-build market calendars so session lookups never build on a request path
+    try:
+        from src.market_protocol.calendars import prebuild_calendars
+
+        built = await asyncio.to_thread(prebuild_calendars)
+        logger.info(f"Market calendars pre-built: {built}")
+    except Exception as e:
+        logger.warning(f"Market calendar pre-build failed: {e}")
+
     # Start BackgroundTaskManager cleanup task
     try:
         manager = BackgroundTaskManager.get_instance()
@@ -336,16 +345,16 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to initialize PTC Agent: {e}")
         logger.warning("PTC Agent endpoints may not work correctly")
 
-    # Start SharedWSConnectionManager (shared upstream WS to ginlix-data)
+    # Start MarketDataFeed (shared upstream WS to ginlix-data)
     try:
-        from src.server.services.shared_ws_manager import DEFAULT_WS_FEEDS, SharedWSConnectionManager
+        from src.server.services.market_data_feed import DEFAULT_WS_FEEDS, MarketDataFeed
 
         for market, interval, tier in DEFAULT_WS_FEEDS:
-            ws = SharedWSConnectionManager.get_instance(market, interval, tier)
+            ws = MarketDataFeed.get_instance(market, interval, tier)
             await ws.start()
-        logger.info("SharedWSConnectionManager instances started")
+        logger.info("MarketDataFeed instances started")
     except Exception as e:
-        logger.warning(f"Failed to start SharedWSConnectionManager: {e}")
+        logger.warning(f"Failed to start MarketDataFeed: {e}")
 
     # Start AutomationScheduler (polling loop for time-based triggers)
     try:
@@ -445,14 +454,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error shutting down AutomationScheduler: {e}")
 
-    # 1.5. Shutdown SharedWSConnectionManager
+    # 1.5. Shutdown MarketDataFeed
     try:
-        from src.server.services.shared_ws_manager import SharedWSConnectionManager
+        from src.server.services.market_data_feed import MarketDataFeed
 
-        for ws in SharedWSConnectionManager.all_instances():
+        for ws in MarketDataFeed.all_instances():
             await ws.stop()
     except Exception as e:
-        logger.warning(f"Error shutting down SharedWSConnectionManager: {e}")
+        logger.warning(f"Error shutting down MarketDataFeed: {e}")
 
     # 2. Cancel background subagent tasks
     try:
@@ -730,6 +739,7 @@ from src.server.app.workspace_sandbox import router as workspace_sandbox_router
 from src.server.app.chart_annotations import router as chart_annotations_router
 from src.server.app.workspace_sandbox import preview_redirect_router
 from src.server.app.market_data import router as market_data_router
+from src.server.app.bars import router as bars_router
 from src.server.app.users import router as users_router
 from src.server.app.watchlist import router as watchlist_router
 from src.server.app.portfolio import router as portfolio_router
@@ -783,6 +793,7 @@ app.include_router(
 )  # /api/v1/workspaces/{id}/chart-annotations - Agent-drawn chart annotations
 app.include_router(cache_router)  # /api/v1/cache/* - Cache management
 app.include_router(market_data_router)  # /api/v1/market-data/* - Market data proxy
+app.include_router(bars_router)  # /api/v1/market-data/bars/* - Protocol-native progressive bars
 app.include_router(users_router)  # /api/v1/users/* - User management
 app.include_router(
     watchlist_router

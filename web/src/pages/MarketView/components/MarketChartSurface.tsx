@@ -19,7 +19,6 @@ import CompanyOverviewPanel from './CompanyOverviewPanel';
 import { MarketDataWSProvider, useMarketDataWSContext } from '../contexts/MarketDataWSContext';
 import { useStockData } from '../hooks/useStockData';
 import { useChartAnnotationSync } from '../hooks/useChartAnnotationSync';
-import { supports1sInterval } from '../utils/chartConstants';
 
 interface OverviewData {
   quote?: Record<string, unknown>;
@@ -63,7 +62,6 @@ function MarketChartSurfaceInner({
     overviewLoading,
     overlayData,
     marketStatus,
-    handleLatestBar,
   } = useStockData({ selectedStock: symbol, wsStatus, setPreviousClose, setDayOpen });
 
   // Load this symbol's persisted annotations (all timeframes) into the store so
@@ -76,13 +74,6 @@ function MarketChartSurfaceInner({
     wsSubscribe([symbol]);
     return () => wsUnsubscribe([symbol]);
   }, [symbol, wsSubscribe, wsUnsubscribe]);
-
-  // Auto-downgrade 1s → 1m when the symbol doesn't support 1s.
-  useEffect(() => {
-    if (selectedInterval === '1s' && !supports1sInterval(symbol)) {
-      setSelectedInterval('1min');
-    }
-  }, [symbol, selectedInterval]);
 
   const handleIntervalChange = useCallback((interval: string) => {
     setSelectedInterval(interval);
@@ -140,7 +131,6 @@ function MarketChartSurfaceInner({
           workspaceId={workspaceId ?? null}
           onIntervalChange={handleIntervalChange}
           onStockMeta={handleStockMeta}
-          onLatestBar={handleLatestBar}
           quoteData={quote}
           earningsData={(overviewData as OverviewData | null)?.earningsSurprises || null}
           overlayData={overlayData as Record<string, unknown> | null}
@@ -148,7 +138,6 @@ function MarketChartSurfaceInner({
           snapshot={snapshotData}
           liveTick={wsPrices.get(symbol)?.barData || null}
           wsStatus={wsStatus}
-          ginlixDataEnabled={ginlixDataEnabled}
           marketStatus={marketStatus}
         />
       </div>

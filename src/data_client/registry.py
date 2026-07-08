@@ -147,14 +147,31 @@ async def get_market_data_provider() -> MarketDataSource:
 
         provider_configs = get_market_data_providers()
         entries: list[ProviderEntry] = []
+        sources_by_name: dict[str, Any] = {}
 
         for cfg in provider_configs:
             name = cfg["name"]
             markets = set(cfg.get("markets", ["all"]))
             reg = _SOURCE_REGISTRY.get(name)
             if reg and reg[0]():  # availability check
-                source = await reg[1]()
-                entries.append(ProviderEntry(name=name, source=source, markets=markets))
+                # A provider may appear multiple times (per-capability chain
+                # positions) — all its entries share one source instance.
+                if name not in sources_by_name:
+                    sources_by_name[name] = await reg[1]()
+                entries.append(ProviderEntry(
+                    name=name,
+                    source=sources_by_name[name],
+                    markets=markets,
+                    intraday_markets=(
+                        set(cfg["intraday_markets"]) if cfg.get("intraday_markets") is not None else None
+                    ),
+                    daily_markets=(
+                        set(cfg["daily_markets"]) if cfg.get("daily_markets") is not None else None
+                    ),
+                    snapshot_markets=(
+                        set(cfg["snapshot_markets"]) if cfg.get("snapshot_markets") is not None else None
+                    ),
+                ))
                 logger.debug(
                     "market_data.source.registered | name=%s markets=%s", name, markets
                 )

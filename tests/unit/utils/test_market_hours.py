@@ -9,7 +9,11 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from src.utils.market_hours import current_trading_date, expected_latest_daily_date
+from src.utils.market_hours import (
+    current_trading_date,
+    expected_latest_daily_date,
+    next_phase_change_ms,
+)
 
 ET = ZoneInfo("America/New_York")
 
@@ -60,3 +64,31 @@ class TestExpectedLatestDailyDate:
     def test_holiday_walks_back(self):
         holiday = datetime(2026, 5, 25, 11, 0, tzinfo=ET)
         assert expected_latest_daily_date(holiday) == "2026-05-22"
+
+
+class TestNextPhaseChange:
+    @staticmethod
+    def _ms(dt: datetime) -> int:
+        return int(dt.timestamp() * 1000)
+
+    def test_walks_the_session_boundaries(self):
+        # (now, next boundary) across every phase of one trading day.
+        cases = [
+            (datetime(2026, 7, 2, 3, 0, tzinfo=ET), datetime(2026, 7, 2, 4, 0, tzinfo=ET)),
+            (datetime(2026, 7, 2, 8, 0, tzinfo=ET), datetime(2026, 7, 2, 9, 30, tzinfo=ET)),
+            (datetime(2026, 7, 2, 12, 0, tzinfo=ET), datetime(2026, 7, 2, 16, 0, tzinfo=ET)),
+            (datetime(2026, 7, 2, 17, 0, tzinfo=ET), datetime(2026, 7, 2, 20, 0, tzinfo=ET)),
+        ]
+        for now, expected in cases:
+            assert next_phase_change_ms(now) == self._ms(expected), now.isoformat()
+
+    def test_boundary_instant_advances_to_the_next_edge(self):
+        # Exactly at 16:00 the phase is already post — next change is 20:00.
+        at_close = datetime(2026, 7, 2, 16, 0, tzinfo=ET)
+        assert next_phase_change_ms(at_close) == self._ms(datetime(2026, 7, 2, 20, 0, tzinfo=ET))
+
+    def test_skips_holiday_and_weekend(self):
+        # Post-close Thu 2026-07-02; Fri is the observed July 4th holiday →
+        # next boundary is Monday's 04:00 pre-open.
+        after_hours = datetime(2026, 7, 2, 21, 0, tzinfo=ET)
+        assert next_phase_change_ms(after_hours) == self._ms(datetime(2026, 7, 6, 4, 0, tzinfo=ET))
