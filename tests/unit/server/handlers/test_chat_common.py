@@ -822,6 +822,144 @@ class TestWaitOrSteer:
         assert event is None
 
     @pytest.mark.asyncio
+    async def test_steer_only_fresh_raises_409_not_running(self):
+        """A steer_only probe must never be admitted as a fresh turn — the
+        probe's SSE reader ignores turn events, so a turn admitted on that
+        connection streams its output (interrupts included) into a void.
+        409 'not_running' routes the gateway to its resubmit path instead."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import wait_or_steer
+
+        manager = AsyncMock()
+        manager.wait_for_admission = AsyncMock(return_value="fresh")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await wait_or_steer(
+                manager, "t-1", "hello", "u-1", steer_only=True
+            )
+
+        assert exc_info.value.status_code == 409
+        detail = exc_info.value.detail
+        assert isinstance(detail, dict)
+        assert detail["code"] == "not_running"
+        assert "t-1" not in detail["message"]
+
+    @pytest.mark.asyncio
+    async def test_steer_only_still_steers_running(self):
+        """steer_only forbids only the fresh-admission fallback; a
+        genuinely-running turn steers exactly as before."""
+        from src.server.handlers.chat._common import wait_or_steer
+
+        manager = AsyncMock()
+        manager.wait_for_admission = AsyncMock(return_value="running")
+        # Live task present → no accept-after-exit reclaim; steer straight through.
+        manager.has_active_task_for_thread = AsyncMock(return_value=True)
+
+        with patch(
+            "src.server.handlers.chat.steering.steer_thread",
+            new_callable=AsyncMock,
+            return_value={"position": 2, "payload": "QUEUED_JSON"},
+        ):
+            ready, event = await wait_or_steer(
+                manager, "t-1", "hello", "u-1", steer_only=True
+            )
+
+        assert ready is False
+        assert "steering_accepted" in event
+
+    @pytest.mark.asyncio
+    async def test_steer_accept_racing_exit_reclaims_and_admits_fresh(self):
+        """The admission snapshot said "running" but the workflow exited before
+        the Redis push landed: the message must be reclaimed and the POST
+        routed as a fresh turn — never a false steering_accepted for a
+        message nothing will consume."""
+        from src.server.handlers.chat._common import wait_or_steer
+
+        manager = AsyncMock()
+        manager.wait_for_admission = AsyncMock(return_value="running")
+        manager.has_active_task_for_thread = AsyncMock(return_value=False)
+
+        with (
+            patch(
+                "src.server.handlers.chat.steering.steer_thread",
+                new_callable=AsyncMock,
+                return_value={"position": 1, "payload": "QUEUED_JSON"},
+            ),
+            patch(
+                "src.server.handlers.chat.steering.unsteer_thread",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_unsteer,
+        ):
+            ready, event = await wait_or_steer(manager, "t-1", "hello", "u-1")
+
+        assert ready is True
+        assert event is None
+        mock_unsteer.assert_awaited_once_with("t-1", "QUEUED_JSON")
+
+    @pytest.mark.asyncio
+    async def test_steer_accept_racing_exit_steer_only_raises_not_running(self):
+        """Same race under steer_only: a reclaimed accept surfaces as
+        not_running so the gateway resubmits — not as a fresh admission."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import wait_or_steer
+
+        manager = AsyncMock()
+        manager.wait_for_admission = AsyncMock(return_value="running")
+        manager.has_active_task_for_thread = AsyncMock(return_value=False)
+
+        with (
+            patch(
+                "src.server.handlers.chat.steering.steer_thread",
+                new_callable=AsyncMock,
+                return_value={"position": 1, "payload": "QUEUED_JSON"},
+            ),
+            patch(
+                "src.server.handlers.chat.steering.unsteer_thread",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await wait_or_steer(
+                    manager, "t-1", "hello", "u-1", steer_only=True
+                )
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["code"] == "not_running"
+
+    @pytest.mark.asyncio
+    async def test_steer_accept_drained_by_exit_still_reports_accepted(self):
+        """If the reclaim misses, the exiting workflow's final drain got the
+        message first and steering_returned already carried it back on the
+        turn stream — the POST keeps the queue contract and reports
+        accepted."""
+        from src.server.handlers.chat._common import wait_or_steer
+
+        manager = AsyncMock()
+        manager.wait_for_admission = AsyncMock(return_value="running")
+        manager.has_active_task_for_thread = AsyncMock(return_value=False)
+
+        with (
+            patch(
+                "src.server.handlers.chat.steering.steer_thread",
+                new_callable=AsyncMock,
+                return_value={"position": 1, "payload": "QUEUED_JSON"},
+            ),
+            patch(
+                "src.server.handlers.chat.steering.unsteer_thread",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            ready, event = await wait_or_steer(manager, "t-1", "hello", "u-1")
+
+        assert ready is False
+        assert "steering_accepted" in event
+
+    @pytest.mark.asyncio
     async def test_running_steers_immediately_with_no_wait(self):
         """CRITICAL regression: a genuinely-running turn is steered immediately
         — admission returns "running" and steer_thread is called without any
@@ -830,11 +968,13 @@ class TestWaitOrSteer:
 
         manager = AsyncMock()
         manager.wait_for_admission = AsyncMock(return_value="running")
+        # Live task present → no accept-after-exit reclaim; steer straight through.
+        manager.has_active_task_for_thread = AsyncMock(return_value=True)
 
         with patch(
             "src.server.handlers.chat.steering.steer_thread",
             new_callable=AsyncMock,
-            return_value={"position": 1},
+            return_value={"position": 1, "payload": "QUEUED_JSON"},
         ) as mock_steer:
             ready, event = await wait_or_steer(
                 manager, "t-1", "hello", "u-1"
@@ -930,21 +1070,66 @@ class TestWaitOrSteer:
         assert "t-1" not in detail["message"]
         mock_steer.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_cannot_steer_running_is_a_conflict(self):
+        """Dispatched flows (can_steer=False) never steer: a running peer is a
+        409, not a steering_accepted — a second astream on a thread-keyed
+        checkpointer would collide."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import wait_or_steer
+
+        manager = AsyncMock()
+        manager.wait_for_admission = AsyncMock(return_value="running")
+
+        with (
+            patch(
+                "src.server.handlers.chat.steering.steer_thread",
+                new_callable=AsyncMock,
+            ) as mock_steer,
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await wait_or_steer(manager, "t-1", "hi", "u-1", can_steer=False)
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["code"] == "running"
+        mock_steer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exclude_run_id_reaches_admission_scan(self):
+        """A dispatched flow passes its own pre-registered run_id so the
+        admission scan ignores its placeholder and only sees OTHER runs."""
+        from src.server.handlers.chat._common import wait_or_steer
+
+        manager = AsyncMock()
+        manager.wait_for_admission = AsyncMock(return_value="fresh")
+
+        ready, event = await wait_or_steer(
+            manager, "t-1", "hi", "u-1", exclude_run_id="r-9"
+        )
+
+        assert ready is True
+        assert event is None
+        manager.wait_for_admission.assert_awaited_once_with(
+            "t-1", exclude_run_id="r-9"
+        )
+
 
 # ---------------------------------------------------------------------------
-# admission_conflict_detail (dispatched-flow 409 message mapping)
+# admission_conflict_detail (single 409 wording source)
 # ---------------------------------------------------------------------------
 
 
 class TestAdmissionConflictDetail:
-    """The dispatched (X-Dispatch=background) flow can't steer, so a non-fresh
-    admission state becomes a 409. This shared helper maps the admission state
-    to its retry message — same mapping for PTC and Flash."""
+    """The single wording source for every in-generator admission 409 — the
+    ``stopping``/``compacting``/``running`` conflicts and the ``steer_only``
+    probe's ``not_running`` refusal. Same mapping for PTC and Flash, foreground
+    and dispatched."""
 
     def test_compacting_state_names_compaction(self):
         from src.server.handlers.chat._common import admission_conflict_detail
 
-        detail = admission_conflict_detail("t-1", "compacting")
+        detail = admission_conflict_detail("compacting")
         # Structured detail (code + message) so handle_workflow_error can tag the
         # SSE error with a code and the client can recognize a transient state.
         assert isinstance(detail, dict)
@@ -955,25 +1140,39 @@ class TestAdmissionConflictDetail:
     def test_stopping_state_names_stopping(self):
         from src.server.handlers.chat._common import admission_conflict_detail
 
-        detail = admission_conflict_detail("t-1", "stopping")
+        detail = admission_conflict_detail("stopping")
         assert isinstance(detail, dict)
         assert detail["code"] == "stopping"
         assert "stopping" in detail["message"].lower()
+
+    def test_not_running_names_the_steer_refusal(self):
+        from src.server.handlers.chat._common import admission_conflict_detail
+
+        # The steer_only probe against an idle thread: not a wait_for_admission
+        # state, but routed through the same mapper so the wording lives here too.
+        detail = admission_conflict_detail("not_running")
+        assert isinstance(detail, dict)
+        assert detail["code"] == "not_running"
+        assert "running" in detail["message"].lower()
 
     def test_running_state_is_the_generic_fallback(self):
         from src.server.handlers.chat._common import admission_conflict_detail
 
         # Any other non-fresh state (e.g. "running") falls through to the
         # "still running" code.
-        detail = admission_conflict_detail("t-1", "running")
+        detail = admission_conflict_detail("running")
         assert isinstance(detail, dict)
         assert detail["code"] == "running"
         assert "still running" in detail["message"].lower()
+        # The actionable hint (reconnect / cancel) is part of the contract —
+        # the web UI renders this message verbatim, so keep it pinned.
+        assert "reconnect" in detail["message"].lower()
+        assert "cancel" in detail["message"].lower()
 
     def test_unknown_state_falls_back_to_generic(self):
         from src.server.handlers.chat._common import admission_conflict_detail
 
-        detail = admission_conflict_detail("t-1", "wedged")
+        detail = admission_conflict_detail("wedged")
         assert detail["code"] == "running"
         assert "still running" in detail["message"].lower()
 
@@ -1051,6 +1250,67 @@ class TestHandleWorkflowErrorHTTPException:
         assert any("compacting" in ev for ev in events)
         # ...but the conflict is never persisted as a turn failure and never
         # clobbers the (possibly peer-owned) tracker status.
+        persistence_service.persist_error.assert_not_awaited()
+        tracker.mark_failed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_not_running_conflict_skips_persist_and_mark_failed(self):
+        """not_running (steer_only probe on an idle thread) is an admission
+        outcome: it must reach the client as an SSE error but never be
+        persisted or mark a (possibly peer-owned) turn failed. Pins the
+        ADMISSION_CONFLICT_CODES membership added for steer_only."""
+        from fastapi import HTTPException
+
+        from src.server.handlers.chat._common import handle_workflow_error
+
+        exc = HTTPException(
+            status_code=409,
+            detail={"code": "not_running", "message": "no workflow to steer"},
+        )
+
+        persistence_service = AsyncMock()
+        tracker = AsyncMock()
+        handler = MagicMock()
+        handler.get_tool_usage = MagicMock(return_value=None)
+        handler.get_sse_events = MagicMock(return_value=None)
+        handler._format_sse_event = MagicMock(
+            side_effect=lambda ev, data: f"event: {ev}\ndata: {data}\n\n"
+        )
+        request = MagicMock()
+        request.workspace_id = None
+        request.locale = None
+        request.timezone = None
+
+        with (
+            patch(
+                "src.server.handlers.chat._common.WorkflowTracker"
+            ) as mock_tracker_cls,
+            patch(
+                "src.server.handlers.chat._common.release_burst_slot",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tracker_cls.get_instance.return_value = tracker
+            events = [
+                ev
+                async for ev in handle_workflow_error(
+                    exc,
+                    thread_id="t-1",
+                    user_id="u-1",
+                    workspace_id="w-1",
+                    handler=handler,
+                    token_callback=None,
+                    persistence_service=persistence_service,
+                    start_time=0.0,
+                    request=request,
+                    is_byok=False,
+                    msg_type="ptc",
+                    log_prefix="PTC_TEST",
+                )
+            ]
+
+        assert any("event: error" in ev for ev in events)
+        assert any("not_running" in ev for ev in events)
         persistence_service.persist_error.assert_not_awaited()
         tracker.mark_failed.assert_not_awaited()
 

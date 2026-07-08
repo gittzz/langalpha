@@ -56,6 +56,9 @@ def _make_request():
     req.locale = "en-US"
     req.subagents_enabled = None
     req.llm_model = None
+    # Explicit bool: a bare MagicMock attribute is truthy, which would trip
+    # the steer_only fresh-admission rejection in the real wait_or_steer.
+    req.steer_only = False
     return req
 
 
