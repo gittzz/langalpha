@@ -96,7 +96,6 @@ interface MarketChartProps {
   onIntervalChange?: (interval: string) => void;
   onCapture?: () => void;
   onStockMeta?: (meta: unknown) => void;
-  onLatestBar?: (bar: ChartDataBar) => void;
   /** Venue market phase (`pre|open|post|closed`) from the bars responses; null until known. */
   onMarketPhase?: (phase: string | null) => void;
   quoteData: Record<string, unknown> | null;
@@ -147,7 +146,6 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
   onIntervalChange,
   onCapture: _onCapture,
   onStockMeta,
-  onLatestBar,
   onMarketPhase,
   quoteData,
   earningsData,
@@ -1158,8 +1156,6 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
       // Don't re-zoom on poll updates — preserve the user's scroll/zoom.
       setLastUpdateTime(new Date());
       setError(null);
-      const latest = merged[merged.length - 1];
-      if (latest && typeof onLatestBar === 'function') onLatestBar(latest);
     },
   });
 
@@ -1733,11 +1729,6 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
           }
           setLastUpdateTime(new Date());
           setError(null);
-
-          // Report latest bar to parent so header can show fresh price
-          if (typeof onLatestBar === 'function') {
-            onLatestBar(data[data.length - 1]);
-          }
 
           // Subscribe to visible range changes for scroll-based loading (debounced)
           if (chartRef.current) {

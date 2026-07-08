@@ -117,7 +117,6 @@ function MarketViewInner() {
     overviewLoading,
     overlayData,
     marketStatus,
-    handleLatestBar
   } = useStockData({
     selectedStock,
     wsStatus,
@@ -619,7 +618,6 @@ function MarketViewInner() {
               onCapture={handleCaptureChart}
               onStockMeta={handleStockMeta as any}
               onMarketPhase={setMarketPhase}
-              onLatestBar={handleLatestBar}
               quoteData={(overviewData as OverviewData | null)?.quote || null}
               earningsData={(overviewData as OverviewData | null)?.earningsSurprises || null}
               overlayData={overlayData as Record<string, unknown> | null}
@@ -750,7 +748,6 @@ function MarketViewInner() {
                   onCapture={handleCaptureChart}
                   onStockMeta={handleStockMeta as any}
                   onMarketPhase={setMarketPhase}
-                  onLatestBar={handleLatestBar}
                   quoteData={(overviewData as OverviewData | null)?.quote || null}
                   earningsData={(overviewData as OverviewData | null)?.earningsSurprises || null}
                   overlayData={overlayData as Record<string, unknown> | null}

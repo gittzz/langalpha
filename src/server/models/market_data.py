@@ -258,8 +258,12 @@ class SnapshotData(BaseModel):
     low: Optional[float] = Field(None, description="Day low")
     volume: Optional[int] = Field(None, description="Day volume")
     market_status: Optional[str] = Field(None, description="Per-ticker market phase")
+    last_minute_close: Optional[float] = Field(None, description="Latest minute-aggregate close (consolidated last sale; excludes odd-lot prints)")
+    regular_close: Optional[float] = Field(None, description="Regular-session close (provider-exact, unlike the 1dp change fields)")
     regular_trading_change: Optional[float] = Field(None, description="Regular session change (close - prev close)")
+    early_trading_change: Optional[float] = Field(None, description="Pre-market change (absolute)")
     early_trading_change_percent: Optional[float] = Field(None, description="Pre-market change %")
+    late_trading_change: Optional[float] = Field(None, description="After-hours change (absolute)")
     late_trading_change_percent: Optional[float] = Field(None, description="After-hours change %")
     source: Optional[str] = Field(None, description="Provider that filled this row")
 

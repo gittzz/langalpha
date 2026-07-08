@@ -37,7 +37,12 @@ export interface QuoteRow {
   high?: number | null;
   low?: number | null;
   volume?: number | null;
+  last_minute_close?: number | null;
+  regular_close?: number | null;
+  regular_trading_change?: number | null;
+  early_trading_change?: number | null;
   early_trading_change_percent?: number | null;
+  late_trading_change?: number | null;
   late_trading_change_percent?: number | null;
   [key: string]: unknown;
 }

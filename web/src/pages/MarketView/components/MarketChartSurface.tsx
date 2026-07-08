@@ -62,7 +62,6 @@ function MarketChartSurfaceInner({
     overviewLoading,
     overlayData,
     marketStatus,
-    handleLatestBar,
   } = useStockData({ selectedStock: symbol, wsStatus, setPreviousClose, setDayOpen });
 
   // Load this symbol's persisted annotations (all timeframes) into the store so
@@ -132,7 +131,6 @@ function MarketChartSurfaceInner({
           workspaceId={workspaceId ?? null}
           onIntervalChange={handleIntervalChange}
           onStockMeta={handleStockMeta}
-          onLatestBar={handleLatestBar}
           quoteData={quote}
           earningsData={(overviewData as OverviewData | null)?.earningsSurprises || null}
           overlayData={overlayData as Record<string, unknown> | null}

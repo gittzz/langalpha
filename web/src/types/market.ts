@@ -39,7 +39,12 @@ export interface SnapshotData {
   high?: number;
   low?: number;
   volume?: number;
+  last_minute_close?: number | null;
+  regular_close?: number | null;
+  regular_trading_change?: number | null;
+  early_trading_change?: number | null;
   early_trading_change_percent?: number | null;
+  late_trading_change?: number | null;
   late_trading_change_percent?: number | null;
   source?: string | null;
   [key: string]: unknown;

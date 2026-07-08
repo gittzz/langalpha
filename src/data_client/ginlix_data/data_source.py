@@ -192,6 +192,7 @@ class GinlixDataSource:
         """Normalize a ginlix-data snapshot to the unified snapshot shape."""
         session = raw.get("session", {})
         last_trade = raw.get("last_trade", {})
+        last_minute = raw.get("last_minute", {})
         ticker = raw.get("ticker", "")
         # For indices, reverse-map I:SPX → GSPC etc.
         if asset_type == "indices":
@@ -209,6 +210,17 @@ class GinlixDataSource:
             "volume": int(session["volume"]) if session.get("volume") is not None else None,
             "market_status": raw.get("market_status"),
             "last_trade_price": last_trade.get("price") if last_trade else None,
+            # Close of the most recent minute aggregate — the consolidated last
+            # sale. Unlike last_trade (and the session change fields derived
+            # from it), it excludes odd-lot prints that don't update the
+            # official last, so it matches what the chart's bars show.
+            "last_minute_close": last_minute.get("close") if last_minute else None,
+            # Provider-exact regular-session close. `price` maps the same wire
+            # field, but downstream live-tick write-through overwrites `price`,
+            # so the settled close needs its own untouched key. The provider's
+            # change fields are served at reduced precision (1dp) — deriving
+            # the close from them is off by cents; this field is exact.
+            "regular_close": session.get("close"),
             "regular_trading_change": session.get("regular_trading_change"),
             "regular_trading_change_percent": session.get("regular_trading_change_percent"),
             "early_trading_change": session.get("early_trading_change"),

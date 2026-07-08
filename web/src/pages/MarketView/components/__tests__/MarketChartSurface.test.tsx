@@ -35,7 +35,6 @@ const sd = vi.hoisted(() => ({
   overviewLoading: false,
   overlayData: null as Record<string, unknown> | null,
   marketStatus: 'open' as unknown,
-  handleLatestBar: vi.fn(),
 }));
 
 // Captured props handed to each mocked child.

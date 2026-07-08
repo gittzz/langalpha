@@ -1,10 +1,10 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { mapSnapshotToStockQuote, fetchCompanyOverview, fetchAnalystData } from '../utils/api';
 import { useQuote } from '@/lib/quotes';
 import { fetchMarketStatus } from '@/lib/marketUtils';
 import type { StockInfo, RealTimePrice, SnapshotData } from '@/types/market';
-import type { ConnectionStatus, BarData } from './useMarketDataWS';
+import type { ConnectionStatus } from './useMarketDataWS';
 
 type MapperSnapshot = Parameters<typeof mapSnapshotToStockQuote>[1];
 
@@ -45,7 +45,6 @@ export interface UseStockDataReturn {
     overviewLoading: boolean;
     overlayData: AnalystOverlayData | null;
     marketStatus: MarketStatusData | null;
-    handleLatestBar: (bar: BarData | null) => void;
 }
 
 /**
@@ -97,9 +96,10 @@ export function useStockData({
         }
     }, [quote, selectedStock, setPreviousClose, setDayOpen]);
 
-    // Isolate pure UI state for the realtime bar updates
-    // This allows WebSocket to update local state extremely fast
-    // without triggering React Query cache updates on every tick.
+    // The quote row is the single writer of realTimePrice — live WS ticks
+    // override at display time (wsPrices in the consumer), never here. Keeping
+    // one writer makes the header deterministic across refreshes; the chart's
+    // head bar must not be lifted into this state.
     useEffect(() => {
         if (!selectedStock) {
             setStockInfo(null);
@@ -143,34 +143,6 @@ export function useStockData({
         staleTime: 30000,
     });
 
-    // WebSocket Update Handler (mutates local realTimePrice state)
-    const stockInfoRef = useRef(stockInfo);
-    useEffect(() => { stockInfoRef.current = stockInfo; }, [stockInfo]);
-
-    const handleLatestBar = useCallback((bar: BarData | null): void => {
-        if (!bar?.close) return;
-        setRealTimePrice((prev) => {
-            if (!prev || !prev.price) return prev;
-            const updatedPrice = Math.round(bar.close * 100) / 100;
-            // Use previousClose from snapshot if available, else derive from initial quote
-            const previousClose = prev.previousClose ?? ((prev.price ?? 0) - (prev.change ?? 0));
-            if (!previousClose) {
-                // Still update price even without previousClose — just skip change% recalculation
-                return { ...prev, price: updatedPrice, close: bar.close, timestamp: bar.time * 1000 };
-            }
-            const change = bar.close - previousClose;
-            const changePct = parseFloat(((change / previousClose) * 100).toFixed(2));
-            return {
-                ...prev,
-                price: updatedPrice,
-                close: bar.close,
-                change: Math.round(change * 100) / 100,
-                changePercent: changePct,
-                timestamp: bar.time * 1000,
-            };
-        });
-    }, []);
-
     return {
         stockInfo,
         realTimePrice,
@@ -179,6 +151,5 @@ export function useStockData({
         overviewLoading,
         overlayData,
         marketStatus,
-        handleLatestBar
     };
 }
