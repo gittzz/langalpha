@@ -392,6 +392,81 @@ class TestDailyWatermarkStale:
 
 
 # ---------------------------------------------------------------------------
+# is_watermark_stale — daily post-close settle
+# ---------------------------------------------------------------------------
+
+class TestDailyPostCloseSettle:
+    """An envelope written mid-session holds a partial-day head candle — its
+    OHLCV froze at fetch time. Crossing a settledness rung (open→post at the
+    bell, post→closed after hours) must flag it stale so the head bar settles
+    at the official close; equal or descending rungs must not (weekend cache
+    hits stay byte-stable).
+    """
+
+    @staticmethod
+    def _daily_env(bar_date: datetime, *, stored_phase: str | None, fetched_at: float = 0) -> dict:
+        wm = int(datetime(bar_date.year, bar_date.month, bar_date.day, 0, 0, tzinfo=ET).timestamp() * 1000)
+        env = {"watermark": wm, "bars": [{"time": wm}], "market_phase": stored_phase}
+        if fetched_at:
+            env["fetched_at"] = fetched_at
+        return env
+
+    # Tue 2026-05-26 is a regular XNYS session.
+    MID_SESSION = datetime(2026, 5, 26, 12, 0, tzinfo=ET)
+    POST = datetime(2026, 5, 26, 17, 0, tzinfo=ET)
+    NIGHT = datetime(2026, 5, 26, 21, 0, tzinfo=ET)
+
+    def test_open_envelope_settles_at_the_bell(self):
+        env = self._daily_env(datetime(2026, 5, 26), stored_phase="open")
+        assert is_watermark_stale(env, "1day", now=self.POST, symbol="AAPL") is True
+
+    def test_open_envelope_settles_when_fully_closed(self):
+        env = self._daily_env(datetime(2026, 5, 26), stored_phase="open")
+        assert is_watermark_stale(env, "1day", now=self.NIGHT, symbol="AAPL") is True
+
+    def test_post_envelope_resettles_at_consolidated_close(self):
+        # A bar fetched right after the bell may predate the consolidated
+        # close — one more refetch when the venue fully closes.
+        env = self._daily_env(datetime(2026, 5, 26), stored_phase="post")
+        assert is_watermark_stale(env, "1day", now=self.NIGHT, symbol="AAPL") is True
+
+    def test_same_rung_is_fresh(self):
+        post_env = self._daily_env(datetime(2026, 5, 26), stored_phase="post")
+        assert is_watermark_stale(post_env, "1day", now=self.POST, symbol="AAPL") is False
+        open_env = self._daily_env(datetime(2026, 5, 26), stored_phase="open")
+        assert is_watermark_stale(open_env, "1day", now=self.MID_SESSION, symbol="AAPL") is False
+
+    def test_closed_envelope_stays_byte_stable_on_weekend(self):
+        saturday = datetime(2026, 5, 30, 10, 0, tzinfo=ET)
+        env = self._daily_env(datetime(2026, 5, 29), stored_phase="closed")
+        assert is_watermark_stale(env, "1day", now=saturday, symbol="AAPL") is False
+
+    def test_closed_envelope_next_premarket_is_fresh(self):
+        # Descending rung (closed → pre) must not refetch; the date-level
+        # checks own new-day transitions.
+        wed_premkt = datetime(2026, 5, 27, 8, 0, tzinfo=ET)
+        env = self._daily_env(datetime(2026, 5, 26), stored_phase="closed")
+        assert is_watermark_stale(env, "1day", now=wed_premkt, symbol="AAPL") is False
+
+    def test_cooldown_shields_fresh_fetches(self):
+        env = self._daily_env(datetime(2026, 5, 26), stored_phase="open", fetched_at=time.time())
+        assert is_watermark_stale(env, "1day", now=self.POST, symbol="AAPL") is False
+
+    def test_phaseless_envelope_skips_the_settle_check(self):
+        env = self._daily_env(datetime(2026, 5, 26), stored_phase=None)
+        assert is_watermark_stale(env, "1day", now=self.NIGHT, symbol="AAPL") is False
+
+    def test_hk_lunch_envelope_settles_after_hk_close(self):
+        # Non-US venue on its own calendar: an envelope written during the
+        # XHKG session (legacy phase "open") settles once HK closes.
+        hkt = ZoneInfo("Asia/Hong_Kong")
+        hk_evening = datetime(2026, 5, 26, 22, 0, tzinfo=hkt)
+        wm = int(datetime(2026, 5, 26, 0, 0, tzinfo=hkt).timestamp() * 1000)
+        env = {"watermark": wm, "bars": [{"time": wm}], "market_phase": "open"}
+        assert is_watermark_stale(env, "1day", now=hk_evening, symbol="0700.HK") is True
+
+
+# ---------------------------------------------------------------------------
 # clock_for — instrument → market clock classification
 # ---------------------------------------------------------------------------
 

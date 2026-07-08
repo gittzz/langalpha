@@ -38,6 +38,13 @@ _EMPTY_RESULT_TTL = 30  # short TTL for empty upstream results
 # this floor every request would bypass the cache with a blocking fetch.
 _DAILY_STALE_REFETCH_COOLDOWN = 120
 
+# Phase settledness ladder for the daily post-close settle check. A daily
+# envelope written in a less-settled phase than the venue is in now holds a
+# partial-day head candle frozen at fetch time; each rung climbed forces one
+# refetch (cooldown-bounded) so the bar settles at the official close (post)
+# and again at the consolidated close (closed).
+_PHASE_SETTLEDNESS = {"pre": 0, "open": 0, "post": 1, "closed": 2}
+
 def series_identity(symbol: str, interval: str, is_index: bool = False) -> tuple[str, str]:
     """(instrument_key, schema) for a legacy symbol + interval pair.
 
@@ -328,8 +335,10 @@ def is_watermark_stale(
     trading days ago even though the date-level check alone might miss it
     (e.g. a ``data_date`` that got refreshed without the bars advancing).
 
-    Daily (``1day``) is checked at the DATE level: the newest bar's trading
-    date (in the instrument's exchange tz) vs the clock's
+    Daily (``1day``) is checked at the DATE level, plus a post-close settle
+    check (an envelope written mid-session must refetch once the venue phase
+    settles, or its head bar stays a frozen partial-day candle): the newest
+    bar's trading date (in the instrument's exchange tz) vs the clock's
     ``expected_latest_daily_date()`` (the newest bar that should exist now —
     the previous trading day during pre-market, since today's daily bar
     doesn't appear until the session opens). This is the only backstop daily
@@ -365,7 +374,18 @@ def is_watermark_stale(
         last_bar_date = watermark_to_date_str(envelope.get("watermark"), tz=clock.tz)
         if last_bar_date is None:
             return True  # bars present but unusable watermark — corrupt
-        return last_bar_date < clock.expected_latest_daily_date(now)
+        if last_bar_date < clock.expected_latest_daily_date(now):
+            return True
+        # Post-close settle: an envelope written mid-session holds a partial
+        # head candle (OHLCV frozen at fetch time). Once the venue reaches a
+        # more settled phase the head bar must be refetched or it serves the
+        # partial values all evening.
+        stored_phase = envelope.get("market_phase")
+        if stored_phase is not None:
+            now_rank = _PHASE_SETTLEDNESS.get(clock.market_phase(now), 0)
+            if now_rank > _PHASE_SETTLEDNESS.get(stored_phase, 0):
+                return True
+        return False
     # Empty envelopes (no bars in requested window) are not meaningfully stale
     # on a watermark basis — there's nothing to be behind. They're deliberately
     # cached with a short _EMPTY_RESULT_TTL to dampen fetch storms for symbols
