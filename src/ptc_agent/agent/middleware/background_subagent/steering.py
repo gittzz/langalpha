@@ -90,8 +90,17 @@ class SubagentSteeringMiddleware(AgentMiddleware):
                 return None
 
             content = "\n".join(parsed) if len(parsed) > 1 else parsed[0]
+            # Stamp the delivered payload so checkpoint-sourced replay can
+            # re-emit steering_delivered without the captured SSE stream.
             human_msg = HumanMessage(
-                content=f"[Follow-up Instructions from Orchestrator]\n{content}"
+                content=f"[Follow-up Instructions from Orchestrator]\n{content}",
+                additional_kwargs={
+                    "lc_source": "steering",
+                    "steering_delivered": {
+                        "content": content,
+                        "count": len(parsed),
+                    },
+                },
             )
 
             logger.info(

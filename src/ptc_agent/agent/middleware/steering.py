@@ -89,8 +89,27 @@ class SteeringMiddleware(AgentMiddleware):
                 ]
                 content = "\n".join(lines)
 
+            # Delivered payload rides both the live SSE event and the injected
+            # message's additional_kwargs, so checkpoint-sourced replay can
+            # re-emit steering_delivered without the stored SSE stream.
+            delivered = {
+                "count": len(parsed),
+                "messages": [
+                    {
+                        "content": q.get("content", ""),
+                        "user_id": q.get("user_id"),
+                        "timestamp": q.get("timestamp"),
+                    }
+                    for q in parsed
+                ],
+                "timestamp": time.time(),
+            }
             human_msg = HumanMessage(
-                content=f"[Steering from User]\n{content}"
+                content=f"[Steering from User]\n{content}",
+                additional_kwargs={
+                    "lc_source": "steering",
+                    "steering_delivered": delivered,
+                },
             )
 
             logger.info(
@@ -104,16 +123,7 @@ class SteeringMiddleware(AgentMiddleware):
                     {
                         "type": "steering_delivered",
                         "thread_id": thread_id,
-                        "count": len(parsed),
-                        "messages": [
-                            {
-                                "content": q.get("content", ""),
-                                "user_id": q.get("user_id"),
-                                "timestamp": q.get("timestamp"),
-                            }
-                            for q in parsed
-                        ],
-                        "timestamp": time.time(),
+                        **delivered,
                     }
                 )
             except Exception:
