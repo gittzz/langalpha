@@ -44,12 +44,37 @@ def _make_middleware(primary_client, fallbacks=(), **kwargs):
 
 @pytest.fixture
 def events(monkeypatch):
-    """Capture custom stream events emitted via get_stream_writer()."""
+    """Capture custom stream events emitted via get_stream_writer().
+
+    Retry events go through the raw writer; fallback events go through
+    ``push_ui_message``, which resolves the writer + config from
+    ``langgraph.graph.ui``'s namespace and needs ``CONFIG_KEY_SEND`` for its
+    state write — patch both so ui records land in the same capture list.
+    """
+    from langgraph._internal._constants import CONFIG_KEY_SEND
+    from langgraph.constants import CONF
+
     captured = []
     monkeypatch.setattr(
         "langgraph.config.get_stream_writer", lambda: captured.append
     )
+    monkeypatch.setattr(
+        "langgraph.graph.ui.get_stream_writer", lambda: captured.append
+    )
+    monkeypatch.setattr(
+        "langgraph.graph.ui.get_config",
+        lambda: {CONF: {CONFIG_KEY_SEND: lambda writes: None}},
+    )
     return captured
+
+
+def _fallback_props(events):
+    """Props of captured model_fallback ui records, in emission order."""
+    return [
+        e["props"]
+        for e in events
+        if e.get("type") == "ui" and e.get("name") == "model_fallback"
+    ]
 
 
 class TestSuccessPath:
@@ -125,12 +150,13 @@ class TestRetryBehavior:
         assert result == "ok-from-fallback"
         # Exactly ONE attempt on the primary (no retries on a 404), then fallback
         assert calls == [client, fallback_client]
-        assert [e["type"] for e in events] == ["model_fallback"]
-        assert events[0]["from_model"] == "primary-model"
-        assert events[0]["to_model"] == "fallback-a"
-        assert events[0]["from_is_primary"] is True
-        assert events[0]["attempts_on_from"] == 1
-        assert events[0]["status_code"] == 404
+        fallbacks = _fallback_props(events)
+        assert len(fallbacks) == 1 and len(events) == 1
+        assert fallbacks[0]["from_model"] == "primary-model"
+        assert fallbacks[0]["to_model"] == "fallback-a"
+        assert fallbacks[0]["from_is_primary"] is True
+        assert fallbacks[0]["attempts_on_from"] == 1
+        assert fallbacks[0]["status_code"] == 404
 
 
 class TestFallbackChain:
@@ -150,7 +176,7 @@ class TestFallbackChain:
 
         result = await mw.awrap_model_call(_FakeRequest(client), handler)
         assert result == "ok"
-        switches = [e for e in events if e["type"] == "model_fallback"]
+        switches = _fallback_props(events)
         assert [(s["from_model"], s["to_model"], s["from_is_primary"]) for s in switches] == [
             ("primary-model", "fallback-a", True),
             ("fallback-a", "fallback-b", False),
@@ -247,7 +273,7 @@ class TestRobustness:
             return "ok"
 
         assert mw.wrap_model_call(_FakeRequest(client), handler) == "ok"
-        assert [e["type"] for e in events] == ["model_fallback"]
+        assert [p["to_model"] for p in _fallback_props(events)] == ["fallback-a"]
 
     def test_sync_retry_loop_parity(self, events):
         client = _FakeModel("primary-model")

@@ -182,17 +182,25 @@ class ModelResilienceMiddleware(AgentMiddleware):
     def _emit_fallback(
         self, record: _AttemptRecord, to_model: str, *, from_is_primary: bool
     ) -> None:
-        self._emit(
-            {
-                "type": "model_fallback",
-                "from_model": record.model,
-                "to_model": to_model,
-                "from_is_primary": from_is_primary,
-                "error": _summarize_error(record.exc),
-                "status_code": record.status_code,
-                "attempts_on_from": record.attempts,
-            }
-        )
+        # Unlike retries, fallbacks must survive replay: push_ui_message
+        # dual-writes the record to the custom stream (live SSE) and the
+        # checkpointed ``ui`` channel, which replay projects per turn.
+        props = {
+            "from_model": record.model,
+            "to_model": to_model,
+            "from_is_primary": from_is_primary,
+            "error": _summarize_error(record.exc),
+            "status_code": record.status_code,
+            "attempts_on_from": record.attempts,
+        }
+        try:
+            from langgraph.graph.ui import push_ui_message
+
+            push_ui_message(name="model_fallback", props=props)
+        except Exception:
+            # Runtime context is unavailable outside a graph run (tests, sync
+            # invocations); resilience must not depend on it.
+            logger.debug("[ModelResilience] ui emit unavailable, skipping fallback event")
 
     def _raise_exhausted(self, records: list[_AttemptRecord]) -> NoReturn:
         primary = records[0]

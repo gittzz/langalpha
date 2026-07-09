@@ -1347,6 +1347,41 @@ class TestModelResilienceEvents:
         assert "model_fallback" in [e["event"] for e in persisted]
 
     @pytest.mark.asyncio
+    async def test_model_fallback_ui_record_unwraps_to_legacy_shape(self):
+        # push_ui_message wraps the payload in a langgraph ui record; the
+        # handler must unwrap it to the same wire shape as the legacy event.
+        handler = self._make_handler()
+        chunks = await self._collect(
+            handler,
+            [
+                {
+                    "type": "ui",
+                    "id": "ui-abc123",
+                    "name": "model_fallback",
+                    "props": {
+                        "from_model": "primary-model",
+                        "to_model": "fallback-a",
+                        "from_is_primary": True,
+                        "error": "Error code: 404 https://user:secret@host/v1",
+                        "status_code": 404,
+                        "attempts_on_from": 1,
+                    },
+                    "metadata": {},
+                }
+            ],
+        )
+        data = self._find_event(chunks, "model_fallback")
+        assert data is not None
+        assert data["from_model"] == "primary-model"
+        assert data["to_model"] == "fallback-a"
+        assert data["agent"] == "main"
+        assert "secret" not in data["error"]
+        # No artifact event leaks from the generic ui passthrough
+        assert self._find_event(chunks, "artifact") is None
+        persisted = handler.get_sse_events() or []
+        assert "model_fallback" in [e["event"] for e in persisted]
+
+    @pytest.mark.asyncio
     async def test_subagent_namespace_attributed(self):
         handler = self._make_handler()
         chunks = await self._collect(
