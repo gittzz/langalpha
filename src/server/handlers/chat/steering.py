@@ -98,7 +98,12 @@ async def drain_pending_steerings(thread_id: str) -> list[dict] | None:
 
     try:
         key = f"workflow:steering:{thread_id}"
-        pipe = cache.client.pipeline()
+        # transaction=True (MULTI/EXEC) is load-bearing, not incidental: the
+        # LRANGE+DELETE must be atomic so it can never interleave with a
+        # concurrent ``unsteer_thread`` LREM. That atomicity is what gives
+        # wait_or_steer's reclaim its delivered-XOR-reclaimed guarantee — a
+        # message is returned here or reclaimed there, never both, never lost.
+        pipe = cache.client.pipeline(transaction=True)
         pipe.lrange(key, 0, -1)
         pipe.delete(key)
         results = await pipe.execute()
@@ -136,7 +141,9 @@ async def steer_thread(
         user_id: User identifier
 
     Returns:
-        Dict with queue position if successful, None if steering failed
+        Dict with queue position and the exact queued payload (for a
+        possible ``unsteer_thread`` reclaim) if successful, None if
+        steering failed
     """
     from src.utils.cache.redis_cache import get_cache_client
 
@@ -159,10 +166,33 @@ async def steer_thread(
             f"[CHAT] Steering for running workflow: "
             f"thread_id={thread_id} position={position}"
         )
-        return {"position": position}
+        return {"position": position, "payload": message}
     except Exception as e:
         logger.error(f"[CHAT] Failed to steer thread: {e}")
         return None
+
+
+async def unsteer_thread(thread_id: str, payload: str) -> bool:
+    """Reclaim a just-pushed steering message by exact payload (``LREM``).
+
+    Used by ``wait_or_steer`` when the workflow turned out to have exited
+    between the admission snapshot and the push. True means the message was
+    still queued (nothing consumed it); False means a drain got it first —
+    the caller must then treat the steer as delivered-or-returned, not lost.
+    """
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if not cache.enabled or not cache.client:
+        return False
+
+    try:
+        key = f"workflow:steering:{thread_id}"
+        removed = await cache.client.lrem(key, 1, payload)
+        return bool(removed)
+    except Exception as e:
+        logger.error(f"[CHAT] Failed to unsteer thread: {e}")
+        return False
 
 
 async def steer_subagent(

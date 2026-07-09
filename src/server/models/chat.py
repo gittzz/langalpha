@@ -245,6 +245,16 @@ class ChatRequest(BaseModel):
         default=False,
         description="When True, agent must submit a plan for approval via submit_plan tool before execution",
     )
+    steer_only: bool = Field(
+        default=False,
+        description="When True, this POST may only steer an in-flight workflow; "
+        "if the thread has none, reject with admission-conflict "
+        "code='not_running' (an SSE error event once the stream has started, "
+        "HTTP 409 otherwise) instead of starting a new turn. Set by gateway "
+        "steer probes, whose SSE readers ignore turn events — without this, a "
+        "steer racing the workflow's exit silently spawns a turn whose output "
+        "(interrupts included) is dropped.",
+    )
 
     # Interrupt/resume support (HITL)
     hitl_response: Optional[Dict[str, HITLResponse]] = Field(

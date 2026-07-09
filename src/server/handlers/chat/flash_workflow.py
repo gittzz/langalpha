@@ -194,26 +194,21 @@ async def astream_flash_workflow(
         # on the same thread, and ``qr_db.create_query`` uses ``ON CONFLICT
         # (thread_id, turn_index) DO UPDATE``, so a second ``persist_query_start``
         # here would overwrite the running turn's query content with the
-        # steering text. Dispatched flow owns the BTM placeholder ``threads.py``
-        # already reserved for it under the same ``(thread_id, run_id)`` key. We
-        # still must guarantee at most one in-flight LangGraph ``astream`` per
-        # ``thread_id`` (the checkpointer is thread-keyed), so admit only when
-        # no OTHER run is active on the thread. ``exclude_run_id`` skips our own
-        # placeholder; a running or still-stopping peer means 409.
-        if dispatched:
-            state = await manager.wait_for_admission(
-                thread_id, exclude_run_id=run_id
-            )
-            if state != "fresh":
-                raise HTTPException(
-                    status_code=409,
-                    detail=admission_conflict_detail(thread_id, state),
-                )
-            ready, steering_event = True, None
-        else:
-            ready, steering_event = await wait_or_steer(
-                manager, thread_id, user_input, user_id
-            )
+        # steering text. Admit a fresh turn, steer the running one, or 409 —
+        # see ``wait_or_steer``. Dispatched flows own the pre-registered
+        # ``(thread_id, run_id)`` placeholder, so they pass it as
+        # ``exclude_run_id`` (ignore it in the admission scan) and
+        # ``can_steer=False`` (any OTHER in-flight run is a hard conflict,
+        # never a steer). Foreground turns steer.
+        ready, steering_event = await wait_or_steer(
+            manager,
+            thread_id,
+            user_input,
+            user_id,
+            steer_only=request.steer_only,
+            can_steer=not dispatched,
+            exclude_run_id=run_id if dispatched else None,
+        )
         if not ready:
             slot_owned = False
             await release_burst_slot(user_id)
@@ -584,7 +579,12 @@ async def astream_flash_workflow(
             # Race condition: another request registered first -- queue the
             # message. The admission lock should normally prevent reaching
             # this branch, but it's kept as a belt-and-braces fallback.
-            result = await steer_thread(thread_id, user_input, user_id)
+            # Dispatched flows (can_steer=False) must never steer, even in this
+            # fallback: leave result None so they fall through to the 409, same
+            # as the primary wait_or_steer path.
+            result = None if dispatched else await steer_thread(
+                thread_id, user_input, user_id
+            )
             if result:
                 slot_owned = False
                 await release_burst_slot(user_id)
@@ -601,14 +601,7 @@ async def astream_flash_workflow(
                 return
 
             raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "running",
-                    "message": (
-                        "The workflow is still running. Wait a moment, then "
-                        "retry — or use /reconnect to continue, /cancel to stop."
-                    ),
-                },
+                status_code=409, detail=admission_conflict_detail("running")
             )
         else:
             slot_owned = False  # Manager owns burst slot release from here

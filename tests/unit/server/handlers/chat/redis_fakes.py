@@ -75,11 +75,12 @@ class FakeClient:
         lst = self.lists.get(key, [])
         return lst[index] if -len(lst) <= index < len(lst) else None
 
-    async def lrem(self, key, count, value) -> None:
+    async def lrem(self, key, count, value) -> int:
         lst = self.lists.get(key, [])
         if count == 0:
-            self.lists[key] = [x for x in lst if x != value]
-            return
+            kept = [x for x in lst if x != value]
+            self.lists[key] = kept
+            return len(lst) - len(kept)
         removed = 0
         out = []
         for x in lst:
@@ -88,6 +89,7 @@ class FakeClient:
                 continue
             out.append(x)
         self.lists[key] = out
+        return removed
 
     async def llen(self, key) -> int:
         return len(self.lists.get(key, []))
