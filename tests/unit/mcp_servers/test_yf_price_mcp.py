@@ -7,6 +7,7 @@ yfinance is mocked — no live network.
 
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -185,6 +186,101 @@ class TestGetStockHistory:
             result, "upstream_error", symbol="AAPL",
             detail_excludes=("Network error",),
         )
+
+
+# ============================================================================
+# NaN bars (yfinance placeholder / in-progress session rows)
+# ============================================================================
+
+
+class TestNaNBarHandling:
+    """yfinance appends a placeholder bar for an in-progress or dataless session
+    whose OHLC is NaN (timing-dependent — this is what makes VOD.L history flaky
+    around LSE hours). NaN is not valid JSON and a priceless bar is not a real
+    observation, so such rows must be dropped before serialization."""
+
+    @patch("mcp_servers.yf_price_mcp_server.yf.Ticker")
+    def test_trailing_nan_bar_dropped(self, mock_ticker_cls):
+        dates = pd.date_range("2024-01-01", periods=4, freq="D")
+        df = pd.DataFrame(
+            {
+                "Open": [150.0, 151.0, 152.0, np.nan],
+                "High": [152.0, 153.0, 154.0, np.nan],
+                "Low": [149.0, 150.0, 151.0, np.nan],
+                "Close": [151.0, 152.0, 153.0, np.nan],
+                "Volume": [1000000, 1100000, 1200000, 0],
+            },
+            index=dates,
+        )
+        mock_ticker_cls.return_value.history.return_value = df
+        result = get_stock_history("AAPL")
+
+        assert_ok_envelope(result, count=3)  # placeholder bar dropped
+        closes = [row["close"] for row in result["data"]]
+        assert all(isinstance(c, float) and c == c for c in closes)  # no NaN
+        assert result["data"][-1]["close"] == 153.0  # last surviving bar is real
+
+    @patch("mcp_servers.yf_price_mcp_server.yf.Ticker")
+    def test_all_nan_bars_is_not_found(self, mock_ticker_cls):
+        dates = pd.date_range("2024-01-01", periods=2, freq="D")
+        df = pd.DataFrame(
+            {
+                "Open": [np.nan, np.nan],
+                "High": [np.nan, np.nan],
+                "Low": [np.nan, np.nan],
+                "Close": [np.nan, np.nan],
+                "Volume": [0, 0],
+            },
+            index=dates,
+        )
+        mock_ticker_cls.return_value.history.return_value = df
+        result = get_stock_history("AAPL")
+
+        # Every bar dropped → same as an empty frame → not_found, never a crash.
+        assert_error(result, "not_found", symbol="AAPL")
+
+    @patch("mcp_servers.yf_price_mcp_server.yf.Ticker")
+    def test_nan_volume_on_valid_price_bar_coerced(self, mock_ticker_cls):
+        """A priced bar with a missing volume is kept (volume → 0), not dropped
+        and not crashed on int(NaN)."""
+        dates = pd.date_range("2024-01-01", periods=2, freq="D")
+        df = pd.DataFrame(
+            {
+                "Open": [150.0, 151.0],
+                "High": [152.0, 153.0],
+                "Low": [149.0, 150.0],
+                "Close": [151.0, 152.0],
+                "Volume": [1000000, np.nan],
+            },
+            index=dates,
+        )
+        mock_ticker_cls.return_value.history.return_value = df
+        result = get_stock_history("AAPL")
+
+        assert_ok_envelope(result, count=2)
+        assert result["data"][1]["close"] == 152.0
+        assert result["data"][1]["volume"] == 0
+
+    @patch("mcp_servers.yf_price_mcp_server.yf.Ticker")
+    def test_multi_history_drops_nan_bars(self, mock_ticker_cls):
+        dates = pd.date_range("2024-01-01", periods=3, freq="D")
+        df = pd.DataFrame(
+            {
+                "Open": [150.0, 151.0, np.nan],
+                "High": [152.0, 153.0, np.nan],
+                "Low": [149.0, 150.0, np.nan],
+                "Close": [151.0, 152.0, np.nan],
+                "Volume": [1000000, 1100000, 0],
+            },
+            index=dates,
+        )
+        mock_ticker_cls.return_value.history.return_value = df
+        result = get_multiple_stocks_history(["AAPL"])
+
+        assert result["data"]["AAPL"]["count"] == 2
+        assert result["count"] == 2
+        closes = [row["close"] for row in result["data"]["AAPL"]["data"]]
+        assert all(c == c for c in closes)  # no NaN
 
 
 # ============================================================================
