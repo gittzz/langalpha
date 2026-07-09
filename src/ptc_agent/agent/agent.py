@@ -65,6 +65,7 @@ from ptc_agent.core.paths import (
     USER_PROFILE_DATA_DIR,
 )
 from ptc_agent.agent.backends.user_data import UserDataBackend
+from ptc_agent.agent.middleware.image_capture import ImageCaptureMiddleware
 from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
@@ -655,6 +656,12 @@ class PTCAgent:
 
         model_resilience = self._build_model_resilience_middleware()
 
+        # Placed before (outer to) model_resilience so sandbox images are
+        # captured once, on the final response only — not per retry attempt.
+        image_capture = (
+            ImageCaptureMiddleware(session=session) if session is not None else None
+        )
+
         # SubagentSteeringMiddleware must be first so follow-up messages are visible before other middleware.
         subagent_middleware = [
             m
@@ -664,6 +671,7 @@ class PTCAgent:
                     backend=backend, eviction_dir=eviction_dir
                 ),
                 *shared_middleware,
+                image_capture,
                 compaction,
                 *model_resilience,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
@@ -713,6 +721,7 @@ class PTCAgent:
                 ),
                 *shared_middleware,
                 *main_only_middleware,
+                image_capture,
                 compaction,
                 *model_resilience,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
