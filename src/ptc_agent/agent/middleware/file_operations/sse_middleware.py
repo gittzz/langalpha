@@ -25,12 +25,11 @@ Event Structure (ordered fields):
 
 import logging
 from datetime import datetime, timezone
-from typing import Annotated, Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
 from typing_extensions import NotRequired
 from langgraph.config import get_stream_writer
-from ptc_agent.utils.file_operations import _file_operations_log_reducer
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +41,6 @@ class FileOperationState(AgentState):
     during tool execution, enabling agent name extraction in middleware.
     """
     current_agent: NotRequired[str] = "unknown"
-    file_operations_log: Annotated[NotRequired[list[dict[str, Any]]], _file_operations_log_reducer]
-    """Persistent audit trail of all file operations during workflow execution."""
 
 
 class FileOperationMiddleware(AgentMiddleware):
