@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from src.server.database import conversation as qr_db
 from src.observability.tracing import safe_aspan
+from src.server.utils.error_sanitization import sanitize_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -560,6 +561,10 @@ class ConversationPersistenceService:
 
             if errors is None:
                 errors = [error_message]
+            errors = [
+                sanitize_error_text(error) if isinstance(error, str) else error
+                for error in errors
+            ]
 
             async with qr_db.get_db_connection() as conn:
                 async with conn.transaction():

@@ -1,7 +1,7 @@
 """
 Generic Tool Result Cache Middleware
 
-Automatically caches specified tool results to configured cache files with SSE event emission.
+Automatically caches specified tool results to configured cache files.
 Replaces manual cache file creation and provides flexible, reusable caching for any tool set.
 """
 
@@ -24,14 +24,13 @@ class ToolResultCacheMiddleware(AgentMiddleware):
     Generic middleware for automatically caching tool results to filesystem.
 
     This middleware intercepts specified tool calls and appends their results
-    to a configured cache file. SSE events are emitted to match actual agent behavior
-    (write_file for first creation, edit_file for subsequent appends).
+    to a configured cache file (write for first creation, append for subsequent
+    tool calls).
 
     Features:
     - Configurable tool monitoring
     - Configurable cache file path
     - Optional agent type filtering
-    - Automatic SSE event emission
     - Non-fatal error handling
 
     Example Usage:

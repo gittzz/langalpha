@@ -28,9 +28,13 @@ _KEY_PREFIX = "replay:turn:v1"
 # skip caching rather than bloat Redis — replay just rebuilds those threads.
 _MAX_ENTRY_BYTES = 512 * 1024
 
-# Strong refs to in-flight refresh tasks (create_task results are otherwise
-# GC-eligible).
-_refresh_tasks: set[asyncio.Task] = set()
+# One strong-referenced runner per thread (create_task results are otherwise
+# GC-eligible). A trigger that arrives while its runner is active marks the
+# thread dirty; the same runner performs one coalesced follow-up pass after the
+# current pass finishes. This preserves refresh generation order, so an older
+# snapshot can never finish after and overwrite a newer one.
+_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+_refresh_dirty: set[str] = set()
 
 
 def _key(thread_id: str, tail_checkpoint_id: str) -> str:
@@ -83,8 +87,8 @@ async def task_streams_live(thread_id: str, task_ids: set[str]) -> bool:
 
     A turn whose projected subagent transcript is still growing must not be
     cached: task-ns writes never move the main-branch tail, so a frozen
-    partial transcript would never self-heal. A missing stream (TTL-expired
-    or never spilled) counts as terminal; verification failures count as
+    partial transcript would never self-heal. Only an explicit end sentinel
+    proves terminal here. Missing streams and verification failures count as
     live (conservative — skip caching rather than freeze a partial).
     """
     if not task_ids:
@@ -92,7 +96,8 @@ async def task_streams_live(thread_id: str, task_ids: set[str]) -> bool:
     client = get_cache_client().client
     if client is None:
         return True
-    for task_id in task_ids:
+
+    async def _task_live(task_id: str) -> bool:
         try:
             entries = await client.xrevrange(
                 f"subagent:stream:{thread_id}:{task_id}", count=1
@@ -102,15 +107,16 @@ async def task_streams_live(thread_id: str, task_ids: set[str]) -> bool:
                 f"[ProjectionCache] task stream check failed for "
                 f"{thread_id}/{task_id}: {e}"
             )
-            return True
+            return True  # conservative: skip caching rather than freeze a partial
         if not entries:
-            continue
+            return True
         raw = entries[0][1].get(b"event") or entries[0][1].get("event")
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
-        if not _is_stream_end_sentinel(raw):
-            return True
-    return False
+        return not _is_stream_end_sentinel(raw)
+
+    liveness = await asyncio.gather(*(_task_live(task_id) for task_id in task_ids))
+    return any(liveness)
 
 
 def _is_stream_end_sentinel(raw: Any) -> bool:
@@ -134,18 +140,51 @@ def _is_stream_end_sentinel(raw: Any) -> bool:
     )
 
 
+def _refresh_done(thread_id: str, task: asyncio.Task[None]) -> None:
+    """Drop a completed runner without clobbering a newer replacement task."""
+    if _refresh_tasks.get(thread_id) is task:
+        _refresh_tasks.pop(thread_id, None)
+        _refresh_dirty.discard(thread_id)
+
+
+async def _run_projection_refreshes(thread_id: str) -> None:
+    """Run refreshes serially, coalescing overlapping triggers per thread."""
+    while True:
+        # Triggers arriving after this point mark the pass dirty and force one
+        # follow-up pass. Multiple triggers during the same pass coalesce.
+        _refresh_dirty.discard(thread_id)
+        await refresh_thread_projection(thread_id)
+        if thread_id not in _refresh_dirty:
+            return
+
+
 def schedule_projection_refresh(thread_id: str) -> None:
-    """Fire-and-forget post-persist warm-up of the thread's last two turns."""
+    """Fire-and-forget post-persist warm-up of the thread's last two turns.
+
+    At most one runner executes per thread. A trigger overlapping an active
+    pass requests a coalesced follow-up pass, preserving snapshot write order.
+    """
     if not cache_active():
         return
     try:
-        task = asyncio.get_running_loop().create_task(
-            refresh_thread_projection(thread_id)
-        )
+        loop = asyncio.get_running_loop()
     except RuntimeError:  # no running loop (sync test contexts)
         return
-    _refresh_tasks.add(task)
-    task.add_done_callback(_refresh_tasks.discard)
+
+    current = _refresh_tasks.get(thread_id)
+    if current is not None and not current.done():
+        _refresh_dirty.add(thread_id)
+        return
+
+    # A completed task's callback may not have run yet. Install the replacement
+    # first; _refresh_done's identity guard prevents the old callback from
+    # removing it.
+    _refresh_dirty.discard(thread_id)
+    task = loop.create_task(_run_projection_refreshes(thread_id))
+    _refresh_tasks[thread_id] = task
+    task.add_done_callback(
+        lambda completed, tid=thread_id: _refresh_done(tid, completed)
+    )
 
 
 async def refresh_thread_projection(thread_id: str) -> None:

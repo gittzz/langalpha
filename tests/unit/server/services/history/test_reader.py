@@ -7,6 +7,8 @@ the same recipe production uses against Postgres.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -17,7 +19,12 @@ from langgraph.types import Command, interrupt
 
 from ptc_agent.agent.middleware.compaction.types import CompactionState
 from ptc_agent.agent.state import DeltaAgentState
-from src.server.services.history.reader import CheckpointHistoryReader
+from src.server.services.history.reader import (
+    CheckpointHistoryReader,
+    TaskHistory,
+    _ReaderState,
+)
+from src.server.utils.checkpoint_helpers import CheckpointBranchTipNotFound
 
 pytestmark = pytest.mark.asyncio
 
@@ -122,6 +129,16 @@ async def test_edit_branch_follows_requested_tip():
 
     original = await reader.aget_thread_history(THREAD, original_tip)
     assert [t.user_message.content for t in original.turns] == ["q0", "q1", "q2"]
+
+
+async def test_missing_requested_tip_fails_instead_of_reading_newest():
+    saver = InMemorySaver()
+    graph = _echo_graph(saver)
+    await _run_turns(graph, 1)
+
+    reader = CheckpointHistoryReader(saver)
+    with pytest.raises(CheckpointBranchTipNotFound, match="missing-tip"):
+        await reader.aget_thread_history(THREAD, "missing-tip")
 
 
 async def test_regenerate_branch_reuses_input_boundary():
@@ -238,11 +255,31 @@ async def test_task_namespace_transcript():
 
     # Background subagents run their own graph against the parent thread_id
     # with an explicit checkpoint_ns — mirror that write path.
+    summary_message = HumanMessage(content="task summary", id="task-summary")
+    summarization_event = {
+        "cutoff_index": 1,
+        "summary_message": summary_message,
+        "file_path": None,
+    }
+    task_ui = {
+        "type": "ui",
+        "id": "task-ui-1",
+        "name": "model_fallback",
+        "props": {"from_model": "primary", "to_model": "fallback"},
+        "metadata": {},
+    }
+
     sub_graph = (
-        StateGraph(DeltaAgentState)
+        StateGraph(_ReaderState)
         .add_node(
             "agent",
-            lambda s: {"messages": [AIMessage(content="subagent reply", id="sub-ai-1")]},
+            lambda s: {
+                "messages": [AIMessage(content="subagent reply", id="sub-ai-1")],
+                "_summarization_event": summarization_event,
+                "_offloaded_tool_call_ids": {"tc-1", "tc-2"},
+                "_offloaded_read_result_ids": {"read-1"},
+                "ui": [task_ui],
+            },
         )
         .add_edge(START, "agent")
         .compile(checkpointer=saver)
@@ -259,6 +296,18 @@ async def test_task_namespace_transcript():
     )
 
     reader = CheckpointHistoryReader(saver)
+    task_history = await reader.aget_task_history(THREAD, "tsk1")
+    assert isinstance(task_history, TaskHistory)
+    assert [m.content for m in task_history.messages] == [
+        "sub prompt",
+        "subagent reply",
+    ]
+    assert task_history.new_summarization_event == summarization_event
+    assert task_history.newly_offloaded_args == 2
+    assert task_history.newly_offloaded_reads == 1
+    assert task_history.new_ui_records == [task_ui]
+
+    # Compatibility surface delegates to the full materialization.
     messages = await reader.aget_task_messages(THREAD, "tsk1")
     assert [m.content for m in messages] == ["sub prompt", "subagent reply"]
 
@@ -328,6 +377,21 @@ async def test_append_ui_record_skipped_on_interrupted_tip():
     # The skipped record did not land.
     history = await reader.aget_thread_history(THREAD)
     assert history.ui == []
+
+
+async def test_append_ui_record_skipped_when_interrupt_check_fails(monkeypatch):
+    reader = CheckpointHistoryReader(InMemorySaver())
+    interrupt_check = AsyncMock(side_effect=RuntimeError("checkpoint unavailable"))
+    update = AsyncMock()
+    monkeypatch.setattr(reader._checkpointer, "aget_tuple", interrupt_check)
+    monkeypatch.setattr(reader._updater, "aupdate_state", update)
+
+    await reader.append_ui_record(
+        THREAD, "image_capture", {"path_to_url": {"a.png": "https://x/a"}}
+    )
+
+    interrupt_check.assert_awaited_once()
+    update.assert_not_awaited()
 
 
 async def test_new_ui_records_attributed_to_their_turn():

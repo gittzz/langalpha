@@ -2988,12 +2988,16 @@ async def get_replay_thread_data(
             )
             responses = [dict(r) for r in await cur.fetchall()]
 
-            # 5. Usage rows (table-sourced credit_usage reconstruction)
+            # 5. Main-workflow usage rows (table-sourced credit_usage
+            # reconstruction). Background subagents persist additional
+            # msg_type='task' rows under the same response id, but the live
+            # credit_usage event represents the main workflow only.
             await cur.execute(
-                """SELECT conversation_response_id, token_usage, total_credits,
-                          created_at
+                """SELECT conversation_response_id, msg_type, token_usage,
+                          total_credits, created_at
                    FROM conversation_usages
                    WHERE conversation_thread_id = %s
+                     AND msg_type <> 'task'
                    ORDER BY created_at ASC""",
                 (thread_id,),
             )

@@ -31,6 +31,9 @@ from src.config.settings import (
 )
 from opentelemetry.trace import Status, StatusCode
 from src.observability.tracing import tracer as _otel_tracer
+from src.server.utils.error_sanitization import (
+    sanitize_error_text as _sanitize_error_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,43 +192,10 @@ _UPSTREAM_MODULE_PREFIXES: tuple[str, ...] = (
 
 _STATUS_CODE_RE = re.compile(r"\b([45]\d{2})\b")
 
-# Strip basic-auth credentials out of any URL that leaks into an exception
-# message (httpx will include the request URL in ``str(exc)``; a user who
-# configured a BYOK base_url as ``https://user:pass@host`` would otherwise
-# ship that secret to the SSE client and the replay log).
-_URL_USERINFO_RE = re.compile(r"(https?://)[^@/\s]+@")
-
-# Provider exceptions can echo request headers or key params back in their
-# message (some OpenAI-compatible proxies do). Mask the common credential
-# shapes before the text reaches the SSE client or the persisted replay log.
-_BEARER_TOKEN_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
-_KEY_PARAM_RE = re.compile(
-    r"(?i)\b(api[-_]?key|x-api-key|authorization|access[-_]?token|client[-_]?secret)"
-    r"(\s*[=:]\s*)([\"']?)[A-Za-z0-9._~+/=-]{8,}"
-)
-_SK_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
-# Bare ``?key=``/``&token=`` URL query params — Google-style SDKs put the API
-# key in the query string and httpx echoes the full request URL in the
-# exception text, which ``_KEY_PARAM_RE`` (label-prefixed shapes) misses.
-_URL_KEY_QUERY_RE = re.compile(
-    r"(?i)([?&](?:key|apikey|token|secret|password|credential)=)[^&\s\"']+"
-)
-_GOOGLE_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{16,}\b")
-
 
 def _parse_status_from_message(text: str) -> Optional[int]:
     match = _STATUS_CODE_RE.search(text)
     return int(match.group(1)) if match else None
-
-
-def _sanitize_error_text(text: str) -> str:
-    """Scrub credentials out of the raw exception text before we send it."""
-    text = _URL_USERINFO_RE.sub(r"\1", text)
-    text = _BEARER_TOKEN_RE.sub(r"\1 [REDACTED]", text)
-    text = _KEY_PARAM_RE.sub(r"\1\2\3[REDACTED]", text)
-    text = _URL_KEY_QUERY_RE.sub(r"\1[REDACTED]", text)
-    text = _SK_TOKEN_RE.sub("[REDACTED]", text)
-    return _GOOGLE_KEY_RE.sub("[REDACTED]", text)
 
 
 def find_resilience_trace(exc: BaseException) -> Optional[Dict[str, Any]]:

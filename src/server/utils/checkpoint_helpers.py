@@ -25,6 +25,17 @@ logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+class CheckpointBranchTipNotFound(LookupError):
+    """A requested checkpoint branch tip is absent from the thread history."""
+
+    def __init__(self, thread_id: str, checkpoint_id: str) -> None:
+        self.thread_id = thread_id
+        self.checkpoint_id = checkpoint_id
+        super().__init__(
+            f"Checkpoint branch tip {checkpoint_id!r} not found for thread {thread_id!r}"
+        )
+
+
 def build_checkpoint_config(
     thread_id: str,
     checkpoint_id: str | None = None,
@@ -218,13 +229,18 @@ async def walk_current_branch_boundaries(
     checkpointer: Any,
     thread_id: str,
     branch_tip_checkpoint_id: str | None = None,
+    *,
+    strict_branch_tip: bool = False,
 ) -> tuple[list[Any], str | None]:
     """Chronological turn-boundary checkpoints on the thread's current branch.
 
     Edit/regenerate fork the checkpoint graph, so only ancestors of the branch
     tip count as turns: the tip is ``branch_tip_checkpoint_id`` when present and
-    on the graph, else the newest checkpoint. Canonical branch walk shared by
-    ``checkpoint_handler.get_thread_turns`` (turn CRUD) and the history reader.
+    on the graph, else the newest checkpoint. With ``strict_branch_tip=True``, a
+    supplied-but-missing tip raises ``CheckpointBranchTipNotFound`` instead of
+    silently reading the newest (possibly uncommitted) state. Canonical branch
+    walk shared by ``checkpoint_handler.get_thread_turns`` (turn CRUD) and the
+    history reader.
 
     Returns ``(boundaries, tip_id)`` — boundaries oldest-first as skeleton
     ``CheckpointTuple``s (no channel values; pending writes limited to the
@@ -232,13 +248,21 @@ async def walk_current_branch_boundaries(
     """
     checkpoints = await _list_checkpoint_skeletons(checkpointer, thread_id)
     if not checkpoints:
+        if strict_branch_tip and branch_tip_checkpoint_id is not None:
+            raise CheckpointBranchTipNotFound(thread_id, branch_tip_checkpoint_id)
         return [], None
 
     cp_by_id = {
         cp.config["configurable"]["checkpoint_id"]: cp for cp in checkpoints
     }
-    if branch_tip_checkpoint_id and branch_tip_checkpoint_id in cp_by_id:
-        tip = cp_by_id[branch_tip_checkpoint_id]
+    if branch_tip_checkpoint_id is not None:
+        tip = cp_by_id.get(branch_tip_checkpoint_id)
+        if tip is None:
+            if strict_branch_tip:
+                raise CheckpointBranchTipNotFound(
+                    thread_id, branch_tip_checkpoint_id
+                )
+            tip = checkpoints[0]
     else:
         tip = checkpoints[0]  # alist is newest-first
     tip_id: str = tip.config["configurable"]["checkpoint_id"]

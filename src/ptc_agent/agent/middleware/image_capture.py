@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "bmp"}
 IMAGE_MD_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 
+# Capture rides the live turn-completion path (paths are rewritten pre-commit so
+# checkpointed truth carries durable URLs). Bound it so a hung sandbox or storage
+# backend can't stall the turn — on timeout the paths are left in place and the
+# idempotent post-stream capture (same content-addressed keys) recovers them.
+_CAPTURE_TIMEOUT_SECONDS = 30.0
+
 
 def is_sandbox_image_path(path: str, work_dir: str = "/home/workspace") -> bool:
     """Check if path is a sandbox-relative image (not an external URL)."""
@@ -58,21 +64,23 @@ async def capture_sandbox_images(
 ) -> dict[str, str]:
     """Download sandbox image paths, upload content-addressed, return path→URL.
 
-    Non-fatal per path: failures are logged and the path is simply absent from
-    the returned map (callers leave unmapped paths untouched).
+    Per-path captures run concurrently; each failure is logged and simply
+    absent from the returned map (callers leave unmapped paths untouched).
     """
     work_dir_prefix = sandbox.working_dir.rstrip("/") + "/"
-    path_to_url: dict[str, str] = {}
-    for path in paths:
+
+    async def _capture_one(path: str) -> tuple[str, str] | None:
         try:
             normalized = (
                 path.replace(work_dir_prefix, "")
                 if path.startswith(work_dir_prefix)
                 else path
             )
-            content = await sandbox.adownload_file_bytes(sandbox.normalize_path(normalized))
+            content = await sandbox.adownload_file_bytes(
+                sandbox.normalize_path(normalized)
+            )
             if not content:
-                continue
+                return None
             basename = normalized.rsplit("/", 1)[-1]
             key = image_storage_key(
                 thread_id, hashlib.sha256(content).hexdigest(), basename
@@ -80,11 +88,14 @@ async def capture_sandbox_images(
             content_type, _ = mimetypes.guess_type(basename)
             # upload_bytes is sync (boto3) — run in thread to avoid blocking
             if await asyncio.to_thread(upload_bytes, key, content, content_type):
-                path_to_url[path] = get_public_url(key)
                 logger.info(f"[IMAGE_CAPTURE] Uploaded {path} → {key}")
+                return path, get_public_url(key)
         except Exception as e:
             logger.warning(f"[IMAGE_CAPTURE] Failed to capture {path}: {e}")
-    return path_to_url
+        return None
+
+    results = await asyncio.gather(*(_capture_one(path) for path in paths))
+    return dict(r for r in results if r is not None)
 
 
 def rewrite_image_paths(text: str, url_map: dict[str, str]) -> str:
@@ -167,7 +178,15 @@ class ImageCaptureMiddleware(AgentMiddleware):
     ) -> ModelResponse:
         response = await handler(request)
         try:
-            result = await self._arewrite(response.result)
+            result = await asyncio.wait_for(
+                self._arewrite(response.result), _CAPTURE_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            logger.warning(
+                "[ImageCapture] capture exceeded %ss; sandbox paths left in place",
+                _CAPTURE_TIMEOUT_SECONDS,
+            )
+            return response
         except Exception:
             logger.warning(
                 "[ImageCapture] capture failed; sandbox paths left in place",

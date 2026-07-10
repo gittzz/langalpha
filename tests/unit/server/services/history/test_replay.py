@@ -8,7 +8,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from ptc_agent.agent.middleware.large_result_eviction import TOO_LARGE_TOOL_MSG
-from src.server.services.history.reader import ThreadHistory, TurnSlice
+from src.server.services.history.reader import TaskHistory, ThreadHistory, TurnSlice
 from src.server.services.history.replay import (
     CheckpointReplayUnavailable,
     build_checkpoint_replay_items,
@@ -50,10 +50,12 @@ def _response(turn_index, sse_events=None, status="completed"):
     }
 
 
-def _mock_reader(monkeypatch, history, task_messages=None):
+def _mock_reader(monkeypatch, history, task_messages=None, task_history=None):
     reader = MagicMock()
     reader.aget_thread_history = AsyncMock(return_value=history)
-    reader.aget_task_messages = AsyncMock(return_value=task_messages or [])
+    reader.aget_task_history = AsyncMock(
+        return_value=task_history or TaskHistory(messages=task_messages or [])
+    )
     monkeypatch.setattr(
         "src.server.services.history.replay.CheckpointHistoryReader.get_instance",
         lambda: reader,
@@ -72,6 +74,42 @@ async def test_legacy_backfilled_steering_falls_back(monkeypatch):
             THREAD,
             [_query(0), _query(1, qtype="steering")],
             {0: _response(0), 1: _response(1)},
+        )
+
+
+async def test_missing_committed_tip_is_replay_unavailable(monkeypatch):
+    from src.server.utils.checkpoint_helpers import CheckpointBranchTipNotFound
+
+    reader = _mock_reader(monkeypatch, ThreadHistory(thread_id=THREAD))
+    reader.aget_thread_history = AsyncMock(
+        side_effect=CheckpointBranchTipNotFound(THREAD, "missing-tip")
+    )
+
+    with pytest.raises(CheckpointReplayUnavailable, match="missing-tip"):
+        await build_checkpoint_replay_items(
+            THREAD,
+            [_query(0)],
+            {0: _response(0)},
+            branch_tip_checkpoint_id="missing-tip",
+        )
+
+
+async def test_missing_committed_tip_is_unavailable_on_cache_path(monkeypatch):
+    from src.server.services.history import projection_cache
+    from src.server.utils.checkpoint_helpers import CheckpointBranchTipNotFound
+
+    reader = _mock_reader(monkeypatch, ThreadHistory(thread_id=THREAD))
+    reader.aget_turn_anchors = AsyncMock(
+        side_effect=CheckpointBranchTipNotFound(THREAD, "missing-tip")
+    )
+    monkeypatch.setattr(projection_cache, "cache_active", lambda: True)
+
+    with pytest.raises(CheckpointReplayUnavailable, match="missing-tip"):
+        await build_checkpoint_replay_items(
+            THREAD,
+            [_query(0)],
+            {0: _response(0)},
+            branch_tip_checkpoint_id="missing-tip",
         )
 
 
@@ -250,7 +288,7 @@ async def test_inflight_windowed_keeps_absolute_pairing(monkeypatch):
     reader.aget_recent_history = AsyncMock(
         return_value=ThreadHistory(thread_id=THREAD, turns=turns)
     )
-    reader.aget_task_messages = AsyncMock(return_value=[])
+    reader.aget_task_history = AsyncMock(return_value=TaskHistory())
     monkeypatch.setattr(
         "src.server.services.history.replay.CheckpointHistoryReader.get_instance",
         lambda: reader,
@@ -517,24 +555,67 @@ async def test_stored_interrupt_and_error_pass_through_in_position(monkeypatch):
 
 
 async def test_image_map_applied_from_ui_records(monkeypatch):
+    image_record = {
+        "type": "ui",
+        "id": "ui-1",
+        "name": "image_capture",
+        "props": {"path_to_url": {"work/chart.png": "https://cdn/x/chart.png"}},
+    }
     history = ThreadHistory(
         thread_id=THREAD,
         turns=[
-            _turn(0, [AIMessage(content="![chart](work/chart.png)", id="ai-1")])
-        ],
-        ui=[
-            {
-                "type": "ui",
-                "id": "ui-1",
-                "name": "image_capture",
-                "props": {"path_to_url": {"work/chart.png": "https://cdn/x/chart.png"}},
-            }
+            _turn(
+                0,
+                [AIMessage(content="![chart](work/chart.png)", id="ai-1")],
+                new_ui_records=[image_record],
+            )
         ],
     )
     _mock_reader(monkeypatch, history)
     items = await build_checkpoint_replay_items(THREAD, [_query(0)], {0: _response(0)})
     chunk = next(i for i in items if i["event"] == "message_chunk")
     assert chunk["data"]["content"] == "![chart](https://cdn/x/chart.png)"
+
+
+async def test_image_maps_are_scoped_to_their_turn(monkeypatch):
+    """Reusing a sandbox path later must not rewrite the older turn."""
+    old = {
+        "type": "ui",
+        "id": "ui-old",
+        "name": "image_capture",
+        "props": {"path_to_url": {"work/chart.png": "https://cdn/old.png"}},
+    }
+    new = {
+        "type": "ui",
+        "id": "ui-new",
+        "name": "image_capture",
+        "props": {"path_to_url": {"work/chart.png": "https://cdn/new.png"}},
+    }
+    history = ThreadHistory(
+        thread_id=THREAD,
+        turns=[
+            _turn(
+                0,
+                [AIMessage(content="![old](work/chart.png)", id="ai-old")],
+                new_ui_records=[old],
+            ),
+            _turn(
+                1,
+                [AIMessage(content="![new](work/chart.png)", id="ai-new")],
+                new_ui_records=[new],
+            ),
+        ],
+    )
+    _mock_reader(monkeypatch, history)
+
+    items = await build_checkpoint_replay_items(
+        THREAD,
+        [_query(0), _query(1, content="next")],
+        {0: _response(0), 1: _response(1)},
+    )
+
+    chunks = [i["data"]["content"] for i in items if i["event"] == "message_chunk"]
+    assert chunks == ["![old](https://cdn/old.png)", "![new](https://cdn/new.png)"]
 
 
 async def test_unresolved_images_fall_back_to_stored(monkeypatch):
@@ -558,6 +639,10 @@ async def test_unresolved_images_fall_back_to_stored(monkeypatch):
     )
     chunk = next(i for i in items if i["event"] == "message_chunk")
     assert chunk["data"]["content"] == "![chart](https://cdn/rewritten.png)"
+    # The wholesale replay copies each stored event's nested data; enrichment
+    # must not stamp turn/response context back into the pristine source row.
+    assert "turn_index" not in stored[0]["data"]
+    assert "response_id" not in stored[0]["data"]
 
 
 async def test_subagent_transcript_projected_once_with_image_map(monkeypatch):
@@ -576,16 +661,17 @@ async def test_subagent_transcript_projected_once_with_image_map(monkeypatch):
             additional_kwargs={"task_artifact": task_artifact},
         ),
     ]
+    image_record = {
+        "type": "ui",
+        "id": "ui-1",
+        "name": "image_capture",
+        "props": {"path_to_url": {"work/sub.png": "https://cdn/sub.png"}},
+    }
     history = ThreadHistory(
         thread_id=THREAD,
-        turns=[_turn(0, turn_msgs), _turn(1, [AIMessage(content="done", id="ai-2")])],
-        ui=[
-            {
-                "type": "ui",
-                "id": "ui-1",
-                "name": "image_capture",
-                "props": {"path_to_url": {"work/sub.png": "https://cdn/sub.png"}},
-            }
+        turns=[
+            _turn(0, turn_msgs, new_ui_records=[image_record]),
+            _turn(1, [AIMessage(content="done", id="ai-2")]),
         ],
     )
     reader = _mock_reader(
@@ -613,7 +699,7 @@ async def test_subagent_transcript_projected_once_with_image_map(monkeypatch):
         [_query(0), _query(1, content="next")],
         {0: _response(0), 1: _response(1)},
     )
-    reader.aget_task_messages.assert_awaited_once_with(THREAD, "tsk1")
+    reader.aget_task_history.assert_awaited_once_with(THREAD, "tsk1")
     sub_chunks = [
         i for i in items
         if i["event"] == "message_chunk" and i["data"].get("agent") == "task:tsk1"
@@ -627,6 +713,116 @@ async def test_subagent_transcript_projected_once_with_image_map(monkeypatch):
         i for i in items
         if i["event"] == "artifact" and str(i["data"].get("agent", "")).startswith("task:")
     ]
+
+
+async def test_subagent_private_state_and_ui_are_checkpoint_projected(monkeypatch):
+    from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+
+    task_artifact = {
+        "task_id": "tsk1",
+        "action": "init",
+        "description": "d",
+        "prompt": "p",
+    }
+    turn_msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "Task", "args": {}, "id": "tc-t"}],
+        ),
+        ToolMessage(
+            content="dispatched",
+            tool_call_id="tc-t",
+            name="Task",
+            id="tm-1",
+            additional_kwargs={"task_artifact": task_artifact},
+        ),
+    ]
+    task_history = TaskHistory(
+        messages=[AIMessage(content="task answer", id="sub-ai-1")],
+        new_summarization_event={
+            "summary_message": build_summary_message(
+                "task summary", None, original_message_count=12
+            ),
+            "cutoff_index": 4,
+        },
+        newly_offloaded_args=2,
+        newly_offloaded_reads=1,
+        new_ui_records=[
+            {
+                "type": "ui",
+                "id": "task-fallback",
+                "name": "model_fallback",
+                "props": {
+                    "from_model": "primary",
+                    "to_model": "fallback",
+                    "error": "api_key=sk-abcdef0123456789",
+                },
+                "metadata": {},
+            }
+        ],
+    )
+    _mock_reader(
+        monkeypatch,
+        ThreadHistory(thread_id=THREAD, turns=[_turn(0, turn_msgs)]),
+        task_history=task_history,
+    )
+
+    items = await build_checkpoint_replay_items(
+        THREAD, [_query(0)], {0: _response(0)}
+    )
+    task_items = [i for i in items if i["data"].get("agent") == "task:tsk1"]
+
+    assert [i["event"] for i in task_items] == [
+        "context_window",
+        "context_window",
+        "context_window",
+        "model_fallback",
+        "message_chunk",
+    ]
+    assert task_items[0]["data"]["offloaded_args"] == 2
+    assert task_items[1]["data"]["offloaded_reads"] == 1
+    assert task_items[2]["data"]["summary_text"] == "task summary"
+    assert "sk-abcdef" not in task_items[3]["data"]["error"]
+    assert task_items[4]["data"]["content"] == "task answer"
+
+
+async def test_subagent_checkpoint_read_failure_makes_replay_unavailable(monkeypatch):
+    task_artifact = {
+        "task_id": "tsk1",
+        "action": "init",
+        "description": "d",
+        "prompt": "p",
+    }
+    turn_msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "Task", "args": {}, "id": "tc-t"}],
+        ),
+        ToolMessage(
+            content="dispatched",
+            tool_call_id="tc-t",
+            name="Task",
+            id="tm-1",
+            additional_kwargs={"task_artifact": task_artifact},
+        ),
+    ]
+    reader = _mock_reader(
+        monkeypatch,
+        ThreadHistory(thread_id=THREAD, turns=[_turn(0, turn_msgs)]),
+    )
+    reader.aget_task_history = AsyncMock(
+        side_effect=RuntimeError("checkpoint pool unavailable")
+    )
+
+    with pytest.raises(
+        CheckpointReplayUnavailable,
+        match="subagent checkpoint state unavailable for task:tsk1",
+    ):
+        await build_checkpoint_replay_items(
+            THREAD, [_query(0)], {0: _response(0)}
+        )
 
 
 async def test_terminal_interrupts_appended(monkeypatch):
@@ -687,7 +883,7 @@ async def test_last_n_turns_windows_to_recent(monkeypatch):
     reader.aget_recent_history = AsyncMock(
         return_value=ThreadHistory(thread_id=THREAD, turns=turns[-2:])
     )
-    reader.aget_task_messages = AsyncMock(return_value=[])
+    reader.aget_task_history = AsyncMock(return_value=TaskHistory())
     monkeypatch.setattr(
         "src.server.services.history.replay.CheckpointHistoryReader.get_instance",
         lambda: reader,
@@ -912,6 +1108,59 @@ async def test_credit_usage_synthesized_from_usage_row(monkeypatch):
     assert not [i for i in items if i["event"] == "credit_usage"]
 
 
+async def test_credit_usage_ignores_later_subagent_usage_rows(monkeypatch):
+    """Task billing rows share the parent response id but were not emitted as
+    the main workflow's terminal credit_usage event."""
+    _mock_reader(
+        monkeypatch,
+        ThreadHistory(
+            thread_id=THREAD,
+            turns=[_turn(0, [AIMessage(content="done", id="a-0")])],
+        ),
+    )
+    main = {
+        "conversation_response_id": "resp-0",
+        "msg_type": "ptc",
+        "token_usage": {
+            "by_model": {
+                "main": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 120,
+                }
+            }
+        },
+        "total_credits": 2.5,
+        "created_at": "2026-07-07T00:00:00",
+    }
+    task = {
+        "conversation_response_id": "resp-0",
+        "msg_type": "task",
+        "token_usage": {
+            "by_model": {
+                "task": {
+                    "input_tokens": 5,
+                    "output_tokens": 1,
+                    "total_tokens": 6,
+                }
+            }
+        },
+        "total_credits": 0.1,
+        "created_at": "2026-07-07T00:01:00",
+    }
+
+    items = await build_checkpoint_replay_items(
+        THREAD,
+        [_query(0)],
+        {0: _response(0)},
+        usages=[main, task],
+    )
+
+    credit = next(i for i in items if i["event"] == "credit_usage")
+    assert credit["data"]["tokens"]["total_tokens"] == 120
+    assert credit["data"]["total_credits"] == 2.5
+
+
 async def test_provenance_synthesized_from_rows_anchored(monkeypatch):
     """Provenance rows re-emit as provenance events anchored after the
     tool_call_result matching their tool_call_id; unanchorable rows tail."""
@@ -1023,6 +1272,31 @@ async def test_terminal_error_synthesized_on_both_paths(monkeypatch):
     assert build_sse_replay_items(THREAD, [_query(0)], {0: legacy})[-1]["event"] == "user_message"
 
 
+async def test_terminal_error_replay_sanitizes_legacy_rows(monkeypatch):
+    """Defense in depth for rows written before persistence-side scrubbing."""
+    response = _response(0, status="error")
+    response["errors"] = [
+        "request failed: https://user:hunter2@api.example.test "
+        "api_key=sk-abcdef0123456789"
+    ]
+    _mock_reader(
+        monkeypatch,
+        ThreadHistory(
+            thread_id=THREAD,
+            turns=[_turn(0, [AIMessage(content="partial", id="a-0")])],
+        ),
+    )
+
+    items = await build_checkpoint_replay_items(
+        THREAD, [_query(0)], {0: response}
+    )
+
+    error = next(i for i in items if i["event"] == "error")
+    assert "hunter2" not in error["data"]["error"]
+    assert "sk-abcdef" not in error["data"]["error"]
+    assert "[REDACTED]" in error["data"]["error"]
+
+
 async def test_model_fallback_projected_from_ui_records(monkeypatch):
     # A fallback notice rides the turn's ui channel (push_ui_message in the
     # resilience middleware); replay projects it at the turn head with the
@@ -1084,3 +1358,6 @@ async def test_model_fallback_stored_events_preferred(monkeypatch):
     fallbacks = [i for i in items if i["event"] == "model_fallback"]
     assert len(fallbacks) == 1
     assert fallbacks[0]["data"].get("position") == "stored"
+    # The passthrough insert copies the stored event's data — enrichment must
+    # not mutate the pristine source row.
+    assert "turn_index" not in stored[1]["data"]

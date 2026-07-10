@@ -117,6 +117,17 @@ class ThreadHistory:
 
 
 @dataclass
+class TaskHistory:
+    """Materialized state for one background-task checkpoint namespace."""
+
+    messages: list[AnyMessage] = field(default_factory=list)
+    new_summarization_event: dict[str, Any] | None = None
+    newly_offloaded_args: int = 0
+    newly_offloaded_reads: int = 0
+    new_ui_records: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class _InputBoundary:
     checkpoint_id: str
     metadata: dict[str, Any]
@@ -161,7 +172,7 @@ def _interrupt_writes(cp_tuple: Any) -> list[dict[str, Any]]:
     """``{"id", "value"}`` records from a checkpoint's ``__interrupt__`` writes."""
     interrupts: list[dict[str, Any]] = []
     for _task_id, channel, value in (cp_tuple.pending_writes or []) if cp_tuple else []:
-        if channel != "__interrupt__":
+        if channel != _INTERRUPT_CHANNEL:
             continue
         values = value if isinstance(value, (list, tuple)) else [value]
         for intr in values:
@@ -401,10 +412,11 @@ class CheckpointHistoryReader:
         paths in the checkpointed message itself), so dropping it on a live
         interrupt is safe.
         """
-        if await self._tip_is_interrupted(thread_id):
+        tip_interrupted = await self._tip_is_interrupted(thread_id)
+        if tip_interrupted is not False:
             logger.debug(
-                "[CheckpointHistoryReader] skip ui record %r on interrupted "
-                "tip for thread_id=%s",
+                "[CheckpointHistoryReader] skip ui record %r on interrupted or "
+                "unknown tip for thread_id=%s",
                 name,
                 thread_id,
             )
@@ -420,14 +432,15 @@ class CheckpointHistoryReader:
             {"configurable": {"thread_id": thread_id}}, {"ui": [record]}
         )
 
-    async def _tip_is_interrupted(self, thread_id: str) -> bool:
-        """True when the thread's latest checkpoint carries a pending interrupt.
+    async def _tip_is_interrupted(self, thread_id: str) -> bool | None:
+        """Interrupt state of the latest checkpoint (None when unreadable).
 
         Reads the raw tuple rather than ``aget_state().next``: this reader's
         graph nodes differ from the real agent graph, so it can't replan the
         foreign pending task and ``.next`` reads empty. The stored
-        ``__interrupt__`` pending write is graph-agnostic. On read failure,
-        assume not-interrupted so the legacy fallback write still happens.
+        ``__interrupt__`` pending write is graph-agnostic. Read failures return
+        None so the optional legacy UI write fails closed and cannot clear an
+        interrupt whose state could not be verified.
         """
         try:
             tup = await self._checkpointer.aget_tuple(
@@ -440,17 +453,17 @@ class CheckpointHistoryReader:
                 thread_id,
                 e,
             )
-            return False
+            return None
         if tup is None:
             return False
         return any(
             w[1] == _INTERRUPT_CHANNEL for w in (tup.pending_writes or ())
         )
 
-    async def aget_task_messages(
+    async def aget_task_history(
         self, thread_id: str, task_id: str
-    ) -> list[AnyMessage]:
-        """Materialize a background subagent transcript (``task:{task_id}`` ns)."""
+    ) -> TaskHistory:
+        """Materialize replay-relevant state from a ``task:{task_id}`` namespace."""
         snapshot = await self._graph.aget_state(
             {
                 "configurable": {
@@ -459,7 +472,33 @@ class CheckpointHistoryReader:
                 }
             }
         )
-        return list(snapshot.values.get("messages", []) or [])
+        values = snapshot.values
+        summarization_event = values.get("_summarization_event")
+        return TaskHistory(
+            messages=list(values.get("messages", []) or []),
+            new_summarization_event=(
+                summarization_event
+                if isinstance(summarization_event, dict)
+                else None
+            ),
+            newly_offloaded_args=len(
+                set(values.get("_offloaded_tool_call_ids") or ())
+            ),
+            newly_offloaded_reads=len(
+                set(values.get("_offloaded_read_result_ids") or ())
+            ),
+            new_ui_records=[
+                record
+                for record in (values.get("ui") or [])
+                if isinstance(record, dict)
+            ],
+        )
+
+    async def aget_task_messages(
+        self, thread_id: str, task_id: str
+    ) -> list[AnyMessage]:
+        """Compatibility wrapper returning only a task namespace's transcript."""
+        return (await self.aget_task_history(thread_id, task_id)).messages
 
     async def aget_turn_anchors(
         self, thread_id: str, branch_tip_checkpoint_id: str | None = None
@@ -530,7 +569,10 @@ class CheckpointHistoryReader:
         resume, so ``is_resume`` is simply "not input".
         """
         boundaries, tip_id = await walk_current_branch_boundaries(
-            self._checkpointer, thread_id, branch_tip_checkpoint_id
+            self._checkpointer,
+            thread_id,
+            branch_tip_checkpoint_id,
+            strict_branch_tip=branch_tip_checkpoint_id is not None,
         )
         records = [
             _InputBoundary(
@@ -565,16 +607,4 @@ class CheckpointHistoryReader:
                 }
             }
         )
-        interrupts: list[dict[str, Any]] = []
-        for _task_id, channel, value in (cp_tuple.pending_writes or []) if cp_tuple else []:
-            if channel != "__interrupt__":
-                continue
-            values = value if isinstance(value, (list, tuple)) else [value]
-            for intr in values:
-                interrupts.append(
-                    {
-                        "id": getattr(intr, "id", None),
-                        "value": getattr(intr, "value", None),
-                    }
-                )
-        return interrupts
+        return _interrupt_writes(cp_tuple)

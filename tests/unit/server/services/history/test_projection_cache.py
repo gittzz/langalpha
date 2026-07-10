@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -10,7 +11,12 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from src.server.services.history import projection_cache
-from src.server.services.history.reader import ThreadHistory, TurnAnchor, TurnSlice
+from src.server.services.history.reader import (
+    TaskHistory,
+    ThreadHistory,
+    TurnAnchor,
+    TurnSlice,
+)
 from src.server.services.history.replay import build_checkpoint_replay_items
 
 pytestmark = pytest.mark.asyncio
@@ -100,7 +106,7 @@ def _mock_reader(monkeypatch, *, anchors=None, tip="cp-tip", history=None,
     reader.aget_recent_history = AsyncMock(
         return_value=history or ThreadHistory(thread_id=THREAD)
     )
-    reader.aget_task_messages = AsyncMock(return_value=[])
+    reader.aget_task_history = AsyncMock(return_value=TaskHistory())
     monkeypatch.setattr(
         "src.server.services.history.replay.CheckpointHistoryReader.get_instance",
         lambda: reader,
@@ -296,18 +302,73 @@ async def test_refresh_noops_without_commit_pointer(monkeypatch, fake_cache):
     assert fake_cache.store == {}
 
 
+async def test_schedule_refresh_coalesces_overlapping_requests(monkeypatch, fake_cache):
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    calls: list[int] = []
+    active = 0
+    max_active = 0
+
+    async def fake_refresh(thread_id):
+        nonlocal active, max_active
+        assert thread_id == THREAD
+        call_number = len(calls) + 1
+        calls.append(call_number)
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            if call_number == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(projection_cache, "refresh_thread_projection", fake_refresh)
+    projection_cache._refresh_tasks.clear()
+    projection_cache._refresh_dirty.clear()
+
+    projection_cache.schedule_projection_refresh(THREAD)
+    runner = projection_cache._refresh_tasks[THREAD]
+    await first_started.wait()
+
+    # Multiple triggers during the first pass coalesce into one ordered rerun;
+    # no second task is allowed to race and finish out of generation order.
+    projection_cache.schedule_projection_refresh(THREAD)
+    projection_cache.schedule_projection_refresh(THREAD)
+    assert projection_cache._refresh_tasks[THREAD] is runner
+    assert projection_cache._refresh_dirty == {THREAD}
+
+    release_first.set()
+    await second_started.wait()
+    await runner
+    await asyncio.sleep(0)  # let the done callback release the strong ref
+
+    assert calls == [1, 2]
+    assert max_active == 1
+    assert THREAD not in projection_cache._refresh_tasks
+    assert THREAD not in projection_cache._refresh_dirty
+
+
 async def test_task_streams_live_variants(fake_cache):
     key = f"subagent:stream:{THREAD}:tsk1"
-    # No stream at all (TTL'd or never spilled) → terminal.
-    assert await projection_cache.task_streams_live(THREAD, {"tsk1"}) is False
+    # No stream cannot prove completion (it may have TTL'd or failed to spill),
+    # so stay conservative and skip caching.
+    assert await projection_cache.task_streams_live(THREAD, {"tsk1"}) is True
     # Last entry is a wire string → producer still writing.
     fake_cache.client.stream_tails[key] = "id: 7\nevent: message_chunk\ndata: {}\n\n"
     assert await projection_cache.task_streams_live(THREAD, {"tsk1"}) is True
     # Finalized sentinel → terminal.
     fake_cache.client.stream_tails[key] = _END_SENTINEL
     assert await projection_cache.task_streams_live(THREAD, {"tsk1"}) is False
-    # No tasks → trivially terminal; disconnected client → conservative live.
+    # Every referenced task needs an explicit sentinel.
+    assert await projection_cache.task_streams_live(THREAD, {"tsk1", "missing"}) is True
+    # No tasks → trivially terminal; Redis failures/disconnects → conservative live.
     assert await projection_cache.task_streams_live(THREAD, set()) is False
+    fake_cache.client.xrevrange = AsyncMock(side_effect=RuntimeError("redis down"))
+    assert await projection_cache.task_streams_live(THREAD, {"tsk1"}) is True
     fake_cache.client = None
     assert await projection_cache.task_streams_live(THREAD, {"tsk1"}) is True
 
@@ -331,8 +392,10 @@ async def test_live_subagent_turn_not_cached_until_finalized(monkeypatch, fake_c
     reader = _mock_reader(
         monkeypatch, anchors=[_anchor(0, "tail-0", 0)], tip="tail-0", history=history
     )
-    reader.aget_task_messages = AsyncMock(
-        return_value=[AIMessage(content="partial", id="sub-1")]
+    reader.aget_task_history = AsyncMock(
+        return_value=TaskHistory(
+            messages=[AIMessage(content="partial", id="sub-1")]
+        )
     )
     stream_key = f"subagent:stream:{THREAD}:tsk1"
     fake_cache.client.stream_tails[stream_key] = "id: 3\nevent: message_chunk\ndata: {}\n\n"
@@ -343,9 +406,13 @@ async def test_live_subagent_turn_not_cached_until_finalized(monkeypatch, fake_c
 
     # Subagent finishes (sentinel lands); the transcript is final now.
     fake_cache.client.stream_tails[stream_key] = _END_SENTINEL
-    reader.aget_task_messages = AsyncMock(
-        return_value=[AIMessage(content="partial", id="sub-1"),
-                      AIMessage(content="final", id="sub-2")]
+    reader.aget_task_history = AsyncMock(
+        return_value=TaskHistory(
+            messages=[
+                AIMessage(content="partial", id="sub-1"),
+                AIMessage(content="final", id="sub-2"),
+            ]
+        )
     )
     items = await build_checkpoint_replay_items(THREAD, [_query(0)], {0: _response(0)})
     entry = fake_cache.store[projection_cache._key(THREAD, "tail-0")]

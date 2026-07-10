@@ -43,7 +43,6 @@ from ptc_agent.agent.middleware.image_capture import (
 from ptc_agent.agent.middleware.large_result_eviction import TOO_LARGE_TOOL_MSG
 from src.server.database.provenance import provenance_row_to_event
 from src.server.handlers.streaming_handler import (
-    _sanitize_error_text,
     build_credit_usage_data,
     resolve_token_threshold,
 )
@@ -54,7 +53,11 @@ from src.server.services.history.projector import (
     history_events_to_sse,
     messages_to_history_events,
 )
-from src.server.services.history.reader import CheckpointHistoryReader, ThreadHistory
+from src.server.services.history.reader import CheckpointHistoryReader
+from src.server.utils.checkpoint_helpers import CheckpointBranchTipNotFound
+from src.server.utils.error_sanitization import (
+    sanitize_error_text as _sanitize_error_text,
+)
 from src.utils.storage import get_bytes
 
 logger = logging.getLogger(__name__)
@@ -199,9 +202,12 @@ async def _assemble_from_cache(
     raw tip read, no state materialization. Returns None on any miss (the
     caller rebuilds and backfills). Pairing guards raise the same
     ``CheckpointReplayUnavailable`` signals as the full build."""
-    anchors, tip_id = await reader.aget_turn_anchors(
-        thread_id, branch_tip_checkpoint_id
-    )
+    try:
+        anchors, tip_id = await reader.aget_turn_anchors(
+            thread_id, branch_tip_checkpoint_id
+        )
+    except CheckpointBranchTipNotFound as e:
+        raise CheckpointReplayUnavailable(str(e)) from e
     if not anchors or tip_id is None or any(
         a.tail_checkpoint_id is None for a in anchors
     ):
@@ -247,12 +253,17 @@ async def _build_and_backfill(
 ) -> list[dict[str, Any]]:
     """Materialize checkpoint state and project every requested turn, storing
     each settled turn's finished segment in the projection cache."""
-    if last_n_turns is not None:
-        history = await reader.aget_recent_history(
-            thread_id, last_n_turns, branch_tip_checkpoint_id
-        )
-    else:
-        history = await reader.aget_thread_history(thread_id, branch_tip_checkpoint_id)
+    try:
+        if last_n_turns is not None:
+            history = await reader.aget_recent_history(
+                thread_id, last_n_turns, branch_tip_checkpoint_id
+            )
+        else:
+            history = await reader.aget_thread_history(
+                thread_id, branch_tip_checkpoint_id
+            )
+    except CheckpointBranchTipNotFound as e:
+        raise CheckpointReplayUnavailable(str(e)) from e
 
     if not history.turns:
         raise CheckpointReplayUnavailable("no checkpoint turns found")
@@ -263,8 +274,7 @@ async def _build_and_backfill(
         windowed=last_n_turns is not None,
     )
 
-    image_url_map = _collect_image_url_map(history)
-    usage_by_response = _rows_by_response(usages)
+    usage_by_response = _usage_rows_by_response(usages)
     provenance_by_response = _rows_by_response(provenance, many=True)
 
     items: list[dict[str, Any]] = []
@@ -306,7 +316,13 @@ async def _build_and_backfill(
             await _project_new_tasks(reader, thread_id, turn_items, projected_task_ids)
         )
         turn_task_ids = projected_task_ids - tasks_before
-        _apply_image_url_map(turn_items, image_url_map)
+        # Legacy path→URL records belong to the turn whose state delta contains
+        # them. A thread-global map is incorrect when a sandbox filename is
+        # reused later: last-write-wins would rewrite the older turn's image to
+        # the newer content-addressed object.
+        _apply_image_url_map(
+            turn_items, _collect_image_url_map(turn.new_ui_records)
+        )
         # Table-sourced synthesis rides ahead of the merge: a turn with stored
         # events drops these copies and replays the stored ones instead (the
         # _STORED_PREFERRED_EVENTS transition rule).
@@ -326,7 +342,14 @@ async def _build_and_backfill(
             # Non-derivable image URLs live only in the stored events for this
             # turn — replay it from storage wholesale (subagent events are
             # interleaved in the stored stream, so they're covered too).
-            turn_items = [dict(e) for e in stored_events if _valid_stored(e)]
+            # Copy the nested ``data`` too (like build_sse_replay_items): _enrich
+            # stamps into it, and the source dicts are the request's pristine
+            # ``sse_events`` rows.
+            turn_items = [
+                {"event": e["event"], "data": dict(e["data"])}
+                for e in stored_events
+                if _valid_stored(e)
+            ]
         else:
             turn_items = _merge_stored_payloads(turn_items, stored_events)
 
@@ -533,6 +556,21 @@ def _rows_by_response(
     return result
 
 
+def _usage_rows_by_response(
+    rows: list[dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Key main-workflow usage rows by response id.
+
+    Background subagents deliberately persist one ``msg_type='task'`` row per
+    task under the parent response id. Those rows are billing records, not the
+    terminal ``credit_usage`` payload emitted by the main workflow, so replay
+    must never let their later timestamps replace the main row.
+    """
+    return _rows_by_response(
+        [row for row in rows or [] if row.get("msg_type") != "task"]
+    )
+
+
 def _insert_provenance_items(
     turn_items: list[dict[str, Any]], rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -612,7 +650,9 @@ def _error_item(
     metadata = response.get("metadata") or {}
     data: dict[str, Any] = {
         "thread_id": thread_id,
-        "error": str(errors[-1]),
+        # Rows may predate persistence-side sanitization. Scrub again at the
+        # trust boundary so historical secrets never reach the replay wire.
+        "error": _sanitize_error_text(str(errors[-1])),
         "type": "workflow_error",
     }
     for key in ("error_type", "error_class"):
@@ -712,6 +752,7 @@ async def _resolve_widget_data_refs(turn_items: list[dict[str, Any]]) -> None:
     payload) skips the storage read. Unresolvable refs are left in place — the
     frontend renders the widget without its data files.
     """
+    pending: list[tuple[dict[str, Any], dict[str, Any]]] = []  # (payload, data_ref)
     for item in turn_items:
         if not _is_widget(item["event"], item["data"]):
             continue
@@ -721,7 +762,14 @@ async def _resolve_widget_data_refs(turn_items: list[dict[str, Any]]) -> None:
         ref = payload.get("data_ref")
         if not isinstance(ref, dict) or not ref.get("key"):
             continue
-        raw = await asyncio.to_thread(get_bytes, ref["key"])
+        pending.append((payload, ref))
+    if not pending:
+        return
+
+    raws = await asyncio.gather(
+        *(asyncio.to_thread(get_bytes, ref["key"]) for _payload, ref in pending)
+    )
+    for (payload, ref), raw in zip(pending, raws):
         if raw is None:
             logger.warning(f"[REPLAY] widget data_ref unreadable: {ref['key']}")
             continue
@@ -782,7 +830,9 @@ def _merge_stored_payloads(
             anchor_idx = index_by_key[key]
             continue
         if event["event"] in _PASSTHROUGH_EVENTS or id(event) in extra_widget_ids:
-            inserts_after.setdefault(anchor_idx, []).append(dict(event))
+            inserts_after.setdefault(anchor_idx, []).append(
+                {"event": event["event"], "data": dict(event["data"])}
+            )
 
     merged = list(inserts_after.get(-1, []))
     for idx, item in enumerate(turn_items):
@@ -836,7 +886,12 @@ async def _project_new_tasks(
     turn_items: list[dict[str, Any]],
     projected_task_ids: set[str],
 ) -> list[dict[str, Any]]:
-    """Project each background subagent transcript once, at first reference."""
+    """Project each background task namespace once, at first reference.
+
+    Task messages, compaction-private state, and UI fallback records all live
+    in that namespace. Any materialization failure makes checkpoint replay
+    unavailable so ``source=auto`` can use the complete stored-SSE fallback.
+    """
     new_task_ids: list[str] = []
     for item in turn_items:
         if item.get("event") != "artifact":
@@ -852,22 +907,42 @@ async def _project_new_tasks(
     if not new_task_ids:
         return []
 
-    transcripts = await asyncio.gather(
-        *(reader.aget_task_messages(thread_id, tid) for tid in new_task_ids),
+    task_histories = await asyncio.gather(
+        *(reader.aget_task_history(thread_id, tid) for tid in new_task_ids),
         return_exceptions=True,
     )
     task_items: list[dict[str, Any]] = []
-    for task_id, messages in zip(new_task_ids, transcripts):
-        if isinstance(messages, BaseException):
+    for task_id, task_history in zip(new_task_ids, task_histories):
+        if isinstance(task_history, BaseException):
             logger.warning(
-                f"[REPLAY] Failed to read subagent transcript task:{task_id}: {messages}"
+                "[REPLAY] Failed to read subagent checkpoint state task:%s",
+                task_id,
+                exc_info=(
+                    type(task_history),
+                    task_history,
+                    task_history.__traceback__,
+                ),
             )
-            continue
-        if messages:
+            # Silent continuation would produce a plausible-looking but
+            # incomplete transcript and bypass the endpoint's SSE fallback.
+            raise CheckpointReplayUnavailable(
+                f"subagent checkpoint state unavailable for task:{task_id}"
+            ) from task_history
+
+        task_agent = f"task:{task_id}"
+        task_items.extend(
+            _context_signal_items(thread_id, task_history, agent=task_agent)
+        )
+        task_items.extend(
+            _model_fallback_items(thread_id, task_history, agent=task_agent)
+        )
+        if task_history.messages:
             task_items.extend(
                 item
                 for item in history_events_to_sse(
-                    messages_to_history_events(messages, agent=f"task:{task_id}"),
+                    messages_to_history_events(
+                        task_history.messages, agent=task_agent
+                    ),
                     thread_id=thread_id,
                 )
                 # Live streams never emit artifact events in the task lane
@@ -878,9 +953,9 @@ async def _project_new_tasks(
     return task_items
 
 
-def _collect_image_url_map(history: ThreadHistory) -> dict[str, str]:
+def _collect_image_url_map(records: list[dict[str, Any]]) -> dict[str, str]:
     url_map: dict[str, str] = {}
-    for record in history.ui:
+    for record in records:
         if not isinstance(record, dict) or record.get("name") != IMAGE_CAPTURE_UI_NAME:
             continue
         path_to_url = (record.get("props") or {}).get("path_to_url")
@@ -929,7 +1004,9 @@ def _has_unresolved_sandbox_images(turn_items: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _context_signal_items(thread_id: str, turn: Any) -> list[dict[str, Any]]:
+def _context_signal_items(
+    thread_id: str, turn: Any, *, agent: str = MAIN_AGENT
+) -> list[dict[str, Any]]:
     """Project a turn's compaction signals from its private-state deltas.
 
     Offload counts become one aggregated event per kind (live may batch them
@@ -946,7 +1023,7 @@ def _context_signal_items(thread_id: str, turn: Any) -> list[dict[str, Any]]:
             events.append(
                 HistoryEvent(
                     "context-window",
-                    MAIN_AGENT,
+                    agent,
                     None,
                     {
                         "action": "offload",
@@ -960,23 +1037,24 @@ def _context_signal_items(thread_id: str, turn: Any) -> list[dict[str, Any]]:
     if summarization_event is not None:
         message = summarization_event.get("summary_message")
         if isinstance(message, HumanMessage):
-            events.extend(messages_to_history_events([message]))
+            events.extend(messages_to_history_events([message], agent=agent))
     return history_events_to_sse(events, thread_id=thread_id)
 
 
-def _model_fallback_items(thread_id: str, turn: Any) -> list[dict[str, Any]]:
+def _model_fallback_items(
+    thread_id: str, turn: Any, *, agent: str = MAIN_AGENT
+) -> list[dict[str, Any]]:
     """Project a turn's model_fallback notices from its new ``ui`` records.
 
-    Field whitelist and error sanitization mirror the live handler; the main
-    thread's ``ui`` channel only receives main-lane writes (subagent pushes
-    land in their ``task:{id}`` namespace), so ``agent`` is always "main".
+    Field whitelist and error sanitization mirror the live handler. ``agent``
+    identifies the namespace being projected (main or ``task:{id}``).
     """
     items: list[dict[str, Any]] = []
     for record in turn.new_ui_records:
         if record.get("name") != MODEL_FALLBACK_UI_NAME:
             continue
         props = record.get("props") or {}
-        data: dict[str, Any] = {"thread_id": thread_id, "agent": MAIN_AGENT}
+        data: dict[str, Any] = {"thread_id": thread_id, "agent": agent}
         for key in _MODEL_FALLBACK_FIELDS:
             if key in props:
                 data[key] = props[key]

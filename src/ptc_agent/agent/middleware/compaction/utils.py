@@ -682,6 +682,14 @@ def parse_summary_message(message: HumanMessage) -> str:
     """Recover the raw summary text from a ``build_summary_message`` message."""
     content = message.content if isinstance(message.content, str) else ""
     text = content.removeprefix(CONTEXT_SUMMARY_PREFIX)
+    # The exact length is stamped at build time — slice by it rather than
+    # string-splitting on the file note, which would mis-truncate a summary
+    # that itself contains the note text (reachable when file_path is None).
+    stamped = message.additional_kwargs.get("summarize_complete") or {}
+    length = stamped.get("summary_length")
+    if isinstance(length, int) and 0 <= length <= len(text):
+        return text[:length]
+    # Legacy checkpoints without the stamp: fall back to note-prefix splitting.
     return text.rsplit(_SUMMARY_FILE_NOTE.split("{", 1)[0], 1)[0]
 
 
