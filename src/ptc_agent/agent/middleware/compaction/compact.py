@@ -221,7 +221,9 @@ async def compact_messages(
         raise RuntimeError("Compaction LLM returned empty summary")
 
     # Build summary message using shared utility
-    summary_message = build_summary_message(summary_text, file_path)
+    summary_message = build_summary_message(
+        summary_text, file_path, original_message_count=len(effective)
+    )
 
     # Build the event with an id anchor (cutoff grounded in the raw list)
     event = build_compaction_event(

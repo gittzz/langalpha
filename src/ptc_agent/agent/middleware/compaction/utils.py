@@ -644,33 +644,53 @@ def compute_absolute_cutoff(
     return effective_cutoff
 
 
+# File-note suffix appended to the summary message content; the parser splits
+# on its stable prefix, so builder and parser can't drift apart.
+_SUMMARY_FILE_NOTE = "\n\nFull conversation history saved to `{file_path}`."
+
+
 def build_summary_message(
-    summary: str, file_path: str | None = None
+    summary: str,
+    file_path: str | None = None,
+    original_message_count: int = 0,
 ) -> HumanMessage:
     """Build the summary HumanMessage with optional file path reference.
 
-    Tags with lc_source='summarization' for chain filtering.
-
-    Args:
-        summary: The generated summary text.
-        file_path: Path where conversation history was stored, or None.
-
-    Returns:
-        HumanMessage containing the summary.
+    Tags with lc_source='summarization' for chain filtering, and stamps the
+    emit-time ``context_window`` summarize fields into ``additional_kwargs``
+    so checkpoint-sourced replay re-emits the event without the stored SSE
+    stream.
     """
+    content = f"{CONTEXT_SUMMARY_PREFIX}{summary}"
     if file_path is not None:
-        content = (
-            f"{CONTEXT_SUMMARY_PREFIX}{summary}\n\n"
-            f"Full conversation history saved to `{file_path}`."
-        )
-    else:
-        content = f"{CONTEXT_SUMMARY_PREFIX}{summary}"
+        content += _SUMMARY_FILE_NOTE.format(file_path=file_path)
 
     return HumanMessage(
         content=content,
         id=str(uuid.uuid4()),
-        additional_kwargs={"lc_source": "summarization"},
+        additional_kwargs={
+            "lc_source": "summarization",
+            "summarize_complete": {
+                "summary_length": len(summary),
+                "original_message_count": original_message_count,
+            },
+        },
     )
+
+
+def parse_summary_message(message: HumanMessage) -> str:
+    """Recover the raw summary text from a ``build_summary_message`` message."""
+    content = message.content if isinstance(message.content, str) else ""
+    text = content.removeprefix(CONTEXT_SUMMARY_PREFIX)
+    # The exact length is stamped at build time — slice by it rather than
+    # string-splitting on the file note, which would mis-truncate a summary
+    # that itself contains the note text (reachable when file_path is None).
+    stamped = message.additional_kwargs.get("summarize_complete") or {}
+    length = stamped.get("summary_length")
+    if isinstance(length, int) and 0 <= length <= len(text):
+        return text[:length]
+    # Legacy checkpoints without the stamp: fall back to note-prefix splitting.
+    return text.rsplit(_SUMMARY_FILE_NOTE.split("{", 1)[0], 1)[0]
 
 
 # =============================================================================

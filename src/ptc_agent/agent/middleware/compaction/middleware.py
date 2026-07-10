@@ -417,7 +417,9 @@ class CompactionMiddleware(AgentMiddleware):
         )
 
         # Build summary message
-        summary_message = self._build_summary_message(summary, file_path)
+        summary_message = self._build_summary_message(
+            summary, file_path, original_message_count=len(truncated_messages)
+        )
 
         # Create summarization event with an id anchor (cutoff grounded in raw list)
         new_event = build_compaction_event(
@@ -587,7 +589,9 @@ class CompactionMiddleware(AgentMiddleware):
         summary = self._create_summary(
             messages_to_summarize, original_count=len(truncated_messages)
         )
-        summary_message = self._build_summary_message(summary, file_path)
+        summary_message = self._build_summary_message(
+            summary, file_path, original_message_count=len(truncated_messages)
+        )
 
         new_event = build_compaction_event(
             raw_messages=request.messages,
@@ -869,10 +873,13 @@ class CompactionMiddleware(AgentMiddleware):
     # =========================================================================
 
     def _build_summary_message(
-        self, summary: str, file_path: str | None = None
+        self,
+        summary: str,
+        file_path: str | None = None,
+        original_message_count: int = 0,
     ) -> HumanMessage:
         """Delegate to shared utility."""
-        return build_summary_message(summary, file_path)
+        return build_summary_message(summary, file_path, original_message_count)
 
     # =========================================================================
     # Summarization trigger and cutoff logic

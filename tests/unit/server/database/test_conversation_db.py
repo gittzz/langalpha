@@ -558,6 +558,30 @@ async def test_get_recent_responses_for_thread_no_limit(mock_db_connection, mock
     assert "LIMIT" not in sql
 
 
+@pytest.mark.asyncio
+async def test_replay_data_excludes_subagent_usage_rows(
+    mock_db_connection, mock_cursor
+):
+    """Replay's credit_usage source must match the main live event, not later
+    task billing rows that share its response id."""
+    from src.server.database.conversation import get_replay_thread_data
+
+    mock_cursor.fetchone.side_effect = [
+        {"user_id": "user-1"},
+        {
+            "conversation_thread_id": "thread-1",
+            "latest_checkpoint_id": "cp-1",
+        },
+    ]
+    mock_cursor.fetchall.side_effect = [[], [], [], []]
+
+    await get_replay_thread_data("thread-1")
+
+    usage_sql = mock_cursor.execute.call_args_list[4].args[0]
+    assert "SELECT conversation_response_id, msg_type" in usage_sql
+    assert "msg_type <> 'task'" in usage_sql
+
+
 # ===========================================================================
 # Workspace Threads / Pagination
 # ===========================================================================
