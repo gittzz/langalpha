@@ -66,6 +66,7 @@ from ptc_agent.core.paths import (
 )
 from ptc_agent.agent.backends.user_data import UserDataBackend
 from ptc_agent.agent.middleware.image_capture import ImageCaptureMiddleware
+from ptc_agent.agent.middleware.openai_prompt_caching import OpenAIPromptCachingMiddleware
 from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
@@ -675,6 +676,7 @@ class PTCAgent:
                 compaction,
                 *model_resilience,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
+                OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
                 PatchToolCallsMiddleware(),
                 AnthropicThinkingSanitizerMiddleware(),
@@ -700,8 +702,10 @@ class PTCAgent:
 
         # Main agent middleware (includes SubAgentMiddleware + main_only)
         # Ordering matters for prompt caching:
-        #   - AnthropicPromptCachingMiddleware places cache_control breakpoint on
-        #     the last system message block it sees (the static prompt + skills).
+        #   - AnthropicPromptCachingMiddleware (cache_control) and
+        #     OpenAIPromptCachingMiddleware (prompt_cache_breakpoint) each place
+        #     their provider's breakpoint on the last system message block they
+        #     see (the static prompt + skills); each no-ops for other providers.
         #   - WorkspaceContextMiddleware (agent.md) and RuntimeContextMiddleware
         #     (time + profile) are innermost — they append AFTER the breakpoint,
         #     so dynamic content doesn't invalidate the cached prefix.
@@ -725,6 +729,7 @@ class PTCAgent:
                 compaction,
                 *model_resilience,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
+                OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
                 PatchToolCallsMiddleware(),
                 *workspace_context_middleware,

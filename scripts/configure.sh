@@ -183,10 +183,10 @@ case $llm in
         sub=$(prompt_choice "Sub-choice" "a")
         case $sub in
             b)
-                set_llm_field "name" "gpt-5.4-oauth"
-                set_llm_field "flash" "gpt-5.4-mini-oauth"
-                set_llm_field "compaction" "gpt-5.4-mini-oauth"
-                set_llm_field "fetch" "gpt-5.4-mini-oauth"
+                set_llm_field "name" "gpt-5.6-sol-oauth"
+                set_llm_field "flash" "gpt-5.6-terra-oauth"
+                set_llm_field "compaction" "gpt-5.6-terra-oauth"
+                set_llm_field "fetch" "gpt-5.6-terra-oauth"
                 success "ChatGPT OAuth — connect your subscription in the UI after starting"
                 ;;
             *)

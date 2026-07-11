@@ -108,12 +108,12 @@ class TestUserIdNone:
             await service.complete(
                 user_id=None,
                 user_prompt="hi",
-                request_model="gpt-5.4-mini",
+                request_model="gpt-5.6-terra",
                 reasoning_effort="low",
             )
 
         mock_resolve.assert_not_called()
-        mock_create.assert_called_once_with("gpt-5.4-mini", reasoning_effort="low")
+        mock_create.assert_called_once_with("gpt-5.6-terra", reasoning_effort="low")
 
 
 # ---------------------------------------------------------------------------

@@ -1015,14 +1015,14 @@ class TestClassifyModelDirect:
     async def test_returns_system_when_only_in_manifest(self):
         from src.server.handlers.chat.llm_config import classify_model, ModelSource
 
-        system_info = {"provider": "openai", "model_id": "gpt-5.4"}
+        system_info = {"provider": "openai", "model_id": "gpt-5.6-sol"}
         mock_mc = MagicMock()
         mock_mc.get_model_config.return_value = system_info
         with (
             patch(f"{HANDLER}.get_custom_model_config", new_callable=AsyncMock, return_value=None),
             patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
         ):
-            source, cfg = await classify_model("user-1", "gpt-5.4")
+            source, cfg = await classify_model("user-1", "gpt-5.6-sol")
 
         assert source == ModelSource.SYSTEM
         assert cfg is system_info

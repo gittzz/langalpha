@@ -104,6 +104,11 @@ from .runtime_context import (
     RuntimeContextMiddleware,
 )
 
+# OpenAI prompt-cache breakpoint middleware (GPT-5.6+ explicit caching)
+from .openai_prompt_caching import (
+    OpenAIPromptCachingMiddleware,
+)
+
 # Anthropic thinking-block sanitizer (repairs orphan signature-only blocks)
 from .anthropic_thinking_sanitizer import (
     AnthropicThinkingSanitizerMiddleware,
@@ -173,6 +178,8 @@ __all__ = [
     "MemoAwarenessMiddleware",
     # Runtime context
     "RuntimeContextMiddleware",
+    # OpenAI prompt caching
+    "OpenAIPromptCachingMiddleware",
     # Anthropic thinking sanitizer
     "AnthropicThinkingSanitizerMiddleware",
     # Subagent middleware

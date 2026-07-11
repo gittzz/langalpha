@@ -66,7 +66,7 @@ async def test_fetch_keeps_streaming_for_codex_override(monkeypatch):
     """Codex models ship with ``streaming=True`` for a reason — the proxy
     rejects ``stream=false``. The clone must keep streaming on."""
     override = ChatCodexOpenAI(
-        model="gpt-5.4",
+        model="gpt-5.6-sol",
         api_key="fake",
         output_version="responses/v1",
         store=False,
