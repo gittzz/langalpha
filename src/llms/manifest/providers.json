@@ -53,60 +53,64 @@
         }
       },
       {
-        "id": "gpt-5.4-mini",
-        "name": "GPT-5.4 Mini",
+        "id": "gpt-5.6-sol",
+        "name": "GPT-5.6 Sol",
         "is_reasoning": true,
-        "description": "OpenAI's strongest mini model for coding, computer use, and subagents",
-        "alias": [
-          "gpt-5.4-mini-2026-03-17"
-        ],
-        "context_window": 400000,
-        "max_output": 128000,
+        "description": "OpenAI's flagship GPT-5.6 reasoning model with tiered short/long-context pricing",
         "pricing": {
-          "input": 0.75,
-          "cached_input": 0.075,
-          "output": 4.5,
+          "input_tiers": [
+            {
+              "max_tokens": 272000,
+              "rate": 5.0,
+              "cached_input": 0.5,
+              "cache_5m": 6.25
+            },
+            {
+              "max_tokens": null,
+              "rate": 10.0,
+              "cached_input": 1.0,
+              "cache_5m": 12.5
+            }
+          ],
+          "cache_5m": 6.25,
+          "output_tiers": [
+            {
+              "max_tokens": 272000,
+              "rate": 30.0
+            },
+            {
+              "max_tokens": null,
+              "rate": 45.0
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
+          "input_pricing_mode": "input_dependent",
           "unit": "per_1m_tokens"
-        }
+        },
+        "context_window": 1050000,
+        "max_output": 128000
       },
       {
-        "id": "gpt-5.4-nano",
-        "name": "GPT-5.4 Nano",
+        "id": "gpt-5.6-terra",
+        "name": "GPT-5.6 Terra",
         "is_reasoning": true,
-        "description": "OpenAI's cheapest GPT-5.4-class model for simple high-volume tasks",
-        "alias": [
-          "gpt-5.4-nano-2026-03-17"
-        ],
-        "context_window": 400000,
-        "max_output": 128000,
-        "pricing": {
-          "input": 0.2,
-          "cached_input": 0.02,
-          "output": 1.25,
-          "unit": "per_1m_tokens"
-        }
-      },
-      {
-        "id": "gpt-5.4",
-        "name": "GPT-5.4",
-        "is_reasoning": true,
-        "description": "OpenAI's latest and most capable reasoning model with tiered pricing",
-        "alias": [
-          "gpt-5.4-2026-03-05"
-        ],
+        "description": "OpenAI's mid-tier GPT-5.6 reasoning model with tiered short/long-context pricing",
         "pricing": {
           "input_tiers": [
             {
               "max_tokens": 272000,
               "rate": 2.5,
-              "cached_input": 0.25
+              "cached_input": 0.25,
+              "cache_5m": 3.125
             },
             {
               "max_tokens": null,
               "rate": 5.0,
-              "cached_input": 0.5
+              "cached_input": 0.5,
+              "cache_5m": 6.25
             }
           ],
+          "cache_5m": 3.125,
           "output_tiers": [
             {
               "max_tokens": 272000,
@@ -118,8 +122,49 @@
             }
           ],
           "output_pricing_mode": "input_dependent",
+          "input_pricing_mode": "input_dependent",
           "unit": "per_1m_tokens"
-        }
+        },
+        "context_window": 1050000,
+        "max_output": 128000
+      },
+      {
+        "id": "gpt-5.6-luna",
+        "name": "GPT-5.6 Luna",
+        "is_reasoning": true,
+        "description": "OpenAI's most cost-efficient GPT-5.6 reasoning model with tiered short/long-context pricing",
+        "pricing": {
+          "input_tiers": [
+            {
+              "max_tokens": 272000,
+              "rate": 1.0,
+              "cached_input": 0.1,
+              "cache_5m": 1.25
+            },
+            {
+              "max_tokens": null,
+              "rate": 2.0,
+              "cached_input": 0.2,
+              "cache_5m": 2.5
+            }
+          ],
+          "cache_5m": 1.25,
+          "output_tiers": [
+            {
+              "max_tokens": 272000,
+              "rate": 6.0
+            },
+            {
+              "max_tokens": null,
+              "rate": 9.0
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
+          "input_pricing_mode": "input_dependent",
+          "unit": "per_1m_tokens"
+        },
+        "context_window": 1050000,
+        "max_output": 128000
       }
     ],
     "anthropic": [
