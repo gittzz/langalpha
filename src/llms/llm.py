@@ -9,6 +9,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_deepseek import ChatDeepSeek
 from langchain_qwq import ChatQwen
 
+from .endpoints import is_official_openai_endpoint
 from .pricing_utils import get_price_tier
 
 load_dotenv()
@@ -507,6 +508,14 @@ class LLM:
         # Add all parameters from llm_config
         params.update(self.parameters)
 
+        # Explicit prompt caching is api.openai.com-only: strip the opt-in when
+        # routed anywhere else (platform proxy, OpenAI-compatible endpoints) so
+        # ineligible backends never see the param or the breakpoint marker.
+        if params.get("prompt_cache_options") is not None and not is_official_openai_endpoint(
+            params.get("base_url") or params.get("openai_api_base")
+        ):
+            params.pop("prompt_cache_options")
+
         # Pass extra_body for provider-specific fields (e.g. caching, thinking)
         if self.extra_body:
             params["extra_body"] = self.extra_body
@@ -539,6 +548,9 @@ class LLM:
             params["output_version"] = "responses/v1"
 
         params.update(self.parameters)
+
+        # The codex backend 400s on explicit-caching params — never forward the opt-in.
+        params.pop("prompt_cache_options", None)
 
         if self.extra_body:
             params["extra_body"] = self.extra_body

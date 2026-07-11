@@ -24,6 +24,7 @@ from ptc_agent.agent.middleware import (
     LeakDetectionMiddleware,
     ProvenanceMiddleware,
 )
+from ptc_agent.agent.middleware.openai_prompt_caching import OpenAIPromptCachingMiddleware
 from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
 from ptc_agent.agent.state import DeltaAgentState
 from ptc_agent.agent.prompts import format_current_time, get_loader
@@ -287,10 +288,12 @@ class FlashAgent:
             fallback_models=[name for name, _ in fallbacks],
         )
 
-        # Prompt caching, empty tool call retry, and tool call patching
+        # Prompt caching (per-provider breakpoints), empty tool call retry,
+        # and tool call patching
         main_middleware.extend(
             [
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
+                OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
                 PatchToolCallsMiddleware(),
             ]
